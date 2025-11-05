@@ -1,0 +1,38 @@
+"""
+Neural network layers for genomic data processing.
+Includes SNP embedding, transformer blocks, attention mechanisms, and task-specific heads.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+class SNPEmbedding(nn.Module):
+    """
+    Embedding layer for SNP data with special handling for missing values.
+    Maps {-1, 0, 1, 3} to dense embeddings.
+    """
+    def __init__(self, embed_dim=128, dropout=0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        
+        # 4 possible values: -1(AA), 0(Aa), 1(aa), 3(missing)
+        # We'll shift by 1 to make indices: 0, 1, 2, 4
+        self.embedding = nn.Embedding(5, embed_dim, padding_idx=4)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, seq_len) with values in {-1, 0, 1, 3}
+        Returns:
+            (batch, seq_len, embed_dim)
+        """
+        # Shift: -1->0, 0->1, 1->2, 3->4
+        x_shifted = torch.where(x == 3, torch.tensor(4, device=x.device), x + 1)
+        embedded = self.embedding(x_shifted)
+        return self.dropout(embedded)
+
+
