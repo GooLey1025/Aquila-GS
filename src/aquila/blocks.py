@@ -86,11 +86,11 @@ def transformer(d_model, num_heads, d_ff, dropout=0.1, activation='gelu', **kwar
 
 class TransformerTower(nn.Module):
     """Stack of transformer encoder blocks."""
-    def __init__(self, embed_dim, num_heads, d_ff, num_layers, dropout=0.1, activation='gelu'):
+    def __init__(self, embed_dim, num_heads, d_ff, repeat, dropout=0.1, activation='gelu'):
         super().__init__()
         self.layers = nn.ModuleList([
             TransformerBlock(embed_dim, num_heads, d_ff, dropout, activation)
-            for _ in range(num_layers)
+            for _ in range(repeat)
         ])
         
     def forward(self, x, mask=None):
@@ -99,14 +99,14 @@ class TransformerTower(nn.Module):
         return x
 
 
-def transformer_tower(embed_dim, num_heads, d_ff, num_layers, dropout=0.1, activation='gelu', **kwargs):
+def transformer_tower(embed_dim, num_heads, d_ff, repeat, dropout=0.1, activation='gelu', **kwargs):
     """Stack of transformer blocks.
     
     Args:
         embed_dim: Embedding dimension
         num_heads: Number of attention heads
         d_ff: Feed-forward dimension
-        num_layers: Number of transformer layers
+        repeat: Number of times to repeat the transformer block
         dropout: Dropout rate
         activation: Activation function
     
@@ -114,7 +114,7 @@ def transformer_tower(embed_dim, num_heads, d_ff, num_layers, dropout=0.1, activ
         TransformerTower module
     """
     return TransformerTower(embed_dim=embed_dim, num_heads=num_heads, d_ff=d_ff,
-                           num_layers=num_layers, dropout=dropout, activation=activation)
+                           repeat=repeat, dropout=dropout, activation=activation)
 
 
 ############################################################
@@ -163,11 +163,11 @@ def transformer_rope(d_model, num_heads, d_ff, dropout=0.1, activation='gelu', *
 
 class TransformerTowerRoPE(nn.Module):
     """Stack of transformer encoder blocks with RoPE (no separate positional encoding needed)."""
-    def __init__(self, embed_dim, num_heads, d_ff, num_layers, dropout=0.1, activation='gelu'):
+    def __init__(self, embed_dim, num_heads, d_ff, repeat, dropout=0.1, activation='gelu'):
         super().__init__()
         self.layers = nn.ModuleList([
             TransformerBlockRoPE(embed_dim, num_heads, d_ff, dropout, activation)
-            for _ in range(num_layers)
+            for _ in range(repeat)
         ])
         
     def forward(self, x, mask=None):
@@ -176,14 +176,14 @@ class TransformerTowerRoPE(nn.Module):
         return x
 
 
-def transformer_tower_rope(embed_dim, num_heads, d_ff, num_layers, dropout=0.1, activation='gelu', **kwargs):
+def transformer_tower_rope(embed_dim, num_heads, d_ff, repeat, dropout=0.1, activation='gelu', **kwargs):
     """Stack of transformer blocks with RoPE.
     
     Args:
         embed_dim: Embedding dimension
         num_heads: Number of attention heads
         d_ff: Feed-forward dimension
-        num_layers: Number of transformer layers
+        repeat: Number of times to repeat the transformer block
         dropout: Dropout rate
         activation: Activation function
     
@@ -195,7 +195,7 @@ def transformer_tower_rope(embed_dim, num_heads, d_ff, num_layers, dropout=0.1, 
         so no separate positional encoding layer is needed.
     """
     return TransformerTowerRoPE(embed_dim=embed_dim, num_heads=num_heads, d_ff=d_ff,
-                                num_layers=num_layers, dropout=dropout, activation=activation)
+                                repeat=repeat, dropout=dropout, activation=activation)
 
 
 ############################################################
@@ -244,7 +244,7 @@ def transformer_learnable(d_model, num_heads, d_ff, dropout=0.1, activation='gel
 
 class TransformerTowerLearnable(nn.Module):
     """Stack of transformer blocks with learnable positional embeddings."""
-    def __init__(self, embed_dim, num_heads, d_ff, num_layers, max_positions=50000, 
+    def __init__(self, embed_dim, num_heads, d_ff, repeat, max_positions=50000, 
                  dropout=0.1, activation='gelu'):
         super().__init__()
         
@@ -258,7 +258,7 @@ class TransformerTowerLearnable(nn.Module):
         # Transformer blocks
         self.layers = nn.ModuleList([
             TransformerBlockLearnable(embed_dim, num_heads, d_ff, dropout, activation)
-            for _ in range(num_layers)
+            for _ in range(repeat)
         ])
         
     def forward(self, x, mask=None):
@@ -271,7 +271,7 @@ class TransformerTowerLearnable(nn.Module):
         return x
 
 
-def transformer_tower_learnable(embed_dim, num_heads, d_ff, num_layers, max_positions=50000,
+def transformer_tower_learnable(embed_dim, num_heads, d_ff, repeat, max_positions=50000,
                                 dropout=0.1, activation='gelu', **kwargs):
     """Stack of transformer blocks with learnable positional embeddings.
     
@@ -279,7 +279,7 @@ def transformer_tower_learnable(embed_dim, num_heads, d_ff, num_layers, max_posi
         embed_dim: Embedding dimension
         num_heads: Number of attention heads
         d_ff: Feed-forward dimension
-        num_layers: Number of transformer layers
+        repeat: Number of times to repeat the transformer block
         max_positions: Maximum number of positions for learnable embeddings
         dropout: Dropout rate
         activation: Activation function
@@ -292,7 +292,7 @@ def transformer_tower_learnable(embed_dim, num_heads, d_ff, num_layers, max_posi
         Position embeddings are added before the first transformer layer.
     """
     return TransformerTowerLearnable(embed_dim=embed_dim, num_heads=num_heads, d_ff=d_ff,
-                                    num_layers=num_layers, max_positions=max_positions,
+                                    repeat=repeat, max_positions=max_positions,
                                     dropout=dropout, activation=activation)
 
 
@@ -384,7 +384,7 @@ def transformer_mqa(d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
 
 class TransformerTowerMQA(nn.Module):
     """Stack of transformer blocks with Multi-Query Attention and RoPE."""
-    def __init__(self, embed_dim, num_layers=9, num_query_heads=8, qk_head_dim=128,
+    def __init__(self, embed_dim, repeat=9, num_query_heads=8, qk_head_dim=128,
                  v_head_dim=192, dropout=0.1, max_position=8192, norm_type='layer'):
         super().__init__()
         
@@ -398,7 +398,7 @@ class TransformerTowerMQA(nn.Module):
                 max_position=max_position,
                 norm_type=norm_type
             )
-            for _ in range(num_layers)
+            for _ in range(repeat)
         ])
         
     def forward(self, x, mask=None):
@@ -407,14 +407,14 @@ class TransformerTowerMQA(nn.Module):
         return x
 
 
-def transformer_tower_mqa(embed_dim, num_layers=9, num_query_heads=8, qk_head_dim=128,
+def transformer_tower_mqa(embed_dim, repeat=9, num_query_heads=8, qk_head_dim=128,
                          v_head_dim=192, dropout=0.1, max_position=8192, 
                          norm_type='layer', **kwargs):
     """Stack of transformer blocks with Multi-Query Attention.
     
     Args:
         embed_dim: Embedding dimension (d_model)
-        num_layers: Number of transformer layers (default 9)
+        repeat: Number of times to repeat the transformer block (default 9)
         num_query_heads: Number of query heads in MQA (default 8)
         qk_head_dim: Dimension of each query/key head (default 128)
         v_head_dim: Dimension of value head (default 192)
@@ -435,7 +435,7 @@ def transformer_tower_mqa(embed_dim, num_layers=9, num_query_heads=8, qk_head_di
     """
     return TransformerTowerMQA(
         embed_dim=embed_dim,
-        num_layers=num_layers,
+        repeat=repeat,
         num_query_heads=num_query_heads,
         qk_head_dim=qk_head_dim,
         v_head_dim=v_head_dim,
@@ -657,6 +657,12 @@ class ConvBlockNAC(nn.Module):
         
         # Save identity before norm (for residual)
         identity = x if self.residual else None
+        
+        # Ensure consistent dtype (convert to float32 if needed)
+        if x.dtype != torch.float32:
+            x = x.float()
+            if identity is not None:
+                identity = identity.float()
         
         # Lazy initialization of norm if needed
         if self.norm is None:
@@ -909,11 +915,24 @@ class DenseBlock(nn.Module):
             
             if isinstance(layer, nn.ModuleList):
                 # Bottleneck version
-                out, mask = layer[0](concat_features, mask)
-                out, mask = layer[1](out, mask)
+                result = layer[0](concat_features, mask)
+                if isinstance(result, tuple):
+                    out, mask = result
+                else:
+                    out = result
+                
+                result = layer[1](out, mask)
+                if isinstance(result, tuple):
+                    out, mask = result
+                else:
+                    out = result
             else:
                 # Direct version
-                out, mask = layer(concat_features, mask)
+                result = layer(concat_features, mask)
+                if isinstance(result, tuple):
+                    out, mask = result
+                else:
+                    out = result
             
             features.append(out)
         
@@ -1774,11 +1793,11 @@ def res_block(d_model, d_ff, dropout=0.1, activation='relu', **kwargs):
 
 class ResidualTower(nn.Module):
     """Stack of residual blocks."""
-    def __init__(self, d_model, d_ff, num_layers, dropout=0.1, activation='relu'):
+    def __init__(self, d_model, d_ff, repeat, dropout=0.1, activation='relu'):
         super().__init__()
         self.layers = nn.ModuleList([
             ResidualBlock(d_model, d_ff, dropout, activation)
-            for _ in range(num_layers)
+            for _ in range(repeat)
         ])
     
     def forward(self, x):
@@ -1787,20 +1806,20 @@ class ResidualTower(nn.Module):
         return x
 
 
-def res_tower(d_model, d_ff, num_layers, dropout=0.1, activation='relu', **kwargs):
+def res_tower(d_model, d_ff, repeat, dropout=0.1, activation='relu', **kwargs):
     """Stack of residual blocks.
     
     Args:
         d_model: Model dimension
         d_ff: Feed-forward dimension
-        num_layers: Number of residual blocks
+        repeat: Number of times to repeat the residual block
         dropout: Dropout rate
         activation: Activation function
     
     Returns:
         ResidualTower module
     """
-    return ResidualTower(d_model=d_model, d_ff=d_ff, num_layers=num_layers,
+    return ResidualTower(d_model=d_model, d_ff=d_ff, repeat=repeat,
                         dropout=dropout, activation=activation)
 
 
@@ -2008,6 +2027,189 @@ def classification_head(in_features=None, num_tasks=None, num_classes=2, hidden_
 
 
 ############################################################
+# Fusion Blocks (for Multi-Branch Architectures)
+############################################################
+
+class GatedFusionBlock(nn.Module):
+    """
+    Gated fusion block for combining multiple branch outputs.
+    
+    Each branch is projected to a common dimension, then combined using
+    learned gating weights with optional residual connections.
+    """
+    
+    def __init__(self, fusion_dim, num_branches, dropout=0.1, use_residual=True):
+        """
+        Args:
+            fusion_dim: Common dimension for fusion
+            num_branches: Number of branches to fuse
+            dropout: Dropout rate
+            use_residual: Whether to use residual connections
+        """
+        super().__init__()
+        self.fusion_dim = fusion_dim
+        self.num_branches = num_branches
+        self.use_residual = use_residual
+        
+        # Per-branch projection layers (will be populated dynamically)
+        self.branch_projections = nn.ModuleList()
+        
+        # Gating mechanism: learn importance weights for each branch
+        self.gate_fc = nn.Linear(fusion_dim * num_branches, num_branches)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(fusion_dim)
+    
+    def forward(self, branch_outputs):
+        """
+        Args:
+            branch_outputs: List of tensors from different branches
+                           Each can have shape (batch, seq_len_i, dim_i)
+        
+        Returns:
+            Fused output: (batch, fusion_dim) or (batch, seq_len, fusion_dim)
+        """
+        batch_size = branch_outputs[0].shape[0]
+        
+        # Ensure we have the right number of projection layers
+        if len(self.branch_projections) == 0:
+            for branch_out in branch_outputs:
+                in_dim = branch_out.shape[-1]
+                self.branch_projections.append(
+                    nn.Linear(in_dim, self.fusion_dim).to(branch_out.device)
+                )
+        
+        # Project each branch to common dimension and pool to (batch, fusion_dim)
+        projected = []
+        for i, branch_out in enumerate(branch_outputs):
+            # branch_out: (batch, seq_len, dim) or (batch, dim)
+            if branch_out.dim() == 3:
+                # Pool sequence dimension: use mean pooling
+                pooled = branch_out.mean(dim=1)  # (batch, dim)
+            else:
+                pooled = branch_out
+            
+            # Project to fusion dimension
+            proj = self.branch_projections[i](pooled)  # (batch, fusion_dim)
+            projected.append(proj)
+        
+        # Stack projections
+        stacked = torch.stack(projected, dim=1)  # (batch, num_branches, fusion_dim)
+        
+        # Compute gating weights
+        concat_features = stacked.view(batch_size, -1)  # (batch, num_branches * fusion_dim)
+        gate_weights = torch.softmax(self.gate_fc(concat_features), dim=-1)  # (batch, num_branches)
+        
+        # Apply gating: weighted sum
+        gate_weights = gate_weights.unsqueeze(-1)  # (batch, num_branches, 1)
+        fused = (stacked * gate_weights).sum(dim=1)  # (batch, fusion_dim)
+        
+        # Optional residual: add first branch
+        if self.use_residual:
+            fused = fused + projected[0]
+        
+        # Normalize and dropout
+        fused = self.layer_norm(fused)
+        fused = self.dropout(fused)
+        
+        return fused
+
+
+class CrossAttentionFusionBlock(nn.Module):
+    """
+    Cross-attention fusion block for inter-branch communication.
+    
+    Allows one branch (query) to attend to patterns in other branches (key/value).
+    Useful for letting SV branch sense local SNP/INDEL patterns.
+    """
+    
+    def __init__(self, d_model, num_heads=4, dropout=0.1):
+        """
+        Args:
+            d_model: Model dimension
+            num_heads: Number of attention heads
+            dropout: Dropout rate
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, query_branch, key_value_branches):
+        """
+        Args:
+            query_branch: Query tensor (batch, seq_len_q, d_model)
+            key_value_branches: List of K/V tensors [(batch, seq_len_i, d_model), ...]
+        
+        Returns:
+            Enhanced query: (batch, seq_len_q, d_model)
+        """
+        # Concatenate all key/value branches along sequence dimension
+        kv = torch.cat(key_value_branches, dim=1)  # (batch, sum(seq_len_i), d_model)
+        
+        # Apply cross-attention
+        attn_out, _ = self.cross_attention(
+            query=query_branch,
+            key=kv,
+            value=kv
+        )
+        
+        # Residual connection and normalization
+        output = self.norm(query_branch + self.dropout(attn_out))
+        
+        return output
+
+
+def gated_fusion(fusion_dim, num_branches, dropout=0.1, use_residual=True, **kwargs):
+    """
+    Factory function for GatedFusionBlock.
+    
+    Args:
+        fusion_dim: Common dimension for fusion
+        num_branches: Number of branches to fuse
+        dropout: Dropout rate
+        use_residual: Whether to use residual connections
+    
+    Returns:
+        GatedFusionBlock module
+    """
+    return GatedFusionBlock(
+        fusion_dim=fusion_dim,
+        num_branches=num_branches,
+        dropout=dropout,
+        use_residual=use_residual
+    )
+
+
+def cross_attention_fusion(d_model, num_heads=4, dropout=0.1, **kwargs):
+    """
+    Factory function for CrossAttentionFusionBlock.
+    
+    Args:
+        d_model: Model dimension
+        num_heads: Number of attention heads
+        dropout: Dropout rate
+    
+    Returns:
+        CrossAttentionFusionBlock module
+    """
+    return CrossAttentionFusionBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        dropout=dropout
+    )
+
+
+############################################################
 # Block Dictionary
 ############################################################
 
@@ -2058,5 +2260,9 @@ name_func = {
     # Heads
     'regression_head': regression_head,
     'classification_head': classification_head,
+    
+    # Fusion (Multi-Branch)
+    'gated_fusion': gated_fusion,
+    'cross_attention_fusion': cross_attention_fusion,
 }
 

@@ -14,8 +14,12 @@ import numpy as np
 from pathlib import Path
 import time
 import json
-from aquila.snpnn import SNPNeuralNetwork, create_model_from_config
-from aquila.trainer import SNPTrainer
+from aquila.varnn import VariantsNeuralNetwork, create_model_from_config
+# Backward compatibility
+SNPNeuralNetwork = VariantsNeuralNetwork
+from aquila.trainer import VarTrainer
+# Backward compatibility
+SNPTrainer = VarTrainer
 from aquila.data_utils import create_kfold_data_loaders
 from aquila.utils import set_seed, save_config, load_config, print_model_summary
 import pandas as pd
@@ -435,7 +439,7 @@ def main():
         print(f"\nTraining Setup for Fold {fold_idx}")
         print("-" * 80)
         
-        trainer = SNPTrainer(
+        trainer = VarTrainer(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,

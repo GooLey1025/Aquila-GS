@@ -1,22 +1,25 @@
 """
-Dynamic neural network architecture for SNP-based genomic prediction.
+Dynamic neural network architecture for genomic variant-based prediction.
 Builds models from YAML configuration using composable blocks.
+Supports single-branch and multi-branch architectures for SNP/INDEL/SV variants.
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from . import blocks
 
 
-class SNPNeuralNetwork(nn.Module):
+class VariantsNeuralNetwork(nn.Module):
     """
     Multi-task neural network for genomic prediction with dynamic architecture.
     
     The architecture is built from YAML configuration specifying:
-        1. Embedding layer (SNP encoding)
+        1. Embedder layer (variant encoding)
         2. Trunk blocks (shared feature extraction)
         3. Head blocks (task-specific predictions)
+    
+    Supports both single-input (tensor) and multi-branch (dict) architectures.
     """
     
     def __init__(self, params: dict):
@@ -25,7 +28,7 @@ class SNPNeuralNetwork(nn.Module):
         Args:
             params: Configuration dictionary with:
                 - seq_length: Sequence length
-                - embedding: Embedding block config
+                - embedder: Embedder block config
                 - trunk: List of trunk block configs
                 - heads: Dict of head block configs (keyed by head name)
                 - regression_tasks: List of regression task names
@@ -45,29 +48,22 @@ class SNPNeuralNetwork(nn.Module):
         
         # Build model from config
         self.build_model()
-        
-        # Initialize weights
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, module):
-        """Initialize weights using Xavier/Kaiming initialization."""
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
     
     def build_model(self):
         """Build model dynamically from trunk and head configs."""
-        # Build embedding if specified
-        if 'embedding' in self.params:
-            self.embedding_block = self.build_block(self.params['embedding'])
+        # Build embedder if specified (can be a single block or list of blocks)
+        if 'embedder' in self.params:
+            embedder_config = self.params['embedder']
+            if isinstance(embedder_config, list):
+                # Multiple embedder blocks
+                self.embedder = nn.ModuleList()
+                for block_params in embedder_config:
+                    self.embedder.append(self.build_block(block_params))
+            else:
+                # Single embedder block
+                self.embedder = self.build_block(embedder_config)
         else:
-            self.embedding_block = None
+            self.embedder = None
         
         # Build trunk blocks
         self.trunk_blocks = nn.ModuleList()
@@ -151,11 +147,28 @@ class SNPNeuralNetwork(nn.Module):
         else:
             raise ValueError(f"Unexpected input shape: {x.shape}")
         
-        # Embedding
-        if self.embedding_block is not None:
-            current = self.embedding_block(x)
+        # Embedder (can be single block or ModuleList)
+        if self.embedder is not None:
+            if isinstance(self.embedder, nn.ModuleList):
+                # Multiple embedder blocks: apply sequentially
+                current = x
+                for embedder_block in self.embedder:
+                    result = embedder_block(current)
+                    # Handle blocks that return (output, mask) tuple
+                    if isinstance(result, tuple):
+                        current, mask = result
+                    else:
+                        current = result
+            else:
+                # Single embedder block
+                result = self.embedder(x)
+                # Handle blocks that return (output, mask) tuple
+                if isinstance(result, tuple):
+                    current, mask = result
+                else:
+                    current = result
         else:
-            # If no embedding specified, assume x is already embedded
+            # If no embedder specified, assume x is already embedded
             current = x
         
         # Trunk blocks
@@ -230,8 +243,11 @@ class SNPNeuralNetwork(nn.Module):
         """Count the number of parameters in each component."""
         counts = {}
         
-        if self.embedding_block is not None:
-            counts['embedding'] = sum(p.numel() for p in self.embedding_block.parameters())
+        if self.embedder is not None:
+            if isinstance(self.embedder, nn.ModuleList):
+                counts['embedder'] = sum(p.numel() for p in self.embedder.parameters())
+            else:
+                counts['embedder'] = sum(p.numel() for p in self.embedder.parameters())
         
         counts['trunk'] = sum(p.numel() for p in self.trunk_blocks.parameters())
         
@@ -244,33 +260,195 @@ class SNPNeuralNetwork(nn.Module):
         return counts
 
 
+class MultiBranchNeuralNetwork(VariantsNeuralNetwork):
+    """
+    Multi-branch neural network for genomic prediction with variant-type-specific branches.
+    
+    Architecture:
+        - Multiple input branches (SNP, INDEL, SV), each with its own embedder and trunk
+        - Fusion layer(s) to combine branch outputs
+        - Shared trunk for post-fusion processing
+        - Task-specific heads for predictions
+    
+    Config structure:
+        branches:
+            snp: {embedder: {...}, trunk: [...]}
+            indel: {embedder: {...}, trunk: [...]}
+            sv: {embedder: {...}, trunk: [...]}
+        fusion: [{name: gated_fusion, ...}, {name: cross_attention_fusion, ...}]
+        shared_trunk: [...]
+        heads: {regression: [...], classification: [...]}
+    """
+    
+    def __init__(self, params: dict):
+        """Initialize multi-branch model from configuration.
+        
+        Args:
+            params: Configuration dictionary with branches, fusion, shared_trunk, heads
+        """
+        # Don't call super().__init__() yet, we'll build differently
+        nn.Module.__init__(self)
+        
+        self.params = params
+        self.seq_length = params.get('seq_length', {})  # Dict for multi-branch
+        
+        # Task configuration
+        self.regression_tasks = params.get('regression_tasks', [])
+        self.classification_tasks = params.get('classification_tasks', [])
+        self.num_regression_tasks = len(self.regression_tasks)
+        self.num_classification_tasks = len(self.classification_tasks)
+        
+        # Build multi-branch model
+        self.build_multi_branch_model()
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+    
+    def build_multi_branch_model(self):
+        """Build multi-branch architecture from config."""
+        branches_config = self.params.get('branches', {})
+        
+        # Build each branch
+        self.branch_embedders = nn.ModuleDict()
+        self.branch_trunks = nn.ModuleDict()
+        
+        for branch_name, branch_config in branches_config.items():
+            # Build embedder for this branch
+            if 'embedder' in branch_config:
+                self.branch_embedders[branch_name] = self.build_block(branch_config['embedder'])
+            
+            # Build trunk for this branch
+            trunk_blocks = nn.ModuleList()
+            for block_params in branch_config.get('trunk', []):
+                trunk_blocks.append(self.build_block(block_params))
+            self.branch_trunks[branch_name] = trunk_blocks
+        
+        # Build fusion blocks
+        self.fusion_blocks = nn.ModuleList()
+        for fusion_params in self.params.get('fusion', []):
+            self.fusion_blocks.append(self.build_block(fusion_params))
+        
+        # Build shared trunk (after fusion)
+        self.shared_trunk_blocks = nn.ModuleList()
+        for block_params in self.params.get('shared_trunk', []):
+            self.shared_trunk_blocks.append(self.build_block(block_params))
+        
+        # Build head blocks
+        self.head_blocks = nn.ModuleDict()
+        for head_name, head_config in self.params.get('heads', {}).items():
+            if isinstance(head_config, list):
+                head_layers = nn.ModuleList()
+                for block_params in head_config:
+                    head_layers.append(self.build_block(block_params))
+                self.head_blocks[head_name] = head_layers
+            else:
+                self.head_blocks[head_name] = nn.ModuleList([self.build_block(head_config)])
+        
+        if self.params.get('verbose', False):
+            print(f"Built multi-branch model with {len(self.branch_trunks)} branches, "
+                  f"{len(self.fusion_blocks)} fusion blocks, "
+                  f"{len(self.shared_trunk_blocks)} shared trunk blocks, "
+                  f"and {len(self.head_blocks)} heads")
+    
+    def forward(self, x: Union[torch.Tensor, Dict[str, torch.Tensor]], return_embeddings: bool = False) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass through multi-branch network.
+        
+        Args:
+            x: Dict of input tensors: {'snp': tensor, 'indel': tensor, 'sv': tensor}
+               Each tensor has shape (batch, seq_length, 8) for diploid_onehot
+            return_embeddings: If True, also return intermediate embeddings
+            
+        Returns:
+            Dictionary containing head outputs
+        """
+        if not isinstance(x, dict):
+            raise ValueError(f"MultiBranchNeuralNetwork expects dict input, got {type(x)}")
+        
+        # Process each branch
+        branch_outputs = {}
+        for branch_name, branch_input in x.items():
+            if branch_name not in self.branch_trunks:
+                continue
+            
+            # Embedder
+            if branch_name in self.branch_embedders:
+                current = self.branch_embedders[branch_name](branch_input)
+            else:
+                current = branch_input
+            
+            # Branch trunk
+            for block in self.branch_trunks[branch_name]:
+                current = block(current)
+            
+            branch_outputs[branch_name] = current
+        
+        # Apply fusion
+        # Convert dict to list in consistent order
+        branch_list = [branch_outputs[name] for name in sorted(branch_outputs.keys())]
+        
+        fused = branch_list[0]  # Start with first branch
+        for fusion_block in self.fusion_blocks:
+            if isinstance(fusion_block, blocks.GatedFusionBlock):
+                # Gated fusion takes list of all branches
+                fused = fusion_block(branch_list)
+            elif isinstance(fusion_block, blocks.CrossAttentionFusionBlock):
+                # Cross-attention: query = fused, kv = all branches
+                fused = fusion_block(fused.unsqueeze(1) if fused.dim() == 2 else fused, branch_list)
+            else:
+                # Generic fusion block
+                fused = fusion_block(fused)
+        
+        # Shared trunk
+        for block in self.shared_trunk_blocks:
+            fused = block(fused)
+        
+        trunk_output = fused
+        
+        # Head blocks
+        outputs = {}
+        for head_name, head_layers in self.head_blocks.items():
+            head_current = trunk_output
+            for layer in head_layers:
+                head_current = layer(head_current)
+            outputs[head_name] = head_current
+        
+        if return_embeddings:
+            outputs['embeddings'] = trunk_output
+        
+        return outputs
+
+
 def create_model_from_config(
     config: dict,
     seq_length: int,
     regression_tasks: Optional[List[str]] = None,
     classification_tasks: Optional[List[str]] = None
-) -> SNPNeuralNetwork:
+) -> VariantsNeuralNetwork:
     """
-    Create a SNPNeuralNetwork from a configuration dictionary.
+    Create a VariantsNeuralNetwork from a configuration dictionary.
     
     Automatically detects and fills in task dimensions based on provided task lists.
+    Detects architecture_type to create single-branch or multi-branch models.
     
     Args:
         config: Configuration dictionary with model parameters
-        seq_length: Sequence length (number of SNPs)
+        seq_length: Sequence length (number of variants) or dict for multi-branch
         regression_tasks: List of regression task column names
         classification_tasks: List of classification task column names
         
     Returns:
-        Initialized SNPNeuralNetwork
+        Initialized VariantsNeuralNetwork or MultiBranchNeuralNetwork
     """
     import copy
     
     # Deep copy to avoid modifying original config
     model_params = copy.deepcopy(config.get('model', {}))
     
-    # Set sequence length and tasks
-    model_params['seq_length'] = seq_length
+    # Check for multi-branch architecture
+    architecture_type = model_params.get('architecture_type', 'single')
+    
+    # Set tasks
     model_params['regression_tasks'] = regression_tasks or []
     model_params['classification_tasks'] = classification_tasks or []
     
@@ -296,4 +474,11 @@ def create_model_from_config(
             elif isinstance(head_blocks, dict) and head_blocks.get('name') == 'classification_head':
                 head_blocks['num_tasks'] = len(classification_tasks)
     
-    return SNPNeuralNetwork(model_params)
+    if architecture_type == 'multi_branch':
+        # Multi-branch architecture
+        model_params['seq_length'] = seq_length  # Can be dict for multi-branch
+        return MultiBranchNeuralNetwork(model_params)
+    else:
+        # Single-branch architecture
+        model_params['seq_length'] = seq_length
+        return VariantsNeuralNetwork(model_params)

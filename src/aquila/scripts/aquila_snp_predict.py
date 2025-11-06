@@ -13,7 +13,9 @@ import torch
 import pandas as pd
 from pathlib import Path
 
-from aquila.snpnn import SNPNeuralNetwork
+from aquila.varnn import VariantsNeuralNetwork
+# Backward compatibility
+SNPNeuralNetwork = VariantsNeuralNetwork
 from aquila.data_utils import parse_genotype_file
 
 

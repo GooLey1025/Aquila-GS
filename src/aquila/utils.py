@@ -89,10 +89,10 @@ def print_model_summary(model: torch.nn.Module, input_size=None, device='cpu', v
             input_size=input_size,
             dtypes=[dtype],
             device=device,
-            depth=4,
-            col_names=["input_size", "output_size"],
-            row_settings=["var_names"],
-            verbose=2 if verbose else 1
+            depth=2 if verbose else 1,
+            col_names=["input_size", "output_size", "num_params"],
+            row_settings=["var_names"] if verbose else [],
+            verbose=1
         )
     else:
         # Summary without input size

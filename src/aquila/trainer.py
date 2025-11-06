@@ -62,8 +62,8 @@ class EarlyStopping:
         return self.early_stop
 
 
-class SNPTrainer:
-    """Trainer for SNP neural networks with multi-task learning."""
+class VarTrainer:
+    """Trainer for variant neural networks with multi-task learning."""
     
     def __init__(
         self,
@@ -239,6 +239,9 @@ class SNPTrainer:
         self.best_val_score = float('-inf')  # Higher is better
         self.best_epoch = 0
         self.best_metrics = {}
+        
+        # Track starting epoch for resume functionality
+        self.start_epoch = 0
     
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
@@ -410,6 +413,11 @@ class SNPTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'metrics': metrics,
             'history': self.history,
+            'best_val_score': self.best_val_score,
+            'best_epoch': self.best_epoch,
+            'best_metrics': self.best_metrics,
+            'early_stopping_counter': self.early_stopping.counter,
+            'early_stopping_best_score': self.early_stopping.best_score,
         }
         
         # Save latest checkpoint
@@ -429,6 +437,21 @@ class SNPTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.history = checkpoint['history']
+        
+        # Restore best model tracking
+        if 'best_val_score' in checkpoint:
+            self.best_val_score = checkpoint['best_val_score']
+        if 'best_epoch' in checkpoint:
+            self.best_epoch = checkpoint['best_epoch']
+        if 'best_metrics' in checkpoint:
+            self.best_metrics = checkpoint['best_metrics']
+        
+        # Restore early stopping state
+        if 'early_stopping_counter' in checkpoint:
+            self.early_stopping.counter = checkpoint['early_stopping_counter']
+        if 'early_stopping_best_score' in checkpoint:
+            self.early_stopping.best_score = checkpoint['early_stopping_best_score']
+        
         return checkpoint['epoch'], checkpoint['metrics']
     
     def train(self, num_epochs: int, verbose: bool = True) -> Dict[str, list]:
@@ -448,7 +471,7 @@ class SNPTrainer:
         
         start_time = time.time()
         
-        for epoch in range(num_epochs):
+        for epoch in range(self.start_epoch, num_epochs):
             epoch_start = time.time()
             
             # Store learning rate at the beginning of each epoch
@@ -592,4 +615,8 @@ class SNPTrainer:
         print(f"  Best model metrics: {best_metrics_path}")
         
         return self.history
+
+
+# Backward compatibility alias
+SNPTrainer = VarTrainer
 

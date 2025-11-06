@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aquila"
+version = "0.1.0"
+description = "Not yet"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Lei Gu", email = "goley04@foxmail.com"}
+]
+keywords = ["genomics", "deep-learning", "snp", "genomic-selection", "pytorch"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "torch>=2.9.0,<3.0.0",
+    "numpy>=1.21.0",
+    "pandas>=1.3.0",
+    "scikit-learn>=1.0.0",
+    "scipy>=1.7.0",
+    "pyyaml>=5.4.0",
+    "tqdm>=4.62.0",
+    "torchinfo>=1.8.0",
+]
+
+[project.scripts]
+aquila-train = "aquila.scripts.aquila_snp_train:main"
+aquila-predict = "aquila.scripts.aquila_snp_predict:main"
+
+[project.urls]
+Homepage = "https://github.com/GooLey1025/aquila"
+Repository = "https://github.com/GooLey1025/aquila"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["aquila*"]
+namespaces = false
+

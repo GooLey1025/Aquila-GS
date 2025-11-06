@@ -147,12 +147,12 @@ def parse_genotype_diploid_onehot(geno_path: str) -> Tuple[np.ndarray, List[str]
     # Initialize SNP matrix with 8 dimensions per SNP
     snp_matrix = np.zeros((n_samples, n_snps, 8), dtype=np.float32)
     
-    # Mapping from nucleotide to one-hot position
+    # Mapping from nucleotide to one-hot position (alphabetical order: A C G T)
     nucleotide_to_onehot = {
         'A': [1, 0, 0, 0],
-        'T': [0, 1, 0, 0],
-        'C': [0, 0, 1, 0],
-        'G': [0, 0, 0, 1],
+        'C': [0, 1, 0, 0],
+        'G': [0, 0, 1, 0],
+        'T': [0, 0, 0, 1],
     }
     
     # Convert genotypes to diploid one-hot encoding
@@ -200,6 +200,227 @@ def parse_genotype_diploid_onehot(geno_path: str) -> Tuple[np.ndarray, List[str]
 # Factory Function
 ###############################################################################
 
+###############################################################################
+# VCF Encoding (for multi-variant-type analysis)
+###############################################################################
+
+def parse_genotype_vcf(
+    vcf_path: str,
+    variant_types: List[str] = None
+) -> dict:
+    """
+    Parse VCF file with variant type filtering for multi-branch architectures.
+    
+    File format:
+    Standard VCF with phased genotypes (GT field: 0|0, 0|1, 1|0, 1|1, .|.)
+    ID column contains variant type prefix (SNP-, pdSNP-, INDEL-, SV-)
+    
+    Args:
+        vcf_path: Path to VCF file
+        variant_types: List of variant types to extract (e.g., ["SNP", "INDEL", "SV"])
+                      If None, extract all variants
+                      
+    Returns:
+        Dictionary mapping variant_type to (matrix, sample_ids, variant_ids):
+        {
+            'SNP': (snp_matrix, sample_ids, snp_ids),
+            'INDEL': (indel_matrix, sample_ids, indel_ids),
+            'SV': (sv_matrix, sample_ids, sv_ids)
+        }
+        Each matrix has shape (n_samples, n_variants, 8) with diploid one-hot encoding
+        
+    Encoding scheme:
+    - 0|0 (REF/REF): [ref_onehot, ref_onehot]
+    - 0|1 (REF/ALT): [ref_onehot, alt_onehot]
+    - 1|0 (ALT/REF): [alt_onehot, ref_onehot]
+    - 1|1 (ALT/ALT): [alt_onehot, alt_onehot]
+    - .|. or ./. (missing): [0,0,0,0, 0,0,0,0]
+    """
+    print(f"Loading VCF file: {vcf_path}")
+    if variant_types:
+        print(f"Filtering for variant types: {variant_types}")
+    
+    # Nucleotide to one-hot mapping (alphabetical order: A C G T)
+    nucleotide_to_onehot = {
+        'A': [1, 0, 0, 0],
+        'C': [0, 1, 0, 0],
+        'G': [0, 0, 1, 0],
+        'T': [0, 0, 0, 1],
+    }
+    
+    # Read VCF file
+    variants_by_type = {vtype: [] for vtype in (variant_types or [])}
+    sample_ids = None
+    
+    with open(vcf_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            
+            # Skip empty lines
+            if not line:
+                continue
+            
+            # Parse header to get sample IDs
+            if line.startswith('#CHROM'):
+                fields = line.split('\t')
+                # Standard VCF columns: CHROM, POS, ID, REF, ALT, QUAL, FILTER, INFO, FORMAT, then samples
+                sample_ids = fields[9:]  # All columns after FORMAT
+                print(f"Found {len(sample_ids)} samples in VCF")
+                continue
+            
+            # Skip other header lines
+            if line.startswith('#'):
+                continue
+            
+            # Parse variant line
+            fields = line.split('\t')
+            chrom = fields[0]
+            pos = fields[1]
+            variant_id = fields[2]
+            ref = fields[3]
+            alt = fields[4]
+            format_field = fields[8]
+            genotypes = fields[9:]
+            
+            # Determine variant type from ID
+            variant_type = None
+            if variant_types:
+                for vtype in variant_types:
+                    if vtype in variant_id:
+                        variant_type = vtype
+                        break
+                # Skip if not in requested types
+                if variant_type is None:
+                    continue
+            else:
+                # If no filtering, determine type from ID
+                if 'SNP' in variant_id:
+                    variant_type = 'SNP'
+                elif 'INDEL' in variant_id:
+                    variant_type = 'INDEL'
+                elif 'SV' in variant_id:
+                    variant_type = 'SV'
+                else:
+                    variant_type = 'OTHER'
+                
+                if variant_type not in variants_by_type:
+                    variants_by_type[variant_type] = []
+            
+            # Parse GT field (assume GT is first in FORMAT)
+            gt_idx = format_field.split(':').index('GT') if 'GT' in format_field else 0
+            
+            # Encode genotypes for this variant
+            variant_encodings = []
+            for gt_field in genotypes:
+                gt = gt_field.split(':')[gt_idx]
+                
+                # Parse phased/unphased genotypes
+                if '|' in gt:
+                    alleles = gt.split('|')
+                elif '/' in gt:
+                    alleles = gt.split('/')
+                else:
+                    alleles = ['.', '.']
+                
+                # Encode diploid genotype
+                encoding = np.zeros(8, dtype=np.float32)
+                
+                # Check for missing
+                if alleles[0] == '.' or alleles[1] == '.':
+                    # Missing: all zeros
+                    pass
+                else:
+                    # Parse allele indices
+                    try:
+                        allele1_idx = int(alleles[0])
+                        allele2_idx = int(alleles[1])
+                        
+                        # Get nucleotides (0=REF, 1=ALT)
+                        allele1_nuc = ref if allele1_idx == 0 else alt
+                        allele2_nuc = ref if allele2_idx == 0 else alt
+                        
+                        # Encode if valid nucleotides
+                        if allele1_nuc in nucleotide_to_onehot and allele2_nuc in nucleotide_to_onehot:
+                            encoding[:4] = nucleotide_to_onehot[allele1_nuc]
+                            encoding[4:] = nucleotide_to_onehot[allele2_nuc]
+                    except (ValueError, IndexError):
+                        # Invalid genotype, leave as zeros
+                        pass
+                
+                variant_encodings.append(encoding)
+            
+            # Store variant data
+            variants_by_type[variant_type].append({
+                'id': variant_id,
+                'encodings': np.array(variant_encodings)  # Shape: (n_samples, 8)
+            })
+    
+    if sample_ids is None:
+        raise ValueError("No sample IDs found in VCF file. Make sure file has #CHROM header line.")
+    
+    # Convert to matrices
+    result = {}
+    for vtype, variants in variants_by_type.items():
+        if len(variants) == 0:
+            print(f"Warning: No {vtype} variants found")
+            continue
+        
+        n_variants = len(variants)
+        n_samples = len(sample_ids)
+        
+        # Create matrix: (n_samples, n_variants, 8)
+        matrix = np.zeros((n_samples, n_variants, 8), dtype=np.float32)
+        variant_ids = []
+        
+        for i, variant in enumerate(variants):
+            matrix[:, i, :] = variant['encodings']
+            variant_ids.append(variant['id'])
+        
+        result[vtype] = (matrix, sample_ids, variant_ids)
+        print(f"  {vtype}: {n_variants} variants × {n_samples} samples")
+    
+    return result
+
+
+def parse_genotype_snp_vcf(vcf_path: str) -> Tuple[np.ndarray, List[str], List[str]]:
+    """
+    Parse VCF file extracting only SNP variants.
+    
+    Returns:
+        snp_matrix: (n_samples, n_snps, 8) array
+        sample_ids: List of sample IDs
+        snp_ids: List of SNP IDs
+    """
+    result = parse_genotype_vcf(vcf_path, variant_types=['SNP'])
+    if 'SNP' not in result:
+        raise ValueError("No SNP variants found in VCF file")
+    return result['SNP']
+
+
+def parse_genotype_snp_indel_vcf(vcf_path: str) -> dict:
+    """
+    Parse VCF file extracting SNP and INDEL variants.
+    
+    Returns:
+        Dictionary with 'SNP' and 'INDEL' keys, each mapping to (matrix, sample_ids, variant_ids)
+    """
+    return parse_genotype_vcf(vcf_path, variant_types=['SNP', 'INDEL'])
+
+
+def parse_genotype_snp_indel_sv_vcf(vcf_path: str) -> dict:
+    """
+    Parse VCF file extracting SNP, INDEL, and SV variants.
+    
+    Returns:
+        Dictionary with 'SNP', 'INDEL', and 'SV' keys, each mapping to (matrix, sample_ids, variant_ids)
+    """
+    return parse_genotype_vcf(vcf_path, variant_types=['SNP', 'INDEL', 'SV'])
+
+
+###############################################################################
+# Factory Function
+###############################################################################
+
 def parse_genotype_file(geno_path: str, encoding_type: str = 'token') -> Tuple[np.ndarray, List[str], List[str]]:
     """
     Parse genotype file using specified encoding strategy.
@@ -209,11 +430,16 @@ def parse_genotype_file(geno_path: str, encoding_type: str = 'token') -> Tuple[n
         encoding_type: Type of encoding ('token' or 'diploid_onehot')
             - 'token': Returns (n_samples, n_snps) with values {0,1,2,3} for use with snp_embedding
             - 'diploid_onehot': Returns (n_samples, n_snps, 8) with one-hot encoded diploid genotypes
+            - 'snp_vcf': Returns (n_samples, n_snps, 8) from VCF with only SNPs
+            - 'snp_indel_vcf': Returns dict with SNP and INDEL matrices
+            - 'snp_indel_sv_vcf': Returns dict with SNP, INDEL, and SV matrices
         
     Returns:
         snp_matrix: Encoded SNP matrix (shape depends on encoding type)
         sample_ids: List of sample IDs
         snp_ids: List of SNP IDs
+        
+        For multi-branch VCF types, returns dict instead of tuple
         
     Raises:
         ValueError: If encoding_type is not recognized
@@ -222,9 +448,15 @@ def parse_genotype_file(geno_path: str, encoding_type: str = 'token') -> Tuple[n
         return parse_genotype_token(geno_path)
     elif encoding_type == 'diploid_onehot':
         return parse_genotype_diploid_onehot(geno_path)
+    elif encoding_type == 'snp_vcf':
+        return parse_genotype_snp_vcf(geno_path)
+    elif encoding_type == 'snp_indel_vcf':
+        return parse_genotype_snp_indel_vcf(geno_path)
+    elif encoding_type == 'snp_indel_sv_vcf':
+        return parse_genotype_snp_indel_sv_vcf(geno_path)
     else:
         raise ValueError(
             f"Unknown encoding type: {encoding_type}. "
-            f"Available options: ['token', 'diploid_onehot']"
+            f"Available options: ['token', 'diploid_onehot', 'snp_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf']"
         )
 

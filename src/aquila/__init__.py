@@ -6,8 +6,12 @@ A powerful PyTorch-based framework for genomic prediction using SNP data.
 
 __version__ = "0.1.0"
 
-from .snpnn import SNPNeuralNetwork, create_model_from_config
-from .trainer import SNPTrainer, EarlyStopping
+from .varnn import VariantsNeuralNetwork, create_model_from_config
+# Backward compatibility alias
+SNPNeuralNetwork = VariantsNeuralNetwork
+from .trainer import VarTrainer, EarlyStopping
+# Backward compatibility alias
+SNPTrainer = VarTrainer
 from .metrics import (
     MultiTaskLoss,
     MetricsCalculator,
@@ -22,7 +26,7 @@ from .layers import (
     ClassificationHead,
 )
 from .data_utils import (
-    SNPDataset,
+    VariantsDataset,
     create_data_loaders,
     parse_genotype_file,
     parse_phenotype_file,
@@ -36,9 +40,11 @@ from .utils import (
 
 __all__ = [
     # Main components
-    "SNPNeuralNetwork",
+    "VariantsNeuralNetwork",
+    "SNPNeuralNetwork",  # Backward compatibility
     "create_model_from_config",
-    "SNPTrainer",
+    "VarTrainer",
+    "SNPTrainer",  # Backward compatibility
     "EarlyStopping",
     
     # Metrics and losses
@@ -56,7 +62,7 @@ __all__ = [
     "ClassificationHead",
     
     # Data utilities
-    "SNPDataset",
+    "VariantsDataset",
     "create_data_loaders",
     "parse_genotype_file",
     "parse_phenotype_file",

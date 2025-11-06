@@ -9,6 +9,10 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
+import os
+import json
+import hashlib
+import pickle
 
 
 def parse_genotype_file(geno_path: str) -> Tuple[np.ndarray, List[str], List[str]]:
@@ -132,12 +136,15 @@ def parse_phenotype_file(
     return pheno_df, regression_cols, classification_cols
 
 
-class SNPDataset(Dataset):
-    """PyTorch Dataset for SNP data with multi-task phenotypes."""
+class VariantsDataset(Dataset):
+    """PyTorch Dataset for variant data with multi-task phenotypes.
+    
+    Supports both single-branch (tensor) and multi-branch (dict) inputs.
+    """
     
     def __init__(
         self,
-        snp_matrix: np.ndarray,
+        snp_matrix,  # Can be np.ndarray or dict
         phenotype_df: pd.DataFrame,
         sample_ids: List[str],
         regression_cols: List[str],
@@ -148,24 +155,41 @@ class SNPDataset(Dataset):
     ):
         """
         Args:
-            snp_matrix: (n_samples, n_snps) array
+            snp_matrix: (n_samples, n_variants) array or dict of arrays for multi-branch
+                       Dict format: {'snp': array, 'indel': array, 'sv': array}
             phenotype_df: DataFrame with phenotypes
-            sample_ids: List of sample IDs matching snp_matrix rows
+            sample_ids: List of sample IDs matching matrix rows
             regression_cols: List of regression task columns
             classification_cols: List of classification task columns
             normalize_regression: Whether to apply z-score normalization to regression targets
             regression_means: Pre-computed means for normalization (for val/test sets)
             regression_stds: Pre-computed stds for normalization (for val/test sets)
         """
-        # Handle both 2D (token) and 3D (diploid_onehot) encodings
-        if snp_matrix.ndim == 2:
-            # Token encoding: (n_samples, n_snps) -> convert to long
-            self.snp_matrix = torch.from_numpy(snp_matrix).long()
-        elif snp_matrix.ndim == 3:
-            # Diploid one-hot encoding: (n_samples, n_snps, 8) -> keep as float
-            self.snp_matrix = torch.from_numpy(snp_matrix).float()
+        # Handle multi-branch input (dict) or single-branch (array)
+        self.is_multi_branch = isinstance(snp_matrix, dict)
+        
+        if self.is_multi_branch:
+            # Multi-branch: store each variant type separately
+            self.variant_matrices = {}
+            for variant_type, matrix in snp_matrix.items():
+                if matrix.ndim == 2:
+                    self.variant_matrices[variant_type] = torch.from_numpy(matrix).long()
+                elif matrix.ndim == 3:
+                    self.variant_matrices[variant_type] = torch.from_numpy(matrix).float()
+                else:
+                    raise ValueError(f"Unexpected matrix shape for {variant_type}: {matrix.shape}")
+            self.snp_matrix = None
         else:
-            raise ValueError(f"Unexpected snp_matrix shape: {snp_matrix.shape}")
+            # Single-branch: handle both 2D (token) and 3D (diploid_onehot) encodings
+            if snp_matrix.ndim == 2:
+                # Token encoding: (n_samples, n_snps) -> convert to long
+                self.snp_matrix = torch.from_numpy(snp_matrix).long()
+            elif snp_matrix.ndim == 3:
+                # Diploid one-hot encoding: (n_samples, n_snps, 8) -> keep as float
+                self.snp_matrix = torch.from_numpy(snp_matrix).float()
+            else:
+                raise ValueError(f"Unexpected snp_matrix shape: {snp_matrix.shape}")
+            self.variant_matrices = None
         
         self.sample_ids = sample_ids
         self.regression_cols = regression_cols
@@ -222,7 +246,7 @@ class SNPDataset(Dataset):
         if regression_cols:
             self.regression_targets = torch.tensor(self.regression_targets, dtype=torch.float32)
             self.regression_masks = torch.tensor(self.regression_masks, dtype=torch.bool)
-            
+        
             # Apply z-score normalization for regression targets
             if normalize_regression:
                 if regression_means is None or regression_stds is None:
@@ -270,11 +294,18 @@ class SNPDataset(Dataset):
     def __getitem__(self, idx):
         real_idx = self.valid_indices[idx]
         
-        item = {
-            'snp': self.snp_matrix[real_idx],
-            'sample_id': self.sample_ids[real_idx],
-        }
+        item = {'sample_id': self.sample_ids[real_idx]}
         
+        # Add variant data (single-branch or multi-branch)
+        if self.is_multi_branch:
+            # Multi-branch: return dict of variant types
+            for variant_type, matrix in self.variant_matrices.items():
+                item[variant_type] = matrix[real_idx]
+        else:
+            # Single-branch: return single tensor
+            item['snp'] = self.snp_matrix[real_idx]
+        
+        # Add phenotype targets
         if self.regression_cols:
             item['regression_targets'] = self.regression_targets[idx]
             item['regression_mask'] = self.regression_masks[idx]
@@ -284,6 +315,115 @@ class SNPDataset(Dataset):
             item['classification_mask'] = self.classification_masks[idx]
         
         return item
+
+
+def _generate_cache_key(geno_path: str, pheno_path: str, encoding_type: str, 
+                        classification_tasks: Optional[List[str]], val_split: float, 
+                        test_split: float, normalize_regression: bool, 
+                        skew_threshold: float = 2.0) -> str:
+    """Generate unique cache key based on data configuration."""
+    config_dict = {
+        'geno_path': str(geno_path),
+        'geno_mtime': os.path.getmtime(geno_path) if os.path.exists(geno_path) else 0,
+        'pheno_path': str(pheno_path),
+        'pheno_mtime': os.path.getmtime(pheno_path) if os.path.exists(pheno_path) else 0,
+        'encoding_type': encoding_type,
+        'classification_tasks': classification_tasks,
+        'val_split': val_split,
+        'test_split': test_split,
+        'normalize_regression': normalize_regression,
+        'skew_threshold': skew_threshold,
+    }
+    
+    key_string = json.dumps(config_dict, sort_keys=True)
+    return hashlib.md5(key_string.encode()).hexdigest()
+
+
+def _save_data_cache(cache_dir: Path, train_loader: DataLoader, 
+                     val_loader: Optional[DataLoader], test_loader: Optional[DataLoader], 
+                     normalization_stats: Optional[Dict], cache_key: str):
+    """Save data loaders and stats to cache."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n💾 Saving data cache to: {cache_dir}")
+    
+    # Extract dataset from DataLoader and save
+    with open(cache_dir / 'train_dataset.pkl', 'wb') as f:
+        pickle.dump(train_loader.dataset, f)
+    print(f"  ✓ Saved train dataset ({len(train_loader.dataset)} samples)")
+    
+    if val_loader:
+        with open(cache_dir / 'val_dataset.pkl', 'wb') as f:
+            pickle.dump(val_loader.dataset, f)
+        print(f"  ✓ Saved val dataset ({len(val_loader.dataset)} samples)")
+    
+    if test_loader:
+        with open(cache_dir / 'test_dataset.pkl', 'wb') as f:
+            pickle.dump(test_loader.dataset, f)
+        print(f"  ✓ Saved test dataset ({len(test_loader.dataset)} samples)")
+    
+    # Save normalization stats
+    with open(cache_dir / 'normalization_stats.pkl', 'wb') as f:
+        pickle.dump(normalization_stats, f)
+    print(f"  ✓ Saved normalization statistics")
+    
+    # Save cache config
+    with open(cache_dir / 'data_config.json', 'w') as f:
+        json.dump({'cache_key': cache_key}, f)
+    print(f"  ✓ Cache key: {cache_key}\n")
+
+
+def _load_cached_loader(cache_path: Path, batch_size: int, num_workers: int = 4, 
+                        shuffle: bool = True) -> Optional[DataLoader]:
+    """Load dataset from cache and create DataLoader."""
+    if not cache_path.exists():
+        return None
+    
+    with open(cache_path, 'rb') as f:
+        dataset = pickle.load(f)
+    
+    return DataLoader(dataset, batch_size=batch_size, 
+                     shuffle=shuffle, num_workers=num_workers)
+
+
+def detect_skewed_phenotypes(pheno_df: pd.DataFrame, regression_tasks: List[str], 
+                            skew_threshold: float = 2.0) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Detect highly skewed phenotypes and apply log transformation.
+    
+    Args:
+        pheno_df: DataFrame with phenotype data
+        regression_tasks: List of regression task column names
+        skew_threshold: Threshold for absolute skewness to trigger log transform
+    
+    Returns:
+        transformed_df: DataFrame with log-transformed phenotypes
+        log_transformed_tasks: List of task names that were log-transformed
+    """
+    from scipy.stats import skew
+    
+    log_transformed_tasks = []
+    transformed_df = pheno_df.copy()
+    
+    print(f"\nDetecting skewed phenotypes (threshold: |skewness| > {skew_threshold}):")
+    
+    for task in regression_tasks:
+        values = pheno_df[task].dropna()
+        if len(values) < 3:
+            continue
+        
+        skewness = skew(values)
+        if abs(skewness) > skew_threshold:
+            # Apply log(x + 1) transformation
+            transformed_df[task] = np.log1p(pheno_df[task])
+            log_transformed_tasks.append(task)
+            
+            print(f"  [{task}] Skewness={skewness:.3f} -> Applied log(x+1) transform")
+    
+    if not log_transformed_tasks:
+        print(f"  No phenotypes required log transformation")
+    
+    return transformed_df, log_transformed_tasks
 
 
 def create_data_loaders(
@@ -296,6 +436,9 @@ def create_data_loaders(
     num_workers: int = 4,
     normalize_regression: bool = True,
     encoding_type: str = 'token',
+    cache_dir: Optional[str] = None,
+    data_restart: bool = False,
+    skew_threshold: float = 2.0,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], Optional[Dict]]:
     """
     Create train/val/test data loaders with z-score normalization for regression targets.
@@ -307,24 +450,102 @@ def create_data_loaders(
         batch_size: Batch size
         val_split: Validation split ratio
         test_split: Test split ratio
-        random_seed: Random seed for splitting
         num_workers: Number of data loading workers
         normalize_regression: Apply z-score normalization to regression targets
         encoding_type: Encoding strategy ('token' or 'diploid_onehot')
+        cache_dir: Directory to save/load data cache (None = no caching)
+        data_restart: If True, ignore cache and re-process data
+        skew_threshold: Threshold for absolute skewness to trigger log(x+1) transformation
         
     Returns:
         train_loader, val_loader, test_loader, normalization_stats
     """
+    # Check for cached data if cache_dir is provided
+    if cache_dir is not None and not data_restart:
+        cache_path = Path(cache_dir) / 'data_cache'
+        cache_config_file = cache_path / 'data_config.json'
+        
+        # Generate cache key
+        cache_key = _generate_cache_key(
+            geno_path, pheno_path, encoding_type, classification_tasks,
+            val_split, test_split, normalize_regression, skew_threshold
+        )
+        
+        # Check if valid cache exists
+        if cache_path.exists() and cache_config_file.exists():
+            with open(cache_config_file, 'r') as f:
+                cached_config = json.load(f)
+            
+            if cached_config.get('cache_key') == cache_key:
+                print("\n🔄 Found valid data cache, loading from disk...")
+                print(f"   Cache directory: {cache_path}")
+                
+                # Load from cache
+                train_loader = _load_cached_loader(
+                    cache_path / 'train_dataset.pkl', batch_size, num_workers, shuffle=True
+                )
+                val_loader = _load_cached_loader(
+                    cache_path / 'val_dataset.pkl', batch_size, num_workers, shuffle=False
+                )
+                test_loader = _load_cached_loader(
+                    cache_path / 'test_dataset.pkl', batch_size, num_workers, shuffle=False
+                )
+                
+                with open(cache_path / 'normalization_stats.pkl', 'rb') as f:
+                    normalization_stats = pickle.load(f)
+                
+                print(f"   ✓ Loaded train: {len(train_loader.dataset)} samples")
+                if val_loader:
+                    print(f"   ✓ Loaded val: {len(val_loader.dataset)} samples")
+                if test_loader:
+                    print(f"   ✓ Loaded test: {len(test_loader.dataset)} samples")
+                print(f"   ✓ Cache loading complete!\n")
+                
+                return train_loader, val_loader, test_loader, normalization_stats
+            else:
+                print(f"\n⚠️  Cache key mismatch, will re-process data")
+        else:
+            print(f"\n📦 No cache found, will process data and create cache")
+    
     # Load data using specified encoding
     from aquila.encoding import parse_genotype_file as parse_geno_with_encoding
-    snp_matrix, sample_ids, snp_ids = parse_geno_with_encoding(geno_path, encoding_type)
+    
+    # Check if multi-branch encoding
+    multi_branch_encodings = ['snp_indel_vcf', 'snp_indel_sv_vcf']
+    is_multi_branch = encoding_type in multi_branch_encodings
+    
+    if is_multi_branch:
+        # Multi-branch VCF: returns dict
+        variant_data = parse_geno_with_encoding(geno_path, encoding_type)
+        # Extract sample IDs from first variant type
+        first_variant_type = list(variant_data.keys())[0]
+        _, sample_ids, _ = variant_data[first_variant_type]
+        
+        # Create dict of matrices (n_samples, n_variants, 8)
+        snp_matrix = {vtype: data[0] for vtype, data in variant_data.items()}
+    else:
+        # Single-branch: returns tuple
+        result = parse_geno_with_encoding(geno_path, encoding_type)
+        if encoding_type == 'snp_vcf':
+            # snp_vcf returns tuple
+            snp_matrix, sample_ids, snp_ids = result
+        else:
+            # token or diploid_onehot
+            snp_matrix, sample_ids, snp_ids = result
 
     pheno_df, regression_cols, classification_cols = parse_phenotype_file(
         pheno_path, classification_tasks
     )
     
+    # Detect and transform skewed phenotypes
+    log_transformed_tasks = []
+    if regression_cols and skew_threshold > 0:
+        pheno_df, log_transformed_tasks = detect_skewed_phenotypes(
+            pheno_df, regression_cols, skew_threshold
+        )
+    
     # First create dataset WITHOUT normalization to get valid indices
-    dataset_unnormalized = SNPDataset(
+    dataset_unnormalized = VariantsDataset(
         snp_matrix, pheno_df, sample_ids,
         regression_cols, classification_cols,
         normalize_regression=False  # Don't normalize yet
@@ -371,7 +592,9 @@ def create_data_loaders(
         normalization_stats = {
             'regression_means': regression_means_np,
             'regression_stds': regression_stds_np,
-            'regression_tasks': regression_cols
+            'regression_tasks': regression_cols,
+            'log_transformed_tasks': log_transformed_tasks,
+            'skew_threshold': skew_threshold,
         }
         
         print(f"Computed normalization statistics from training set:")
@@ -380,7 +603,7 @@ def create_data_loaders(
     
     # Now create normalized datasets using the training statistics
     # Training set: compute statistics from training data
-    train_dataset = SNPDataset(
+    train_dataset = VariantsDataset(
         snp_matrix, pheno_df, sample_ids,
         regression_cols, classification_cols,
         normalize_regression=normalize_regression,
@@ -418,6 +641,16 @@ def create_data_loaders(
         )
     
     print(f"\nData split: Train={train_size}, Val={val_size}, Test={test_size}")
+    
+    # Save to cache if cache_dir is provided
+    if cache_dir is not None:
+        cache_path = Path(cache_dir) / 'data_cache'
+        cache_key = _generate_cache_key(
+            geno_path, pheno_path, encoding_type, classification_tasks,
+            val_split, test_split, normalize_regression, skew_threshold
+        )
+        _save_data_cache(cache_path, train_loader, val_loader, test_loader, 
+                        normalization_stats, cache_key)
     
     return train_loader, val_loader, test_loader, normalization_stats
 
@@ -473,7 +706,7 @@ def create_kfold_data_loaders(
         raise ValueError(f"Unexpected snp_matrix shape: {snp_matrix.shape}")
     
     # First create dataset WITHOUT normalization to get valid indices
-    dataset_unnormalized = SNPDataset(
+    dataset_unnormalized = VariantsDataset(
         snp_matrix, pheno_df, sample_ids,
         regression_cols, classification_cols,
         normalize_regression=False
@@ -532,7 +765,7 @@ def create_kfold_data_loaders(
             print(f"  Computed normalization stats from training set")
         
         # Create normalized dataset using the training statistics
-        fold_dataset = SNPDataset(
+        fold_dataset = VariantsDataset(
             snp_matrix, pheno_df, sample_ids,
             regression_cols, classification_cols,
             normalize_regression=normalize_regression,

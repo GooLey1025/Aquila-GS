@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Aquila SNP Training Script
+Aquila VCF Training Script
 
-Train a multi-task deep learning model for genomic prediction.
+Train a multi-task deep learning model for genomic prediction using VCF input.
+Supports multi-branch architectures for SNP/INDEL/SV variants.
 
 Usage:
-    python aquila_snp_train.py --config params.yaml
+    python aquila_train.py --config params.yaml --vcf data.vcf --pheno data.pheno.tsv
 """
 
 import argparse
@@ -13,20 +14,17 @@ import torch
 import numpy as np
 from pathlib import Path
 import time
-from aquila.varnn import VariantsNeuralNetwork, create_model_from_config
-# Backward compatibility
-SNPNeuralNetwork = VariantsNeuralNetwork
+from aquila.varnn import create_model_from_config
 from aquila.trainer import VarTrainer
-# Backward compatibility
-SNPTrainer = VarTrainer
 from aquila.data_utils import create_data_loaders
 from aquila.utils import set_seed, save_config, load_config, print_model_summary
 import pandas as pd
 from aquila.metrics import MetricsCalculator
 
+
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Train Aquila SNP model')
+    parser = argparse.ArgumentParser(description='Train Aquila model with VCF input')
     
     parser.add_argument(
         '--config',
@@ -36,10 +34,10 @@ def parse_args():
     )
     
     parser.add_argument(
-        '--geno',
+        '--vcf',
         type=str,
         default=None,
-        help='Path to genotype file (overrides config)'
+        help='Path to VCF file (overrides config)'
     )
     
     parser.add_argument(
@@ -47,6 +45,14 @@ def parse_args():
         type=str,
         default=None,
         help='Path to phenotype file (overrides config)'
+    )
+    
+    parser.add_argument(
+        '--encoding-type',
+        type=str,
+        default='snp_vcf',
+        choices=['snp_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
+        help='VCF encoding type: snp_vcf (SNP only), snp_indel_vcf (SNP+INDEL), snp_indel_sv_vcf (SNP+INDEL+SV)'
     )
     
     parser.add_argument(
@@ -71,6 +77,27 @@ def parse_args():
         help='Device to use for training (cuda or cpu)'
     )
     
+    parser.add_argument(
+        '-dr',
+        '--data-restart',
+        action='store_true',
+        help='Ignore data cache and re-process data from scratch'
+    )
+    
+    parser.add_argument(
+        '--resume',
+        action='store_true',
+        help='Resume training from latest checkpoint'
+    )
+    
+    parser.add_argument(
+        '-st',
+        '--skew-threshold',
+        type=float,
+        default=2.0,
+        help='Skewness threshold for auto log transformation (default: 2.0, set to 0 to disable)'
+    )
+    
     return parser.parse_args()
 
 
@@ -81,21 +108,26 @@ def main():
     
     # Load configuration
     print("=" * 80)
-    print("AQUILA: SNP Neural Network Training")
+    print("AQUILA: VCF Training")
     print("=" * 80)
     print(f"\nLoading configuration from: {args.config}")
     config = load_config(args.config)
     
     # Override with command line arguments
-    if args.geno:
-        config['data']['geno_file'] = args.geno
+    if args.vcf:
+        config['data']['geno_file'] = args.vcf
     if args.pheno:
         config['data']['pheno_file'] = args.pheno
+    
+    # Set encoding type
+    encoding_type = args.encoding_type
+    config['data']['encoding_type'] = encoding_type
     
     # Set random seed
     set_seed(args.seed)
     
     print(f"Random seed: {args.seed}")
+    print(f"Encoding type: {encoding_type}")
     
     # Create output directory
     output_dir = Path(args.output)
@@ -110,17 +142,14 @@ def main():
     train_config = config.get('train', {})
     
     # Get data paths
-    geno_file = data_config.get('geno_file', 'data/data.geno')
-    pheno_file = data_config.get('pheno_file', 'data/data.pheno')
+    vcf_file = data_config['geno_file']
+    pheno_file = data_config['pheno_file']
     
     # Get classification task configuration
     classification_tasks = data_config.get('classification_tasks', None)
     
-    # Get encoding type
-    encoding_type = data_config.get('encoding_type', 'token')
-    
     print(f"\nData Configuration:")
-    print(f"  Genotype file: {geno_file}")
+    print(f"  VCF file: {vcf_file}")
     print(f"  Phenotype file: {pheno_file}")
     print(f"  Encoding type: {encoding_type}")
     
@@ -137,7 +166,7 @@ def main():
     
     time1 = time.time()
     train_loader, val_loader, test_loader, normalization_stats = create_data_loaders(
-        geno_path=geno_file,
+        geno_path=vcf_file,
         pheno_path=pheno_file,
         classification_tasks=classification_tasks,
         batch_size=train_config.get('batch_size', 32),
@@ -146,9 +175,22 @@ def main():
         num_workers=train_config.get('num_workers', 4),
         normalize_regression=train_config.get('normalize_regression', True),
         encoding_type=encoding_type,
+        cache_dir=output_dir,
+        data_restart=args.data_restart,
+        skew_threshold=args.skew_threshold,
     )
     time2 = time.time()
-    print(f"Time taken to load data: {time2 - time1} seconds")
+    print(f"Time taken to load/process data: {time2 - time1:.2f} seconds")
+    
+    # Print log transformation info
+    if normalization_stats and 'log_transformed_tasks' in normalization_stats:
+        log_transformed = normalization_stats['log_transformed_tasks']
+        if log_transformed:
+            print(f"\nLog-transformed phenotypes ({len(log_transformed)}):")
+            for task in log_transformed:
+                print(f"  - {task}")
+        else:
+            print(f"\nNo phenotypes required log transformation (skew threshold: {args.skew_threshold})")
     
     # Save normalization statistics
     if normalization_stats:
@@ -162,22 +204,35 @@ def main():
     sample_batch = next(iter(train_loader))
     num_regression_tasks = 0
     num_classification_tasks = 0
-    seq_length = sample_batch['snp'].shape[1]
+    
+    # Determine sequence length(s) for multi-branch
+    is_multi_branch = encoding_type in ['snp_indel_vcf', 'snp_indel_sv_vcf']
+    
+    if is_multi_branch:
+        # Multi-branch: get seq_length for each variant type
+        seq_length = {}
+        for key in sample_batch.keys():
+            if key not in ['sample_id', 'regression_targets', 'regression_mask', 
+                          'classification_targets', 'classification_mask']:
+                seq_length[key] = sample_batch[key].shape[1]
+        print(f"\nMulti-branch sequence lengths: {seq_length}")
+    else:
+        # Single-branch
+        seq_length = sample_batch['snp'].shape[1]
+        print(f"\nSequence length (variants): {seq_length}")
     
     if 'regression_targets' in sample_batch:
         num_regression_tasks = sample_batch['regression_targets'].shape[1]
     if 'classification_targets' in sample_batch:
         num_classification_tasks = sample_batch['classification_targets'].shape[1]
     
-    print(f"\nDataset Information:")
-    print(f"  Sequence length (SNPs): {seq_length}")
-    print(f"  Number of regression tasks: {num_regression_tasks}")
-    print(f"  Number of classification tasks: {num_classification_tasks}")
-    print(f"  Training samples: {len(train_loader.dataset)}")
+    print(f"Number of regression tasks: {num_regression_tasks}")
+    print(f"Number of classification tasks: {num_classification_tasks}")
+    print(f"Training samples: {len(train_loader.dataset)}")
     if val_loader:
-        print(f"  Validation samples: {len(val_loader.dataset)}")
+        print(f"Validation samples: {len(val_loader.dataset)}")
     if test_loader:
-        print(f"  Test samples: {len(test_loader.dataset)}")
+        print(f"Test samples: {len(test_loader.dataset)}")
     
     # Create model
     print("\n" + "=" * 80)
@@ -215,15 +270,18 @@ def main():
         classification_tasks=classification_task_names
     )
     
-    # Print model summary with torchinfo
-    # Prepare input size based on encoding type
+    # Print model summary
     batch_size = train_config.get('batch_size', 32)
-    if encoding_type == 'diploid_onehot':
-        # For diploid one-hot: (batch_size, seq_length, 8)
-        model_input_size = (batch_size, seq_length, 8)
+    
+    if is_multi_branch:
+        # Multi-branch: create dict input
+        model_input_size = {}
+        for vtype, vlen in seq_length.items():
+            model_input_size[vtype] = (batch_size, vlen, 8)
+        print(f"\nMulti-branch model input sizes: {model_input_size}")
     else:
-        # For token encoding: (batch_size, seq_length)
-        model_input_size = (batch_size, seq_length)
+        # Single-branch
+        model_input_size = (batch_size, seq_length, 8)
     
     print_model_summary(
         model=model,
@@ -267,6 +325,19 @@ def main():
     print(f"  Uncertainty weighting: {train_config.get('uncertainty_weighting', True)}")
     print(f"  Scheduler type: {train_config.get('scheduler_type', 'reduce_on_plateau')}")
     
+    # Resume from checkpoint if requested
+    if args.resume:
+        checkpoint_path = output_dir / 'checkpoints' / 'latest_checkpoint.pt'
+        if checkpoint_path.exists():
+            print(f"\nResuming from checkpoint: {checkpoint_path}")
+            epoch, metrics = trainer.load_checkpoint(str(checkpoint_path))
+            trainer.start_epoch = epoch
+            print(f"Resuming from epoch {epoch + 1}")
+            print(f"Best validation score so far: {trainer.best_val_score:.4f} at epoch {trainer.best_epoch}")
+            print(f"Early stopping counter: {trainer.early_stopping.counter}/{train_config.get('early_stopping_patience', 20)}")
+        else:
+            print("\nWarning: --resume specified but no checkpoint found. Starting fresh training.")
+    
     # Train model
     print("\n" + "=" * 80)
     print("Starting Training")
@@ -290,8 +361,6 @@ def main():
             print("Loaded best checkpoint")
         
         # Collect predictions and targets from test set
-        
-        
         trainer.model.eval()
         all_sample_ids = []
         all_predictions_reg = []
@@ -300,7 +369,19 @@ def main():
         
         with torch.no_grad():
             for batch in test_loader:
-                snp_data = batch['snp'].to(trainer.device)
+                # Handle multi-branch or single-branch input
+                if is_multi_branch:
+                    # Multi-branch: create dict input
+                    variant_inputs = {}
+                    for key in batch.keys():
+                        if key not in ['sample_id', 'regression_targets', 'regression_mask',
+                                      'classification_targets', 'classification_mask']:
+                            variant_inputs[key] = batch[key].to(trainer.device)
+                    snp_data = variant_inputs
+                else:
+                    # Single-branch
+                    snp_data = batch['snp'].to(trainer.device)
+                
                 all_sample_ids.extend(batch['sample_id'])
                 
                 # Get predictions
@@ -333,78 +414,110 @@ def main():
                 regression_means = norm_stats['regression_means']
                 regression_stds = norm_stats['regression_stds']
                 regression_task_names = norm_stats['regression_tasks']
+                log_transformed_tasks = norm_stats.get('log_transformed_tasks', [])
                 
-                # Denormalize predictions and targets
-                predictions_denormalized = predictions_normalized.copy()
-                targets_denormalized = targets_normalized.copy()
+                # Denormalize predictions and targets (reverse Z-score)
+                predictions_log_scale = predictions_normalized.copy()
+                targets_log_scale = targets_normalized.copy()
                 
                 for i in range(len(regression_means)):
-                    # Apply inverse Z-score: original = (normalized * std) + mean
-                    predictions_denormalized[:, i] = (predictions_normalized[:, i] * regression_stds[i]) + regression_means[i]
-                    targets_denormalized[:, i] = (targets_normalized[:, i] * regression_stds[i]) + regression_means[i]
+                    # Apply inverse Z-score: log_scale = (normalized * std) + mean
+                    predictions_log_scale[:, i] = (predictions_normalized[:, i] * regression_stds[i]) + regression_means[i]
+                    targets_log_scale[:, i] = (targets_normalized[:, i] * regression_stds[i]) + regression_means[i]
                 
-                # Calculate metrics on denormalized data
-                test_metrics_denormalized = metrics_calc.compute_regression_metrics(
-                    predictions_denormalized, targets_denormalized, masks
+                # Calculate metrics on log-transformed scale (after reverse Z-score)
+                test_metrics_log_scale = metrics_calc.compute_regression_metrics(
+                    predictions_log_scale, targets_log_scale, masks
                 )
                 
+                # Reverse log transformation to get original scale
+                predictions_original = predictions_log_scale.copy()
+                targets_original = targets_log_scale.copy()
+                
+                for i, task_name in enumerate(regression_task_names):
+                    if task_name in log_transformed_tasks:
+                        # Reverse log(x+1) transformation: original = exp(log_value) - 1
+                        predictions_original[:, i] = np.expm1(predictions_log_scale[:, i])
+                        targets_original[:, i] = np.expm1(targets_log_scale[:, i])
+                
+                # Calculate metrics on original scale
+                test_metrics_original = metrics_calc.compute_regression_metrics(
+                    predictions_original, targets_original, masks
+                )
+                
+                # Print both sets of metrics
+                if log_transformed_tasks:
+                    print("\n" + "=" * 80)
+                    print("Test Set Results (Log-Transformed Scale):")
+                    print("=" * 80)
+                    for key, value in test_metrics_log_scale.items():
+                        if isinstance(value, float):
+                            print(f"  {key}: {value:.4f}")
+                
                 print("\n" + "=" * 80)
-                print("Test Set Results (Denormalized/Original Scale):")
+                print("Test Set Results (Original Scale):")
                 print("=" * 80)
-                for key, value in test_metrics_denormalized.items():
+                for key, value in test_metrics_original.items():
                     if isinstance(value, float):
                         print(f"  {key}: {value:.4f}")
                 
-                # Save denormalized predictions as TSV
-                pred_data_denormalized = {'Sample_ID': all_sample_ids}
+                # Save predictions on both scales
+                import json
+                
+                # Original scale predictions (primary)
+                pred_data_original = {'Sample_ID': all_sample_ids}
                 for i, task_name in enumerate(regression_task_names):
-                    # Create target column with "Missing" for invalid values
                     target_col = []
                     pred_col = []
                     for j in range(len(all_sample_ids)):
-                        if masks[j, i] == 0:  # Invalid/missing value
+                        if masks[j, i] == 0:
                             target_col.append("Missing")
                         else:
-                            target_col.append(targets_denormalized[j, i])
-                        pred_col.append(predictions_denormalized[j, i])
+                            target_col.append(targets_original[j, i])
+                        pred_col.append(predictions_original[j, i])
                     
-                    pred_data_denormalized[f'{task_name}_Target'] = target_col
-                    pred_data_denormalized[f'{task_name}_Pred'] = pred_col
+                    pred_data_original[f'{task_name}_Target'] = target_col
+                    pred_data_original[f'{task_name}_Pred'] = pred_col
                 
-                df_denormalized = pd.DataFrame(pred_data_denormalized)
-                pred_path_denormalized = output_dir / 'test_predictions_denormalized.tsv'
-                df_denormalized.to_csv(pred_path_denormalized, sep='\t', index=False, float_format='%.6f')
-                print(f"\nPredictions saved to: {pred_path_denormalized}")
+                df_original = pd.DataFrame(pred_data_original)
+                pred_path_original = output_dir / 'test_predictions_original_scale.tsv'
+                df_original.to_csv(pred_path_original, sep='\t', index=False, float_format='%.6f')
+                print(f"\nPredictions (original scale) saved to: {pred_path_original}")
+                
+                # Log scale predictions (if any log transformations were applied)
+                if log_transformed_tasks:
+                    pred_data_log = {'Sample_ID': all_sample_ids}
+                    for i, task_name in enumerate(regression_task_names):
+                        target_col = []
+                        pred_col = []
+                        for j in range(len(all_sample_ids)):
+                            if masks[j, i] == 0:
+                                target_col.append("Missing")
+                            else:
+                                target_col.append(targets_log_scale[j, i])
+                            pred_col.append(predictions_log_scale[j, i])
+                        
+                        pred_data_log[f'{task_name}_Target'] = target_col
+                        pred_data_log[f'{task_name}_Pred'] = pred_col
+                    
+                    df_log = pd.DataFrame(pred_data_log)
+                    pred_path_log = output_dir / 'test_predictions_log_scale.tsv'
+                    df_log.to_csv(pred_path_log, sep='\t', index=False, float_format='%.6f')
+                    print(f"Predictions (log scale) saved to: {pred_path_log}")
                 
                 # Save metrics as JSON
-                import json
-                metrics_path_denormalized = output_dir / 'test_metrics_denormalized.json'
-                with open(metrics_path_denormalized, 'w') as f:
-                    json.dump(test_metrics_denormalized, f, indent=2)
-                print(f"Metrics saved to: {metrics_path_denormalized}")
+                metrics_path_original = output_dir / 'test_metrics_original_scale.json'
+                with open(metrics_path_original, 'w') as f:
+                    json.dump(test_metrics_original, f, indent=2)
+                print(f"Metrics (original scale) saved to: {metrics_path_original}")
+                
+                if log_transformed_tasks:
+                    metrics_path_log = output_dir / 'test_metrics_log_scale.json'
+                    with open(metrics_path_log, 'w') as f:
+                        json.dump(test_metrics_log_scale, f, indent=2)
+                    print(f"Metrics (log scale) saved to: {metrics_path_log}")
             else:
-                print("\nWarning: Normalization statistics not found. Predictions will be saved in normalized scale.")
-                
-                # Save predictions as TSV (without task names, in normalized scale)
-                pred_data = {'Sample_ID': all_sample_ids}
-                for i in range(predictions_normalized.shape[1]):
-                    # Create target column with "Missing" for invalid values
-                    target_col = []
-                    pred_col = []
-                    for j in range(len(all_sample_ids)):
-                        if masks[j, i] == 0:  # Invalid/missing value
-                            target_col.append("Missing")
-                        else:
-                            target_col.append(targets_normalized[j, i])
-                        pred_col.append(predictions_normalized[j, i])
-                    
-                    pred_data[f'Task_{i}_Target'] = target_col
-                    pred_data[f'Task_{i}_Pred'] = pred_col
-                
-                df_pred = pd.DataFrame(pred_data)
-                pred_path = output_dir / 'test_predictions.tsv'
-                df_pred.to_csv(pred_path, sep='\t', index=False, float_format='%.6f')
-                print(f"\nPredictions saved to: {pred_path}")
+                print("\nWarning: Normalization statistics not found. Predictions saved in normalized scale.")
     
     print("\n" + "=" * 80)
     print("Training Complete!")
