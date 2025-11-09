@@ -85,6 +85,8 @@ class VarTrainer:
         num_epochs: Optional[int] = None,
         val_score_r_weight: float = 0.8,
         val_score_r2_weight: float = 0.2,
+        is_distributed: bool = False,
+        rank: int = 0,
     ):
         """
         Initialize trainer.
@@ -108,11 +110,15 @@ class VarTrainer:
             num_epochs: Total number of epochs (required for OneCycleLR)
             val_score_r_weight: Weight for Pearson R in validation score (default 0.8)
             val_score_r2_weight: Weight for R² in validation score (default 0.2)
+            is_distributed: Whether running in distributed mode
+            rank: Process rank for distributed training
         """
-        self.model = model.to(device)
+        self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
+        self.is_distributed = is_distributed
+        self.rank = rank
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.gradient_clip_norm = gradient_clip_norm
@@ -405,10 +411,20 @@ class VarTrainer:
         return metrics, all_predictions
     
     def save_checkpoint(self, epoch: int, metrics: Dict[str, float], is_best: bool = False):
-        """Save model checkpoint."""
+        """Save model checkpoint (only on rank 0 for distributed training)."""
+        # Only save on rank 0
+        if self.is_distributed and self.rank != 0:
+            return
+        
+        # Get model state dict (handle DDP wrapper)
+        if self.is_distributed:
+            model_state_dict = self.model.module.state_dict()
+        else:
+            model_state_dict = self.model.state_dict()
+        
         checkpoint = {
             'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_state_dict,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'metrics': metrics,
@@ -431,9 +447,18 @@ class VarTrainer:
             #print(f"Saved best model at epoch {epoch}")
     
     def load_checkpoint(self, checkpoint_path: str):
-        """Load model checkpoint."""
+        """Load model checkpoint (handles DDP wrapper)."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Load model state dict (handle DDP wrapper)
+        state_dict = checkpoint['model_state_dict']
+        if self.is_distributed:
+            # Model is wrapped with DDP, load into module
+            self.model.module.load_state_dict(state_dict)
+        else:
+            # Regular model
+            self.model.load_state_dict(state_dict)
+        
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.history = checkpoint['history']
@@ -465,14 +490,24 @@ class VarTrainer:
         Returns:
             Training history dictionary
         """
-        print(f"Training on device: {self.device}")
-        print(f"Number of parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        print()  # Empty line before training starts
+        if self.rank == 0:
+            if self.is_distributed:
+                # Get parameter count from module for DDP
+                num_params = sum(p.numel() for p in self.model.module.parameters())
+            else:
+                num_params = sum(p.numel() for p in self.model.parameters())
+            print(f"Training on device: {self.device}")
+            print(f"Number of parameters: {num_params:,}")
+            print()  # Empty line before training starts
         
         start_time = time.time()
         
         for epoch in range(self.start_epoch, num_epochs):
             epoch_start = time.time()
+            
+            # Set epoch for DistributedSampler to ensure different data shuffling per epoch
+            if self.is_distributed and hasattr(self.train_loader.sampler, 'set_epoch'):
+                self.train_loader.sampler.set_epoch(epoch)
             
             # Store learning rate at the beginning of each epoch
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -525,8 +560,8 @@ class VarTrainer:
                 # Save checkpoint
                 self.save_checkpoint(epoch + 1, val_metrics, is_best)
                 
-                # Print single-line progress
-                if verbose:
+                # Print single-line progress (only on rank 0)
+                if verbose and self.rank == 0:
                     epoch_time = time.time() - epoch_start
                     train_r2 = train_metrics.get('train_r2', 0.0)
                     train_pearson = train_metrics.get('train_pearson', 0.0)
@@ -549,15 +584,16 @@ class VarTrainer:
                 
                 # Early stopping (based on weighted validation score)
                 if self.early_stopping(val_score):
-                    print(f"\nEarly stopping triggered at epoch {epoch + 1}")
-                    print(f"Best epoch: {self.best_epoch} with val_score: {self.best_val_score:.4f}")
-                    print(f"  (val_r: {self.best_metrics.get('val_r', 0.0):.4f}, val_r2: {self.best_metrics.get('val_r2', 0.0):.4f})")
+                    if self.rank == 0:
+                        print(f"\nEarly stopping triggered at epoch {epoch + 1}")
+                        print(f"Best epoch: {self.best_epoch} with val_score: {self.best_val_score:.4f}")
+                        print(f"  (val_r: {self.best_metrics.get('val_r', 0.0):.4f}, val_r2: {self.best_metrics.get('val_r2', 0.0):.4f})")
                     break
             else:
                 # No validation set, just save checkpoint
                 self.save_checkpoint(epoch + 1, train_metrics)
                 
-                if verbose:
+                if verbose and self.rank == 0:
                     epoch_time = time.time() - epoch_start
                     train_r2 = train_metrics.get('train_r2', 0.0)
                     output = f"Epoch {epoch + 1} - {epoch_time:.0f}s - "
@@ -565,58 +601,57 @@ class VarTrainer:
                     output += f"train_r2: {train_r2:.4f}"
                     print(output)
         
-        elapsed_time = time.time() - start_time
-        print(f"\nTraining completed in {elapsed_time / 60:.2f} minutes")
-        print(f"Best model at epoch {self.best_epoch}:")
-        print(f"  Validation Score: {self.best_val_score:.4f}")
-        if self.best_metrics:
-            print(f"  Validation Pearson R: {self.best_metrics.get('val_r', 0.0):.4f}")
-            print(f"  Validation R²: {self.best_metrics.get('val_r2', 0.0):.4f}")
-            print(f"  Validation Loss: {self.best_metrics.get('val_loss', 0.0):.4f}")
+        if self.rank == 0:
+            elapsed_time = time.time() - start_time
+            print(f"\nTraining completed in {elapsed_time / 60:.2f} minutes")
+            print(f"Best model at epoch {self.best_epoch}:")
+            print(f"  Validation Score: {self.best_val_score:.4f}")
+            if self.best_metrics:
+                print(f"  Validation Pearson R: {self.best_metrics.get('val_r', 0.0):.4f}")
+                print(f"  Validation R²: {self.best_metrics.get('val_r2', 0.0):.4f}")
+                print(f"  Validation Loss: {self.best_metrics.get('val_loss', 0.0):.4f}")
         
-        # Save training history as JSON
-        history_path_json = self.checkpoint_dir / 'training_history.json'
-        with open(history_path_json, 'w') as f:
-            json.dump(self.history, f, indent=2)
-        
-        # Save training history as TSV for easier viewing (in parent directory)
-        history_path_tsv = self.checkpoint_dir.parent / 'training_history.tsv'
-        import pandas as pd
-        
-        # Create DataFrame from history - handle different lengths
-        num_epochs = len(self.history['train_loss'])
-        history_data = {
-            'epoch': range(1, num_epochs + 1),
-            'train_loss': self.history['train_loss'],
-            'train_r2': self.history['train_r2'],
-            'train_r': self.history['train_r'],
-            'learning_rate': self.history['learning_rate'],
-        }
-        
-        # Add validation metrics if available
-        if self.history['val_loss']:
-            history_data['val_loss'] = self.history['val_loss']
-            history_data['val_r2'] = self.history['val_r2']
-            history_data['val_r'] = self.history['val_r']
-            history_data['val_score'] = self.history['val_score']
-        
-        history_df = pd.DataFrame(history_data)
-        history_df.to_csv(history_path_tsv, sep='\t', index=False, float_format='%.6f')
-        history_path = history_path_tsv
-        
-        # Save best model metrics with all details
-        best_metrics_path = self.checkpoint_dir / 'best_metrics.json'
-        with open(best_metrics_path, 'w') as f:
-            json.dump(self.best_metrics, f, indent=2)
-        
-        print(f"\nMetrics saved:")
-        print(f"  Training history (TSV): {history_path_tsv}")
-        print(f"  Training history (JSON): {history_path_json}")
-        print(f"  Best model metrics: {best_metrics_path}")
+        # Save training history as JSON (only on rank 0)
+        if self.rank == 0:
+            history_path_json = self.checkpoint_dir / 'training_history.json'
+            with open(history_path_json, 'w') as f:
+                json.dump(self.history, f, indent=2)
+            
+            # Save training history as TSV for easier viewing (in parent directory)
+            history_path_tsv = self.checkpoint_dir.parent / 'training_history.tsv'
+            import pandas as pd
+            
+            # Create DataFrame from history - handle different lengths
+            num_epochs = len(self.history['train_loss'])
+            history_data = {
+                'epoch': range(1, num_epochs + 1),
+                'train_loss': self.history['train_loss'],
+                'train_r2': self.history['train_r2'],
+                'train_r': self.history['train_r'],
+                'learning_rate': self.history['learning_rate'],
+            }
+            
+            # Add validation metrics if available
+            if self.history['val_loss']:
+                history_data['val_loss'] = self.history['val_loss']
+                history_data['val_r2'] = self.history['val_r2']
+                history_data['val_r'] = self.history['val_r']
+                history_data['val_score'] = self.history['val_score']
+            
+            history_df = pd.DataFrame(history_data)
+            history_df.to_csv(history_path_tsv, sep='\t', index=False, float_format='%.6f')
+            history_path = history_path_tsv
+            
+            # Save best model metrics with all details
+            best_metrics_path = self.checkpoint_dir / 'best_metrics.json'
+            with open(best_metrics_path, 'w') as f:
+                json.dump(self.best_metrics, f, indent=2)
+            
+            print(f"\nMetrics saved:")
+            print(f"  Training history (TSV): {history_path_tsv}")
+            print(f"  Training history (JSON): {history_path_json}")
+            print(f"  Best model metrics: {best_metrics_path}")
         
         return self.history
 
-
-# Backward compatibility alias
-SNPTrainer = VarTrainer
 

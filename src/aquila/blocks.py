@@ -1890,19 +1890,127 @@ def mlp_block(d_model, d_ff, num_layers=3, dropout=0.1, activation='gelu', **kwa
 # Pooling Blocks
 ############################################################
 
-def global_pool(pool_type='mean', d_model=None, **kwargs):
+def global_pool(pool_type='mean', d_model=None, pool_axis=1, **kwargs):
     """Global pooling block.
     
     Args:
         pool_type: Pooling type ('mean', 'max', 'attention')
         d_model: Model dimension (required for attention pooling)
+        pool_axis: Pooling axis - 1 for sequence dimension (default), 2 for feature dimension
     
     Returns:
         GlobalPooling module
     """
     if pool_type == 'attention' and d_model is None:
         raise ValueError("d_model required for attention pooling")
-    return layers.GlobalPooling(d_model=d_model or 128, pool_type=pool_type)
+    return layers.GlobalPooling(d_model=d_model or 128, pool_type=pool_type, pool_axis=pool_axis)
+
+
+def multi_head_pool(d_model, num_heads=4, dropout=0.1, pool_axis=1, **kwargs):
+    """Multi-head pooling block.
+    
+    Combines mean, max, attention, and std pooling strategies in parallel,
+    then fuses them to capture different statistical properties.
+    
+    Args:
+        d_model: Model dimension
+        num_heads: Number of pooling heads (default 4: mean, max, attention, std)
+        dropout: Dropout rate
+        pool_axis: Pooling axis - 1 for sequence dimension (default), 2 for feature dimension
+    
+    Returns:
+        MultiHeadPooling module
+    """
+    return layers.MultiHeadPooling(d_model=d_model, num_heads=num_heads, dropout=dropout, pool_axis=pool_axis)
+
+
+def learnable_query_pool(d_model, num_queries=1, num_layers=2, dropout=0.1, pool_axis=1, **kwargs):
+    """Learnable query pooling block (Set2Set style).
+    
+    Uses learnable query vectors to attend to the sequence or features, allowing
+    the model to learn task-specific aggregation patterns.
+    
+    Args:
+        d_model: Model dimension
+        num_queries: Number of learnable query vectors (default 1, only used when pool_axis=1)
+        num_layers: Number of LSTM layers for iterative refinement (default 2)
+                   Set to 0 to disable LSTM (use_lstm will be False)
+                   When num_layers > 0, LSTM is enabled (use_lstm will be True)
+        dropout: Dropout rate
+        pool_axis: Pooling axis - 1 for sequence dimension (default), 2 for feature dimension
+    
+    Returns:
+        LearnableQueryPooling module
+    
+    Note:
+        The use_lstm flag is automatically determined from num_layers:
+        - num_layers > 0: use_lstm = True, applies LSTM refinement
+        - num_layers = 0: use_lstm = False, no LSTM refinement
+    """
+    return layers.LearnableQueryPooling(
+        d_model=d_model,
+        num_queries=num_queries,
+        num_layers=num_layers,
+        dropout=dropout,
+        pool_axis=pool_axis
+    )
+
+
+def hierarchical_pool(d_model, window_size=64, stride=32, dropout=0.1, **kwargs):
+    """Hierarchical pooling block.
+    
+    First performs local pooling over sliding windows, then applies
+    global attention pooling to capture multi-scale information.
+    
+    Args:
+        d_model: Model dimension
+        window_size: Size of sliding window for local pooling (default 64)
+        stride: Stride for sliding window (default 32)
+        dropout: Dropout rate
+    
+    Returns:
+        HierarchicalPooling module
+    """
+    return layers.HierarchicalPooling(
+        d_model=d_model,
+        window_size=window_size,
+        stride=stride,
+        dropout=dropout
+    )
+
+
+def transformer_pool(d_model, num_layers=2, num_heads=8, dim_feedforward=None, dropout=0.1, pool_axis=1, **kwargs):
+    """Transformer-based pooling block (BERT CLS style).
+    
+    Uses a learnable pooling token that attends to all sequence positions
+    or feature dimensions through transformer layers, similar to BERT's CLS token.
+    
+    Args:
+        d_model: Model dimension
+        num_layers: Number of transformer encoder layers (default 2)
+        num_heads: Number of attention heads (default 8, only used when pool_axis=1)
+        dim_feedforward: Feed-forward dimension (default: d_model * 4 for pool_axis=1, 
+                        feature_embed_dim * 2 for pool_axis=2)
+        dropout: Dropout rate
+        pool_axis: Pooling axis - 1 for sequence dimension (default), 2 for feature dimension
+    
+    Returns:
+        TransformerPooling module
+    
+    Note:
+        When pool_axis=2, a smaller transformer is used for efficiency:
+        - Features are projected to a smaller embedding space (min(64, d_model))
+        - Number of attention heads is adjusted based on embedding dimension
+        - CLS token aggregates information across feature dimensions for each position
+    """
+    return layers.TransformerPooling(
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout,
+        pool_axis=pool_axis
+    )
 
 
 ############################################################
@@ -2210,6 +2318,81 @@ def cross_attention_fusion(d_model, num_heads=4, dropout=0.1, **kwargs):
 
 
 ############################################################
+# Sample Structure Blocks
+############################################################
+
+def sample_structure_encoder(d_model, structure_dim=64, use_cross_sample_attention=True, 
+                             pooling_type='attention', pool_axis=1, dropout=0.1, **kwargs):
+    """
+    Factory function for SampleStructureEncoder.
+    
+    Learnable sample structure encoding that captures kinship/population structure.
+    Instead of positional encoding, this learns sample-level embeddings based on
+    genotype patterns and injects them into the feature space.
+    
+    Args:
+        d_model: Model dimension (must match input feature dimension)
+        structure_dim: Dimension for structure embedding (default: 64)
+        use_cross_sample_attention: Whether to use cross-sample attention for kinship (default: True)
+        pooling_type: Type of pooling for sample representation:
+            - 'attention': Attention-based pooling using GlobalPooling (default, most expressive)
+            - 'multi_head': MultiHeadPooling combining mean, max, attention, std (best expressiveness)
+            - 'mean_max': Combination of mean and max pooling
+            - 'mean': Simple mean pooling (fallback)
+        pool_axis: Pooling axis (1=sequence, 2=feature, default: 1)
+        dropout: Dropout rate (default: 0.1)
+    
+    Returns:
+        SampleStructureEncoder module
+    """
+    return layers.SampleStructureEncoder(
+        d_model=d_model,
+        structure_dim=structure_dim,
+        use_cross_sample_attention=use_cross_sample_attention,
+        pooling_type=pooling_type,
+        pool_axis=pool_axis,
+        dropout=dropout
+    )
+
+
+def sample_cls_token(d_model, num_layers=2, num_heads=8, dim_feedforward=None, 
+                     pooling_type='attention', pool_axis=1, dropout=0.1, **kwargs):
+    """
+    Factory function for SampleCLSToken.
+    
+    Sample-level CLS token that learns population structure.
+    Similar to sequence-level CLS token (like BERT), but operates at sample level.
+    Each sample gets a learnable CLS token that aggregates information across
+    the sequence and interacts with other samples' CLS tokens to learn kinship.
+    
+    Args:
+        d_model: Model dimension (must match input feature dimension)
+        num_layers: Number of transformer layers (default: 2)
+        num_heads: Number of attention heads (default: 8)
+        dim_feedforward: Feed-forward dimension (default: d_model * 4)
+        pooling_type: Type of pooling for sample representation:
+            - 'attention': Attention-based pooling using GlobalPooling (default, most expressive)
+            - 'multi_head': MultiHeadPooling combining mean, max, attention, std (best expressiveness)
+            - 'mean_max': Combination of mean and max pooling
+            - 'mean': Simple mean pooling (fallback)
+        pool_axis: Pooling axis (1=sequence, 2=feature, default: 1)
+        dropout: Dropout rate (default: 0.1)
+    
+    Returns:
+        SampleCLSToken module
+    """
+    return layers.SampleCLSToken(
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        dim_feedforward=dim_feedforward,
+        pooling_type=pooling_type,
+        pool_axis=pool_axis,
+        dropout=dropout
+    )
+
+
+############################################################
 # Block Dictionary
 ############################################################
 
@@ -2256,6 +2439,10 @@ name_func = {
     
     # Pooling
     'global_pool': global_pool,
+    'multi_head_pool': multi_head_pool,
+    'learnable_query_pool': learnable_query_pool,
+    'hierarchical_pool': hierarchical_pool,
+    'transformer_pool': transformer_pool,
     
     # Heads
     'regression_head': regression_head,
@@ -2264,5 +2451,9 @@ name_func = {
     # Fusion (Multi-Branch)
     'gated_fusion': gated_fusion,
     'cross_attention_fusion': cross_attention_fusion,
+    
+    # Sample Structure Blocks
+    'sample_structure_encoder': sample_structure_encoder,
+    'sample_cls_token': sample_cls_token,
 }
 

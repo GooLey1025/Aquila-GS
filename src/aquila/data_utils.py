@@ -5,6 +5,7 @@ Data utilities for loading and preprocessing SNP and phenotype data.
 import time
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple
@@ -320,7 +321,7 @@ class VariantsDataset(Dataset):
 def _generate_cache_key(geno_path: str, pheno_path: str, encoding_type: str, 
                         classification_tasks: Optional[List[str]], val_split: float, 
                         test_split: float, normalize_regression: bool, 
-                        skew_threshold: float = 2.0) -> str:
+                        skew_threshold: float = 2.0, data_split_seed: int = 42) -> str:
     """Generate unique cache key based on data configuration."""
     config_dict = {
         'geno_path': str(geno_path),
@@ -333,6 +334,7 @@ def _generate_cache_key(geno_path: str, pheno_path: str, encoding_type: str,
         'test_split': test_split,
         'normalize_regression': normalize_regression,
         'skew_threshold': skew_threshold,
+        'data_split_seed': data_split_seed,
     }
     
     key_string = json.dumps(config_dict, sort_keys=True)
@@ -439,6 +441,10 @@ def create_data_loaders(
     cache_dir: Optional[str] = None,
     data_restart: bool = False,
     skew_threshold: float = 2.0,
+    rank: int = 0,
+    world_size: int = 1,
+    use_distributed_sampler: bool = False,
+    data_split_seed: int = 42,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], Optional[Dict]]:
     """
     Create train/val/test data loaders with z-score normalization for regression targets.
@@ -456,6 +462,10 @@ def create_data_loaders(
         cache_dir: Directory to save/load data cache (None = no caching)
         data_restart: If True, ignore cache and re-process data
         skew_threshold: Threshold for absolute skewness to trigger log(x+1) transformation
+        rank: Rank for distributed training (default: 0)
+        world_size: World size for distributed training (default: 1)
+        use_distributed_sampler: Whether to use DistributedSampler (default: False)
+        data_split_seed: Random seed for dataset splitting (default: 42)
         
     Returns:
         train_loader, val_loader, test_loader, normalization_stats
@@ -468,7 +478,7 @@ def create_data_loaders(
         # Generate cache key
         cache_key = _generate_cache_key(
             geno_path, pheno_path, encoding_type, classification_tasks,
-            val_split, test_split, normalize_regression, skew_threshold
+            val_split, test_split, normalize_regression, skew_threshold, data_split_seed
         )
         
         # Check if valid cache exists
@@ -477,35 +487,101 @@ def create_data_loaders(
                 cached_config = json.load(f)
             
             if cached_config.get('cache_key') == cache_key:
-                print("\n🔄 Found valid data cache, loading from disk...")
-                print(f"   Cache directory: {cache_path}")
+                if rank == 0:
+                    print("\n🔄 Found valid data cache, loading from disk...")
+                    print(f"   Cache directory: {cache_path}")
                 
-                # Load from cache
-                train_loader = _load_cached_loader(
-                    cache_path / 'train_dataset.pkl', batch_size, num_workers, shuffle=True
-                )
-                val_loader = _load_cached_loader(
-                    cache_path / 'val_dataset.pkl', batch_size, num_workers, shuffle=False
-                )
-                test_loader = _load_cached_loader(
-                    cache_path / 'test_dataset.pkl', batch_size, num_workers, shuffle=False
-                )
+                # Load cached datasets (not loaders, so we can recreate with DistributedSampler)
+                import pickle
+                with open(cache_path / 'train_dataset.pkl', 'rb') as f:
+                    train_dataset = pickle.load(f)
+                
+                # Load val dataset if exists
+                val_dataset_path = cache_path / 'val_dataset.pkl'
+                if val_dataset_path.exists() and val_dataset_path.stat().st_size > 0:
+                    with open(val_dataset_path, 'rb') as f:
+                        val_dataset = pickle.load(f)
+                else:
+                    val_dataset = None
+                
+                # Load test dataset if exists
+                test_dataset_path = cache_path / 'test_dataset.pkl'
+                if test_dataset_path.exists() and test_dataset_path.stat().st_size > 0:
+                    with open(test_dataset_path, 'rb') as f:
+                        test_dataset = pickle.load(f)
+                else:
+                    test_dataset = None
                 
                 with open(cache_path / 'normalization_stats.pkl', 'rb') as f:
                     normalization_stats = pickle.load(f)
                 
-                print(f"   ✓ Loaded train: {len(train_loader.dataset)} samples")
-                if val_loader:
-                    print(f"   ✓ Loaded val: {len(val_loader.dataset)} samples")
-                if test_loader:
-                    print(f"   ✓ Loaded test: {len(test_loader.dataset)} samples")
-                print(f"   ✓ Cache loading complete!\n")
+                # Recreate loaders with proper samplers for distributed training
+                if use_distributed_sampler:
+                    train_sampler = DistributedSampler(
+                        train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
+                    )
+                    train_loader = DataLoader(
+                        train_dataset, batch_size=batch_size, sampler=train_sampler,
+                        num_workers=num_workers, pin_memory=True
+                    )
+                    if rank == 0:
+                        print(f"   ✓ Loaded train: {len(train_dataset)} samples (DistributedSampler)")
+                else:
+                    train_loader = DataLoader(
+                        train_dataset, batch_size=batch_size, shuffle=True,
+                        num_workers=num_workers, pin_memory=True
+                    )
+                    if rank == 0:
+                        print(f"   ✓ Loaded train: {len(train_dataset)} samples")
+                
+                # Validation loader
+                val_loader = None
+                if val_dataset is not None:
+                    if use_distributed_sampler:
+                        val_sampler = DistributedSampler(
+                            val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
+                        )
+                        val_loader = DataLoader(
+                            val_dataset, batch_size=batch_size, sampler=val_sampler,
+                            num_workers=num_workers, pin_memory=True
+                        )
+                    else:
+                        val_loader = DataLoader(
+                            val_dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True
+                        )
+                    if rank == 0:
+                        print(f"   ✓ Loaded val: {len(val_dataset)} samples")
+                
+                # Test loader
+                test_loader = None
+                if test_dataset is not None:
+                    if use_distributed_sampler:
+                        test_sampler = DistributedSampler(
+                            test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
+                        )
+                        test_loader = DataLoader(
+                            test_dataset, batch_size=batch_size, sampler=test_sampler,
+                            num_workers=num_workers, pin_memory=True
+                        )
+                    else:
+                        test_loader = DataLoader(
+                            test_dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True
+                        )
+                    if rank == 0:
+                        print(f"   ✓ Loaded test: {len(test_dataset)} samples")
+                
+                if rank == 0:
+                    print(f"   ✓ Cache loading complete!\n")
                 
                 return train_loader, val_loader, test_loader, normalization_stats
             else:
-                print(f"\n⚠️  Cache key mismatch, will re-process data")
+                if rank == 0:
+                    print(f"\n⚠️  Cache key mismatch, will re-process data")
         else:
-            print(f"\n📦 No cache found, will process data and create cache")
+            if rank == 0:
+                print(f"\n📦 No cache found, will process data and create cache")
     
     # Load data using specified encoding
     from aquila.encoding import parse_genotype_file as parse_geno_with_encoding
@@ -551,10 +627,13 @@ def create_data_loaders(
         normalize_regression=False  # Don't normalize yet
     )
     
-    # Split dataset
+    # Split dataset with dedicated seed
     n_samples = len(dataset_unnormalized)
     indices = np.arange(n_samples)
-    np.random.shuffle(indices)
+    
+    # Use dedicated random generator for data splitting to ensure reproducibility
+    rng = np.random.RandomState(data_split_seed)
+    rng.shuffle(indices)
     
     # Calculate split sizes
     test_size = int(n_samples * test_split)
@@ -564,6 +643,18 @@ def create_data_loaders(
     train_indices = indices[:train_size]
     val_indices = indices[train_size:train_size + val_size]
     test_indices = indices[train_size + val_size:]
+    
+    # Debug: Print train_indices info for verification
+    # print(f"\n{'='*80}")
+    # print(f"DEBUG: Data Split Verification (data_split_seed={data_split_seed})")
+    # print(f"{'='*80}")
+    # print(f"Train indices (first 10): {train_indices[:10].tolist()}")
+    # print(f"Train indices (last 10):  {train_indices[-10:].tolist()}")
+    # print(f"Train indices sum: {train_indices.sum()}")
+    # print(f"Train indices mean: {train_indices.mean():.2f}")
+    # print(f"Val indices (first 5): {val_indices[:5].tolist() if len(val_indices) > 0 else 'N/A'}")
+    # print(f"Test indices (first 5): {test_indices[:5].tolist() if len(test_indices) > 0 else 'N/A'}")
+    # print(f"{'='*80}\n")
     
     # Compute normalization statistics from training set only
     normalization_stats = None
@@ -611,46 +702,111 @@ def create_data_loaders(
         regression_stds=regression_stds_np
     )
     
-    # Create data loaders
-    train_loader = DataLoader(
-        torch.utils.data.Subset(train_dataset, train_indices),
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True
-    )
+    # Create data loaders with optional DistributedSampler
+    train_subset = torch.utils.data.Subset(train_dataset, train_indices)
+    
+    if use_distributed_sampler:
+        # Use DistributedSampler for distributed training
+        train_sampler = DistributedSampler(
+            train_subset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=False
+        )
+        print(f"\n[Rank {rank}] Using DistributedSampler:")
+        print(f"  Total samples: {len(train_subset)}")
+        print(f"  Samples per GPU: {len(train_sampler)}")
+        print(f"  World size: {world_size}")
+        
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=True
+        )
+    else:
+        # Regular DataLoader for single GPU
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True
+        )
     
     val_loader = None
     if val_size > 0:
-        val_loader = DataLoader(
-            torch.utils.data.Subset(train_dataset, val_indices),
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True
-        )
+        val_subset = torch.utils.data.Subset(train_dataset, val_indices)
+        if use_distributed_sampler:
+            val_sampler = DistributedSampler(
+                val_subset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                drop_last=False
+            )
+            val_loader = DataLoader(
+                val_subset,
+                batch_size=batch_size,
+                sampler=val_sampler,
+                num_workers=num_workers,
+                pin_memory=True
+            )
+        else:
+            val_loader = DataLoader(
+                val_subset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True
+            )
     
     test_loader = None
     if test_size > 0:
-        test_loader = DataLoader(
-            torch.utils.data.Subset(train_dataset, test_indices),
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True
-        )
+        test_subset = torch.utils.data.Subset(train_dataset, test_indices)
+        if use_distributed_sampler:
+            test_sampler = DistributedSampler(
+                test_subset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                drop_last=False
+            )
+            test_loader = DataLoader(
+                test_subset,
+                batch_size=batch_size,
+                sampler=test_sampler,
+                num_workers=num_workers,
+                pin_memory=True
+            )
+        else:
+            test_loader = DataLoader(
+                test_subset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True
+            )
     
     print(f"\nData split: Train={train_size}, Val={val_size}, Test={test_size}")
     
-    # Save to cache if cache_dir is provided
-    if cache_dir is not None:
+    # Save to cache if cache_dir is provided (only rank 0 in distributed mode)
+    if cache_dir is not None and rank == 0:
         cache_path = Path(cache_dir) / 'data_cache'
         cache_key = _generate_cache_key(
             geno_path, pheno_path, encoding_type, classification_tasks,
-            val_split, test_split, normalize_regression, skew_threshold
+            val_split, test_split, normalize_regression, skew_threshold, data_split_seed
         )
         _save_data_cache(cache_path, train_loader, val_loader, test_loader, 
                         normalization_stats, cache_key)
+    
+    # Synchronize all processes if distributed (wait for rank 0 to finish saving cache)
+    if use_distributed_sampler:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.barrier()  # All ranks wait here until rank 0 finishes saving
     
     return train_loader, val_loader, test_loader, normalization_stats
 

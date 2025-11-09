@@ -6,14 +6,23 @@ Train a multi-task deep learning model for genomic prediction using VCF input.
 Supports multi-branch architectures for SNP/INDEL/SV variants.
 
 Usage:
-    python aquila_train.py --config params.yaml --vcf data.vcf --pheno data.pheno.tsv
+    Single GPU:
+        python aquila_train.py --config params.yaml
+    
+    Multi-GPU (using torchrun):
+        torchrun --nproc_per_node=2 aquila_train.py --config params.yaml
+        
+        Note: num_gpu in config is not used. Specify GPU count in torchrun command.
+
 """
 
 import argparse
 import torch
+import torch.distributed as dist
 import numpy as np
 from pathlib import Path
 import time
+import os
 from aquila.varnn import create_model_from_config
 from aquila.trainer import VarTrainer
 from aquila.data_utils import create_data_loaders
@@ -98,6 +107,21 @@ def parse_args():
         help='Skewness threshold for auto log transformation (default: 2.0, set to 0 to disable)'
     )
     
+    parser.add_argument(
+        '--local-rank',
+        type=int,
+        default=-1,
+        help='Local rank for distributed training (automatically set by torchrun)'
+    )
+    
+    parser.add_argument(
+        '-dss',
+        '--data-split-seed',
+        type=int,
+        default=42,
+        help='Random seed for dataset splitting (default: 42). Keep this fixed to ensure consistent data splits across runs.'
+    )
+    
     return parser.parse_args()
 
 
@@ -106,11 +130,40 @@ def main():
     # Parse arguments
     args = parse_args()
     
+    # Detect distributed training (launched by torchrun)
+    is_distributed = False
+    rank = 0
+    world_size = 1
+    local_rank = 0
+    
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        is_distributed = True
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        
+        # Initialize process group
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+    
+    # Only print on rank 0
+    def print_rank0(*args_print, **kwargs):
+        if rank == 0:
+            print(*args_print, **kwargs)
+    
     # Load configuration
-    print("=" * 80)
-    print("AQUILA: VCF Training")
-    print("=" * 80)
-    print(f"\nLoading configuration from: {args.config}")
+    print_rank0("=" * 80)
+    if is_distributed:
+        print_rank0("AQUILA: VCF Training (Distributed)")
+        print_rank0("=" * 80)
+        print_rank0(f"\nDistributed Training Mode")
+        print_rank0(f"  World size: {world_size} GPUs")
+        print_rank0(f"  Backend: NCCL")
+    else:
+        print_rank0("AQUILA: VCF Training")
+        print_rank0("=" * 80)
+    
+    print_rank0(f"\nLoading configuration from: {args.config}")
     config = load_config(args.config)
     
     # Override with command line arguments
@@ -123,18 +176,28 @@ def main():
     encoding_type = args.encoding_type
     config['data']['encoding_type'] = encoding_type
     
-    # Set random seed
+    # Set random seed (different seed per rank for distributed training)
+    # if is_distributed:
+    #     set_seed(args.seed + rank)
+    # else:
     set_seed(args.seed)
     
-    print(f"Random seed: {args.seed}")
-    print(f"Encoding type: {encoding_type}")
+    print_rank0(f"Random seed: {args.seed}")
+    print_rank0(f"Encoding type: {encoding_type}")
+    
+    # Set device for distributed or single GPU training
+    if is_distributed:
+        device = f'cuda:{local_rank}'
+    else:
+        device = args.device
     
     # Create output directory
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Save configuration
-    save_config(config, output_dir / 'params.yaml')
+    # Save configuration (only on rank 0)
+    if rank == 0:
+        save_config(config, output_dir / 'params.yaml')
     
     # Extract configuration
     data_config = config.get('data', {})
@@ -148,21 +211,22 @@ def main():
     # Get classification task configuration
     classification_tasks = data_config.get('classification_tasks', None)
     
-    print(f"\nData Configuration:")
-    print(f"  VCF file: {vcf_file}")
-    print(f"  Phenotype file: {pheno_file}")
-    print(f"  Encoding type: {encoding_type}")
+    print_rank0(f"\nData Configuration:")
+    print_rank0(f"  VCF file: {vcf_file}")
+    print_rank0(f"  Phenotype file: {pheno_file}")
+    print_rank0(f"  Encoding type: {encoding_type}")
     
     # Explain task assignment logic
     if classification_tasks is not None:
-        print(f"  Classification tasks specified: {classification_tasks}")
+        print_rank0(f"  Classification tasks specified: {classification_tasks}")
     else:
-        print(f"  All traits are treated as regression")
+        print_rank0(f"  All traits are treated as regression")
     
     # Create data loaders
-    print("\n" + "=" * 80)
-    print("Loading Data")
-    print("=" * 80)
+    print_rank0("\n" + "=" * 80)
+    print_rank0("Loading Data")
+    print_rank0("=" * 80)
+    print_rank0(f"\nData split seed: {args.data_split_seed} (keeps data split consistent across runs)")
     
     time1 = time.time()
     train_loader, val_loader, test_loader, normalization_stats = create_data_loaders(
@@ -178,27 +242,31 @@ def main():
         cache_dir=output_dir,
         data_restart=args.data_restart,
         skew_threshold=args.skew_threshold,
+        rank=rank,
+        world_size=world_size,
+        use_distributed_sampler=is_distributed,
+        data_split_seed=args.data_split_seed,
     )
     time2 = time.time()
-    print(f"Time taken to load/process data: {time2 - time1:.2f} seconds")
+    print_rank0(f"Time taken to load/process data: {time2 - time1:.2f} seconds")
     
     # Print log transformation info
     if normalization_stats and 'log_transformed_tasks' in normalization_stats:
         log_transformed = normalization_stats['log_transformed_tasks']
         if log_transformed:
-            print(f"\nLog-transformed phenotypes ({len(log_transformed)}):")
+            print_rank0(f"\nLog-transformed phenotypes ({len(log_transformed)}):")
             for task in log_transformed:
-                print(f"  - {task}")
+                print_rank0(f"  - {task}")
         else:
-            print(f"\nNo phenotypes required log transformation (skew threshold: {args.skew_threshold})")
+            print_rank0(f"\nNo phenotypes required log transformation (skew threshold: {args.skew_threshold})")
     
-    # Save normalization statistics
-    if normalization_stats:
+    # Save normalization statistics (only on rank 0)
+    if normalization_stats and rank == 0:
         import pickle
         norm_path = output_dir / 'normalization_stats.pkl'
         with open(norm_path, 'wb') as f:
             pickle.dump(normalization_stats, f)
-        print(f"\nNormalization statistics saved to: {norm_path}")
+        print_rank0(f"\nNormalization statistics saved to: {norm_path}")
     
     # Get actual task lists from first batch
     sample_batch = next(iter(train_loader))
@@ -215,29 +283,29 @@ def main():
             if key not in ['sample_id', 'regression_targets', 'regression_mask', 
                           'classification_targets', 'classification_mask']:
                 seq_length[key] = sample_batch[key].shape[1]
-        print(f"\nMulti-branch sequence lengths: {seq_length}")
+        print_rank0(f"\nMulti-branch sequence lengths: {seq_length}")
     else:
         # Single-branch
         seq_length = sample_batch['snp'].shape[1]
-        print(f"\nSequence length (variants): {seq_length}")
+        print_rank0(f"\nSequence length (variants): {seq_length}")
     
     if 'regression_targets' in sample_batch:
         num_regression_tasks = sample_batch['regression_targets'].shape[1]
     if 'classification_targets' in sample_batch:
         num_classification_tasks = sample_batch['classification_targets'].shape[1]
     
-    print(f"Number of regression tasks: {num_regression_tasks}")
-    print(f"Number of classification tasks: {num_classification_tasks}")
-    print(f"Training samples: {len(train_loader.dataset)}")
+    print_rank0(f"Number of regression tasks: {num_regression_tasks}")
+    print_rank0(f"Number of classification tasks: {num_classification_tasks}")
+    print_rank0(f"Training samples: {len(train_loader.dataset)}")
     if val_loader:
-        print(f"Validation samples: {len(val_loader.dataset)}")
+        print_rank0(f"Validation samples: {len(val_loader.dataset)}")
     if test_loader:
-        print(f"Test samples: {len(test_loader.dataset)}")
+        print_rank0(f"Test samples: {len(test_loader.dataset)}")
     
     # Create model
-    print("\n" + "=" * 80)
-    print("Creating Model")
-    print("=" * 80)
+    print_rank0("\n" + "=" * 80)
+    print_rank0("Creating Model")
+    print_rank0("=" * 80)
     
     # Generate task names if not provided
     regression_task_names = None
@@ -256,11 +324,11 @@ def main():
         else:
             classification_task_names = [f"classification_task_{i}" for i in range(num_classification_tasks)]
     
-    print(f"\nTask Configuration:")
+    print_rank0(f"\nTask Configuration:")
     if regression_task_names:
-        print(f"  Regression tasks: {regression_task_names}")
+        print_rank0(f"  Regression tasks: {regression_task_names}")
     if classification_task_names:
-        print(f"  Classification tasks: {classification_task_names}")
+        print_rank0(f"  Classification tasks: {classification_task_names}")
     
     # Create model from config
     model = create_model_from_config(
@@ -269,6 +337,34 @@ def main():
         regression_tasks=regression_task_names,
         classification_tasks=classification_task_names
     )
+    
+    # Move model to device
+    model = model.to(device)
+    
+    # Initialize lazy parameters with a dummy forward pass before DDP wrapping
+    if is_distributed:
+        model.eval()
+        with torch.no_grad():
+            # Create dummy input for initialization
+            if is_multi_branch:
+                dummy_input = {}
+                for vtype, vlen in seq_length.items():
+                    dummy_input[vtype] = torch.zeros(1, vlen, 8, device=device)
+            else:
+                dummy_input = torch.zeros(1, seq_length, 8, device=device)
+            
+            # Run dummy forward pass to initialize all parameters
+            _ = model(dummy_input)
+        model.train()
+        
+        # Now wrap with DDP
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False  # All parameters are used in this configuration
+        )
+        print_rank0(f"Model wrapped with DistributedDataParallel")
     
     # Print model summary
     batch_size = train_config.get('batch_size', 32)
@@ -292,9 +388,9 @@ def main():
     )
     
     # Create trainer
-    print("\n" + "=" * 80)
-    print("Training Setup")
-    print("=" * 80)
+    print_rank0("\n" + "=" * 80)
+    print_rank0("Training Setup")
+    print_rank0("=" * 80)
     
     trainer = VarTrainer(
         model=model,
@@ -306,24 +402,26 @@ def main():
         weight_decay=train_config.get('weight_decay', 1e-5),
         loss_type=train_config.get('loss_type', 'mse'),
         uncertainty_weighting=train_config.get('uncertainty_weighting', True),
-        device=args.device,
+        device=device,
         checkpoint_dir=str(output_dir / 'checkpoints'),
         early_stopping_patience=train_config.get('early_stopping_patience', 20),
         gradient_clip_norm=train_config.get('gradient_clip_norm', 1.0),
         scheduler_type=train_config.get('scheduler_type', 'reduce_on_plateau'),
         scheduler_params=train_config.get('scheduler_params', None),
         num_epochs=train_config.get('num_epochs', 100),
+        is_distributed=is_distributed,
+        rank=rank,
     )
     
-    print(f"\nTraining Configuration:")
-    print(f"  Device: {args.device}")
-    print(f"  Learning rate: {train_config.get('learning_rate', 1e-4)}")
-    print(f"  Batch size: {train_config.get('batch_size', 32)}")
-    print(f"  Max epochs: {train_config.get('num_epochs', 100)}")
-    print(f"  Early stopping patience: {train_config.get('early_stopping_patience', 20)}")
-    print(f"  Loss type: {train_config.get('loss_type', 'mse')}")
-    print(f"  Uncertainty weighting: {train_config.get('uncertainty_weighting', True)}")
-    print(f"  Scheduler type: {train_config.get('scheduler_type', 'reduce_on_plateau')}")
+    print_rank0(f"\nTraining Configuration:")
+    print_rank0(f"  Device: {device}")
+    print_rank0(f"  Learning rate: {train_config.get('learning_rate', 1e-4)}")
+    print_rank0(f"  Batch size: {train_config.get('batch_size', 32)}")
+    print_rank0(f"  Max epochs: {train_config.get('num_epochs', 100)}")
+    print_rank0(f"  Early stopping patience: {train_config.get('early_stopping_patience', 20)}")
+    print_rank0(f"  Loss type: {train_config.get('loss_type', 'mse')}")
+    print_rank0(f"  Uncertainty weighting: {train_config.get('uncertainty_weighting', True)}")
+    print_rank0(f"  Scheduler type: {train_config.get('scheduler_type', 'reduce_on_plateau')}")
     
     # Resume from checkpoint if requested
     if args.resume:
@@ -339,9 +437,9 @@ def main():
             print("\nWarning: --resume specified but no checkpoint found. Starting fresh training.")
     
     # Train model
-    print("\n" + "=" * 80)
-    print("Starting Training")
-    print("=" * 80 + "\n")
+    print_rank0("\n" + "=" * 80)
+    print_rank0("Starting Training")
+    print_rank0("=" * 80 + "\n")
     
     history = trainer.train(
         num_epochs=train_config.get('num_epochs', 100),
@@ -519,14 +617,18 @@ def main():
             else:
                 print("\nWarning: Normalization statistics not found. Predictions saved in normalized scale.")
     
-    print("\n" + "=" * 80)
-    print("Training Complete!")
-    print("=" * 80)
-    print(f"\nResults saved to: {output_dir}")
-    print(f"  - Checkpoints: {output_dir / 'checkpoints'}")
-    print(f"  - Config: {output_dir / 'params.yaml'}")
-    print(f"  - Training history (TSV): {output_dir / 'training_history.tsv'}")
-    print(f"  - Training history (JSON): {output_dir / 'checkpoints' / 'training_history.json'}")
+    print_rank0("\n" + "=" * 80)
+    print_rank0("Training Complete!")
+    print_rank0("=" * 80)
+    print_rank0(f"\nResults saved to: {output_dir}")
+    print_rank0(f"  - Checkpoints: {output_dir / 'checkpoints'}")
+    print_rank0(f"  - Config: {output_dir / 'params.yaml'}")
+    print_rank0(f"  - Training history (TSV): {output_dir / 'training_history.tsv'}")
+    print_rank0(f"  - Training history (JSON): {output_dir / 'checkpoints' / 'training_history.json'}")
+    
+    # Cleanup distributed training
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':

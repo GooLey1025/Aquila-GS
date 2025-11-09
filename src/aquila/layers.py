@@ -379,12 +379,356 @@ class FeedForward(nn.Module):
 
 class GlobalPooling(nn.Module):
     """Global pooling layer to aggregate sequence information."""
-    def __init__(self, d_model, pool_type='mean'):
+    def __init__(self, d_model, pool_type='mean', pool_axis=1):
         super().__init__()
         self.pool_type = pool_type
+        self.pool_axis = pool_axis
         if pool_type == 'attention':
-            self.attention_weights = nn.Linear(d_model, 1)
+            if pool_axis == 1:
+                # Pool over sequence dimension: attention over seq_len
+                self.attention_weights = nn.Linear(d_model, 1)
+            else:
+                # Pool over feature dimension: attention over d_model
+                # Linear layer to compute attention logits for each feature dimension
+                self.attention_weights = nn.Linear(1, 1)
             
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+            mask: (batch, seq_len) boolean mask (only used when pool_axis=1)
+        Returns:
+            If pool_axis=1: (batch, d_model) - pooled over sequence dimension
+            If pool_axis=2: (batch, seq_len) - pooled over feature dimension
+        """
+        if self.pool_axis == 1:
+            # Pool over sequence dimension (default)
+            if self.pool_type == 'mean':
+                if mask is not None:
+                    mask_expanded = mask.unsqueeze(-1).float()
+                    x_masked = x * mask_expanded
+                    return x_masked.sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+                return x.mean(dim=1)
+            
+            elif self.pool_type == 'max':
+                if mask is not None:
+                    x_masked = x.masked_fill(~mask.unsqueeze(-1), float('-inf'))
+                    return x_masked.max(dim=1)[0]
+                return x.max(dim=1)[0]
+            
+            elif self.pool_type == 'attention':
+                # Attention-based pooling over sequence dimension
+                attn_logits = self.attention_weights(x).squeeze(-1)  # (batch, seq_len)
+                if mask is not None:
+                    attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
+                attn_weights = F.softmax(attn_logits, dim=1).unsqueeze(-1)  # (batch, seq_len, 1)
+                return (x * attn_weights).sum(dim=1)
+            
+            else:
+                raise ValueError(f"Unknown pool_type: {self.pool_type}")
+        
+        elif self.pool_axis == 2:
+            # Pool over feature dimension
+            if self.pool_type == 'mean':
+                return x.mean(dim=2)  # (batch, seq_len)
+            
+            elif self.pool_type == 'max':
+                return x.max(dim=2)[0]  # (batch, seq_len)
+            
+            elif self.pool_type == 'attention':
+                # Attention-based pooling over feature dimension
+                # x: (batch, seq_len, d_model)
+                # For each sequence position, compute attention weights over feature dimensions
+                # Reshape to apply linear layer to each feature value
+                x_reshaped = x.unsqueeze(-1)  # (batch, seq_len, d_model, 1)
+                attn_logits = self.attention_weights(x_reshaped).squeeze(-1)  # (batch, seq_len, d_model)
+                attn_weights = F.softmax(attn_logits, dim=2)  # (batch, seq_len, d_model)
+                # Weighted sum over feature dimension
+                return (x * attn_weights).sum(dim=2)  # (batch, seq_len)
+            
+            else:
+                raise ValueError(f"Unknown pool_type: {self.pool_type}")
+        
+        else:
+            raise ValueError(f"pool_axis must be 1 (sequence) or 2 (feature), got {self.pool_axis}")
+
+
+class MultiHeadPooling(nn.Module):
+    """Multi-head pooling: parallel use of multiple pooling strategies.
+    
+    Combines mean, max, attention, and std pooling to capture different
+    statistical properties of the sequence.
+    """
+    def __init__(self, d_model, num_heads=4, dropout=0.1, pool_axis=1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.pool_axis = pool_axis
+        
+        # Attention pooling head
+        if pool_axis == 1:
+            # Pool over sequence dimension
+            self.attention_pool = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.Tanh(),
+                nn.Linear(d_model, 1)
+            )
+        else:
+            # Pool over feature dimension
+            self.attention_pool = nn.Linear(1, 1)
+        
+        # Fusion layer to combine all pooling heads
+        if pool_axis == 1:
+            # Output shape: (batch, d_model)
+            self.fusion = nn.Linear(d_model * num_heads, d_model)
+            self.layer_norm = nn.LayerNorm(d_model)
+        else:
+            # Output shape: (batch, seq_len)
+            # Fusion layer: (batch, seq_len, num_heads) -> (batch, seq_len, 1)
+            # This doesn't depend on seq_len, so we can create it in __init__
+            self.fusion = nn.Linear(num_heads, 1)
+            # LayerNorm requires fixed size, so we'll skip it for variable-length sequences
+            self.layer_norm = None
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+            mask: (batch, seq_len) boolean mask (only used when pool_axis=1)
+        Returns:
+            If pool_axis=1: (batch, d_model) - pooled over sequence dimension
+            If pool_axis=2: (batch, seq_len) - pooled over feature dimension
+        """
+        if self.pool_axis == 1:
+            # Pool over sequence dimension (default)
+            pooled = []
+            
+            # 1. Mean pooling
+            if mask is not None:
+                mask_expanded = mask.unsqueeze(-1).float()
+                x_masked = x * mask_expanded
+                mean_pooled = x_masked.sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+            else:
+                mean_pooled = x.mean(dim=1)
+            pooled.append(mean_pooled)
+            
+            # 2. Max pooling
+            if mask is not None:
+                x_masked = x.masked_fill(~mask.unsqueeze(-1), float('-inf'))
+                max_pooled = x_masked.max(dim=1)[0]
+            else:
+                max_pooled = x.max(dim=1)[0]
+            pooled.append(max_pooled)
+            
+            # 3. Attention pooling
+            attn_logits = self.attention_pool(x).squeeze(-1)  # (batch, seq_len)
+            if mask is not None:
+                attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
+            attn_weights = F.softmax(attn_logits, dim=1).unsqueeze(-1)  # (batch, seq_len, 1)
+            attn_pooled = (x * attn_weights).sum(dim=1)
+            pooled.append(attn_pooled)
+            
+            # 4. Std pooling (capture variability)
+            if mask is not None:
+                mask_expanded = mask.unsqueeze(-1).float()
+                x_masked = x * mask_expanded
+                mean = x_masked.sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+                std_pooled = torch.sqrt(((x - mean.unsqueeze(1)) ** 2 * mask_expanded).sum(dim=1) / 
+                                       mask_expanded.sum(dim=1).clamp(min=1))
+            else:
+                std_pooled = x.std(dim=1)
+            pooled.append(std_pooled)
+            
+            # Concatenate all pooling results
+            concat = torch.cat(pooled, dim=-1)  # (batch, d_model * num_heads)
+            
+            # Fuse and normalize
+            fused = self.fusion(concat)
+            fused = self.layer_norm(fused)
+            fused = self.dropout(fused)
+            
+            return fused
+        
+        elif self.pool_axis == 2:
+            # Pool over feature dimension
+            pooled = []
+            
+            # 1. Mean pooling over feature dimension
+            mean_pooled = x.mean(dim=2)  # (batch, seq_len)
+            pooled.append(mean_pooled)
+            
+            # 2. Max pooling over feature dimension
+            max_pooled = x.max(dim=2)[0]  # (batch, seq_len)
+            pooled.append(max_pooled)
+            
+            # 3. Attention pooling over feature dimension
+            x_reshaped = x.unsqueeze(-1)  # (batch, seq_len, d_model, 1)
+            attn_logits = self.attention_pool(x_reshaped).squeeze(-1)  # (batch, seq_len, d_model)
+            attn_weights = F.softmax(attn_logits, dim=2)  # (batch, seq_len, d_model)
+            attn_pooled = (x * attn_weights).sum(dim=2)  # (batch, seq_len)
+            pooled.append(attn_pooled)
+            
+            # 4. Std pooling over feature dimension
+            std_pooled = x.std(dim=2)  # (batch, seq_len)
+            pooled.append(std_pooled)
+            
+            # Stack all pooling results
+            concat = torch.stack(pooled, dim=-1)  # (batch, seq_len, num_heads)
+            
+            # Fuse: (batch, seq_len, num_heads) -> (batch, seq_len, 1) -> (batch, seq_len)
+            fused = self.fusion(concat).squeeze(-1)  # (batch, seq_len)
+            
+            # Apply dropout (skip LayerNorm since seq_len can vary)
+            fused = self.dropout(fused)
+            
+            return fused
+        
+        else:
+            raise ValueError(f"pool_axis must be 1 (sequence) or 2 (feature), got {self.pool_axis}")
+
+
+class LearnableQueryPooling(nn.Module):
+    """Learnable query pooling using learnable query vectors (Set2Set style).
+    
+    Uses learnable query vectors to attend to the sequence or features, allowing
+    the model to learn task-specific aggregation patterns.
+    """
+    def __init__(self, d_model, num_queries=1, num_layers=2, dropout=0.1, pool_axis=1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_queries = num_queries
+        self.pool_axis = pool_axis
+        
+        if pool_axis == 1:
+            # Pool over sequence dimension
+            # Learnable query vectors for attending to sequence positions
+            self.query = nn.Parameter(torch.randn(num_queries, d_model))
+            
+            # Cross-attention mechanism
+            self.cross_attention = nn.MultiheadAttention(
+                d_model, num_heads=8, dropout=dropout, batch_first=True
+            )
+            
+            # Optional: LSTM for iterative refinement (Set2Set style)
+            self.use_lstm = num_layers > 0
+            if self.use_lstm:
+                self.lstm = nn.LSTM(d_model, d_model, num_layers, batch_first=True)
+            
+            self.layer_norm = nn.LayerNorm(d_model)
+        else:
+            # Pool over feature dimension
+            # For feature dimension pooling, we use a learnable weight vector
+            # to compute attention scores for each feature dimension
+            # This is more memory-efficient than using a Sequential network
+            self.feature_weight = nn.Parameter(torch.randn(d_model))
+            
+            # Optional: LSTM for iterative refinement (applied per sequence position)
+            self.use_lstm = num_layers > 0
+            if self.use_lstm:
+                self.lstm = nn.LSTM(1, 1, num_layers, batch_first=True)
+            
+            # Query parameter not used for feature dimension pooling
+            self.query = None
+            # LayerNorm not used for variable-length sequences
+            self.layer_norm = None
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+            mask: (batch, seq_len) boolean mask (only used when pool_axis=1)
+        Returns:
+            If pool_axis=1: (batch, d_model) - pooled over sequence dimension
+            If pool_axis=2: (batch, seq_len) - pooled over feature dimension
+        """
+        if self.pool_axis == 1:
+            # Pool over sequence dimension (default)
+            batch_size = x.size(0)
+            
+            # Expand learnable query to batch size
+            query = self.query.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, num_queries, d_model)
+            
+            # Cross-attention: query attends to sequence
+            attn_out, _ = self.cross_attention(
+                query, x, x,
+                key_padding_mask=~mask if mask is not None else None
+            )  # (batch, num_queries, d_model)
+            
+            # Optional LSTM refinement
+            if self.use_lstm:
+                attn_out, _ = self.lstm(attn_out)
+            
+            # Normalize and dropout
+            output = self.layer_norm(attn_out)
+            output = self.dropout(output)
+            
+            # If single query, squeeze; otherwise return all queries
+            if self.num_queries == 1:
+                return output.squeeze(1)  # (batch, d_model)
+            else:
+                # Average over queries if multiple
+                return output.mean(dim=1)  # (batch, d_model)
+        
+        elif self.pool_axis == 2:
+            # Pool over feature dimension
+            # x: (batch, seq_len, d_model)
+            
+            # Compute attention logits for each feature dimension
+            # Use learnable weight vector to compute attention scores
+            # Memory-efficient: element-wise multiplication (no large intermediate tensors)
+            attn_logits = x * self.feature_weight.unsqueeze(0).unsqueeze(0)  # (batch, seq_len, d_model)
+            
+            # Apply softmax to get attention weights over feature dimension
+            attn_weights = F.softmax(attn_logits, dim=2)  # (batch, seq_len, d_model)
+            
+            # Weighted sum over feature dimension
+            pooled = (x * attn_weights).sum(dim=2)  # (batch, seq_len)
+            
+            # Optional LSTM refinement (applied per sequence position)
+            if self.use_lstm:
+                # Reshape for LSTM: (batch, seq_len) -> (batch, seq_len, 1)
+                pooled = pooled.unsqueeze(-1)  # (batch, seq_len, 1)
+                pooled, _ = self.lstm(pooled)  # (batch, seq_len, 1)
+                pooled = pooled.squeeze(-1)  # (batch, seq_len)
+            
+            # Apply dropout
+            output = self.dropout(pooled)
+            
+            return output
+        
+        else:
+            raise ValueError(f"pool_axis must be 1 (sequence) or 2 (feature), got {self.pool_axis}")
+
+
+class HierarchicalPooling(nn.Module):
+    """Hierarchical pooling: local pooling followed by global pooling.
+    
+    First performs local pooling over sliding windows, then applies
+    global attention pooling to capture multi-scale information.
+    """
+    def __init__(self, d_model, window_size=64, stride=32, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.window_size = window_size
+        self.stride = stride
+        
+        # Local pooling (adaptive average pooling)
+        self.local_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # Global attention pooling
+        self.global_attention = nn.MultiheadAttention(
+            d_model, num_heads=8, dropout=dropout, batch_first=True
+        )
+        
+        # Fusion layer to combine local and global features
+        self.fusion = nn.Linear(d_model * 2, d_model)
+        self.layer_norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+    
     def forward(self, x, mask=None):
         """
         Args:
@@ -393,29 +737,494 @@ class GlobalPooling(nn.Module):
         Returns:
             (batch, d_model)
         """
-        if self.pool_type == 'mean':
-            if mask is not None:
-                mask_expanded = mask.unsqueeze(-1).float()
-                x_masked = x * mask_expanded
-                return x_masked.sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
-            return x.mean(dim=1)
+        batch, seq_len, d_model = x.shape
         
-        elif self.pool_type == 'max':
-            if mask is not None:
-                x_masked = x.masked_fill(~mask.unsqueeze(-1), float('-inf'))
-                return x_masked.max(dim=1)[0]
-            return x.max(dim=1)[0]
+        # Local pooling: sliding window approach
+        x_t = x.transpose(1, 2)  # (batch, d_model, seq_len)
+        local_features = []
         
-        elif self.pool_type == 'attention':
-            # Attention-based pooling
-            attn_logits = self.attention_weights(x).squeeze(-1)  # (batch, seq_len)
+        # Apply sliding window pooling
+        for i in range(0, seq_len, self.stride):
+            end_idx = min(i + self.window_size, seq_len)
+            if end_idx - i < self.window_size // 2:  # Skip too small windows
+                break
+            window = x_t[:, :, i:end_idx]
+            pooled = self.local_pool(window).squeeze(-1)  # (batch, d_model)
+            local_features.append(pooled)
+        
+        if len(local_features) == 0:
+            # Fallback to global pooling if no windows
+            local_features = [x.mean(dim=1)]
+        
+        local_features = torch.stack(local_features, dim=1)  # (batch, num_windows, d_model)
+        
+        # Global attention pooling
+        # Use mean of local features as query
+        query = local_features.mean(dim=1, keepdim=True)  # (batch, 1, d_model)
+        global_feat, _ = self.global_attention(
+            query, x, x,
+            key_padding_mask=~mask if mask is not None else None
+        )  # (batch, 1, d_model)
+        global_feat = global_feat.squeeze(1)  # (batch, d_model)
+        
+        # Aggregate local features
+        local_agg = local_features.mean(dim=1)  # (batch, d_model)
+        
+        # Fuse local and global features
+        concat = torch.cat([local_agg, global_feat], dim=-1)  # (batch, d_model * 2)
+        fused = self.fusion(concat)
+        fused = self.layer_norm(fused)
+        fused = self.dropout(fused)
+        
+        return fused
+
+
+class TransformerPooling(nn.Module):
+    """Transformer-based pooling using special pooling token (BERT CLS style).
+    
+    Uses a learnable pooling token that attends to all sequence positions
+    or feature dimensions through transformer layers, similar to BERT's CLS token.
+    """
+    def __init__(self, d_model, num_layers=2, num_heads=8, dim_feedforward=None, dropout=0.1, pool_axis=1):
+        super().__init__()
+        self.d_model = d_model
+        self.pool_axis = pool_axis
+        
+        if pool_axis == 1:
+            # Pool over sequence dimension
+            # Learnable pooling token
+            self.pool_token = nn.Parameter(torch.randn(1, 1, d_model))
+            
+            # Transformer encoder
+            if dim_feedforward is None:
+                dim_feedforward = d_model * 4
+            
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                activation='gelu'
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            
+            self.layer_norm = nn.LayerNorm(d_model)
+        else:
+            # Pool over feature dimension
+            # For each sequence position, use a CLS token to aggregate features
+            # Learnable pooling token for feature dimension
+            self.pool_token = nn.Parameter(torch.randn(1, 1, 1))
+            
+            # Smaller transformer for feature dimension
+            # Each "position" in this transformer corresponds to a feature dimension
+            # We need embedding_dim that works for the transformer
+            feature_embed_dim = min(64, d_model)  # Use smaller embedding for efficiency
+            if dim_feedforward is None:
+                dim_feedforward = feature_embed_dim * 2
+            
+            # Project each feature value to embedding space
+            self.feature_projection = nn.Linear(1, feature_embed_dim)
+            
+            # Transformer encoder for features
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=feature_embed_dim,
+                nhead=min(4, feature_embed_dim // 16),  # Adjust heads based on embedding dim
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                activation='gelu'
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            
+            # Project CLS token embedding back to scalar
+            self.output_projection = nn.Linear(feature_embed_dim, 1)
+            
+            # No LayerNorm for variable-length sequences
+            self.layer_norm = None
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+            mask: (batch, seq_len) boolean mask (only used when pool_axis=1)
+        Returns:
+            If pool_axis=1: (batch, d_model) - pooled over sequence dimension
+            If pool_axis=2: (batch, seq_len) - pooled over feature dimension
+        """
+        if self.pool_axis == 1:
+            # Pool over sequence dimension (default)
+            batch_size = x.size(0)
+            
+            # Add pooling token at the beginning
+            pool_token = self.pool_token.expand(batch_size, -1, -1)  # (batch, 1, d_model)
+            x_with_pool = torch.cat([pool_token, x], dim=1)  # (batch, seq_len+1, d_model)
+            
+            # Extend mask to include pooling token (always valid)
             if mask is not None:
-                attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
-            attn_weights = F.softmax(attn_logits, dim=1).unsqueeze(-1)  # (batch, seq_len, 1)
-            return (x * attn_weights).sum(dim=1)
+                pool_mask = torch.ones(batch_size, 1, device=mask.device, dtype=torch.bool)
+                extended_mask = torch.cat([pool_mask, mask], dim=1)
+                # Convert to key_padding_mask format (True = ignore)
+                key_padding_mask = ~extended_mask
+            else:
+                key_padding_mask = None
+            
+            # Transformer encoding
+            encoded = self.transformer(x_with_pool, src_key_padding_mask=key_padding_mask)
+            
+            # Extract pooling token representation
+            pool_output = encoded[:, 0, :]  # (batch, d_model)
+            
+            # Normalize and dropout
+            output = self.layer_norm(pool_output)
+            output = self.dropout(output)
+            
+            return output
+        
+        elif self.pool_axis == 2:
+            # Pool over feature dimension
+            # x: (batch, seq_len, d_model)
+            batch_size, seq_len, d_model = x.size()
+            
+            # Reshape to process each position independently
+            # (batch, seq_len, d_model) -> (batch * seq_len, d_model)
+            x_flat = x.reshape(-1, d_model)  # (batch * seq_len, d_model)
+            
+            # Project each feature value to embedding space
+            # (batch * seq_len, d_model) -> (batch * seq_len, d_model, 1) -> (batch * seq_len, d_model, feature_embed_dim)
+            x_reshaped = x_flat.unsqueeze(-1)  # (batch * seq_len, d_model, 1)
+            x_embedded = self.feature_projection(x_reshaped)  # (batch * seq_len, d_model, feature_embed_dim)
+            
+            # Add CLS token for each position
+            pool_token = self.pool_token.expand(batch_size * seq_len, -1, -1)  # (batch * seq_len, 1, 1)
+            pool_token_embedded = self.feature_projection(pool_token)  # (batch * seq_len, 1, feature_embed_dim)
+            
+            # Concatenate CLS token with feature embeddings
+            x_with_pool = torch.cat([pool_token_embedded, x_embedded], dim=1)  # (batch * seq_len, d_model+1, feature_embed_dim)
+            
+            # Apply transformer to aggregate features
+            encoded = self.transformer(x_with_pool)  # (batch * seq_len, d_model+1, feature_embed_dim)
+            
+            # Extract CLS token representation
+            cls_output = encoded[:, 0, :]  # (batch * seq_len, feature_embed_dim)
+            
+            # Project back to scalar
+            pooled = self.output_projection(cls_output).squeeze(-1)  # (batch * seq_len,)
+            
+            # Reshape back to (batch, seq_len)
+            output = pooled.reshape(batch_size, seq_len)
+            
+            # Apply dropout
+            output = self.dropout(output)
+            
+            return output
         
         else:
-            raise ValueError(f"Unknown pool_type: {self.pool_type}")
+            raise ValueError(f"pool_axis must be 1 (sequence) or 2 (feature), got {self.pool_axis}")
+
+
+class SampleStructureEncoder(nn.Module):
+    """
+    Learnable sample structure encoding that captures kinship/population structure.
+    
+    Instead of positional encoding (which didn't help), this learns sample-level
+    embeddings based on genotype patterns and injects them into the feature space.
+    
+    The module:
+    1. Extracts sample-level statistics from genotype patterns (using existing pooling)
+    2. Learns sample structure embeddings
+    3. Uses cross-sample attention to model kinship relationships
+    4. Injects structure information into sequence features
+    """
+    def __init__(self, d_model, structure_dim=64, use_cross_sample_attention=True, 
+                 pooling_type='attention', pool_axis=1, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.structure_dim = structure_dim
+        self.use_cross_sample_attention = use_cross_sample_attention
+        self.pooling_type = pooling_type
+        self.pool_axis = pool_axis
+        
+        # Sample-level pooling: use existing GlobalPooling or MultiHeadPooling
+        if pooling_type == 'attention':
+            # Use existing GlobalPooling with attention
+            self.sample_pooling = GlobalPooling(d_model, pool_type='attention', pool_axis=pool_axis)
+        elif pooling_type == 'multi_head':
+            # Use existing MultiHeadPooling (combines mean, max, attention, std)
+            self.sample_pooling = MultiHeadPooling(d_model, num_heads=4, dropout=dropout, pool_axis=pool_axis)
+        elif pooling_type == 'mean_max':
+            # Combine mean and max pooling manually
+            self.sample_pooling = None  # Will handle in forward
+        else:
+            # Default: simple mean pooling using GlobalPooling
+            self.sample_pooling = GlobalPooling(d_model, pool_type='mean', pool_axis=pool_axis)
+        
+        # Statistics extractor: compute sample-level features
+        # If pool_axis=1: Input is (batch, d_model) -> Output: (batch, structure_dim)
+        # If pool_axis=2: Input is (batch, seq_len) -> Output: (batch, structure_dim)
+        # We'll create it dynamically based on the actual input shape
+        self.stat_extractor = None  # Will be created on first forward pass
+        self.structure_dim = structure_dim
+        self.dropout_rate = dropout
+        
+        # Project structure embedding to match d_model
+        self.structure_projection = nn.Linear(structure_dim, d_model)
+        
+        # Cross-sample attention: learn kinship relationships
+        if use_cross_sample_attention:
+            self.cross_sample_attention = nn.MultiheadAttention(
+                embed_dim=d_model,
+                num_heads=8,
+                dropout=dropout,
+                batch_first=True
+            )
+            self.attention_norm = nn.LayerNorm(d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(d_model)
+        
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (batch, seq_len, d_model) - sequence features
+            mask: (batch, seq_len) - sequence mask (optional)
+        Returns:
+            x_enhanced: (batch, seq_len, d_model) - features with structure info
+        """
+        batch_size, seq_len, d_model = x.shape
+        
+        # Compute sample-level representation from sequence
+        if self.sample_pooling is not None:
+            # Use existing pooling module (GlobalPooling or MultiHeadPooling)
+            sample_repr = self.sample_pooling(x, mask=mask)  # (batch, d_model) or (batch, seq_len)
+        elif self.pooling_type == 'mean_max':
+            # Combine mean and max pooling
+            if mask is not None:
+                x_masked = x * mask.unsqueeze(-1)
+                mean_pooled = x_masked.sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)
+                # Max pooling with mask
+                x_masked_for_max = x.clone()
+                x_masked_for_max[~mask.unsqueeze(-1)] = float('-inf')
+                max_pooled = x_masked_for_max.max(dim=1)[0]
+            else:
+                mean_pooled = x.mean(dim=1)
+                max_pooled = x.max(dim=1)[0]
+            # Concatenate and project
+            sample_repr = (mean_pooled + max_pooled) / 2  # Average of mean and max
+        else:
+            # Fallback to mean pooling
+            if mask is not None:
+                x_masked = x * mask.unsqueeze(-1)
+                sample_repr = x_masked.sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)
+            else:
+                sample_repr = x.mean(dim=1)
+        
+        # Extract sample structure features
+        # Create stat_extractor dynamically based on pool_axis
+        if self.stat_extractor is None:
+            # Determine input dimension based on pool_axis
+            if self.pool_axis == 2:
+                input_dim = seq_len  # pool_axis=2: input is (batch, seq_len)
+            else:
+                input_dim = d_model  # pool_axis=1: input is (batch, d_model)
+            
+            self.stat_extractor = nn.Sequential(
+                nn.Linear(input_dim, self.structure_dim),
+                nn.LayerNorm(self.structure_dim),
+                nn.ReLU(),
+                nn.Dropout(self.dropout_rate),
+                nn.Linear(self.structure_dim, self.structure_dim),
+                nn.LayerNorm(self.structure_dim)
+            ).to(sample_repr.device)
+        
+        structure_features = self.stat_extractor(sample_repr)  # (batch, structure_dim)
+        
+        # Project to model dimension
+        structure_emb = self.structure_projection(structure_features)  # (batch, d_model)
+        
+        # Option 1: Additive injection (like positional encoding)
+        x_enhanced = x + structure_emb.unsqueeze(1)  # (batch, seq_len, d_model)
+        
+        # Option 2: Cross-sample attention (learn kinship relationships)
+        if self.use_cross_sample_attention:
+            # Use structure embeddings for cross-sample attention
+            structure_emb_expanded = structure_emb.unsqueeze(1)  # (batch, 1, d_model)
+            
+            # Cross-sample attention: each sample attends to all samples' structure
+            attended, _ = self.cross_sample_attention(
+                query=x_enhanced,
+                key=structure_emb_expanded,
+                value=structure_emb_expanded
+            )
+            
+            # Residual connection with gating
+            x_enhanced = x_enhanced + 0.3 * self.attention_norm(attended)
+        
+        # Final normalization and dropout
+        x_enhanced = self.layer_norm(x_enhanced)
+        x_enhanced = self.dropout(x_enhanced)
+        
+        return x_enhanced
+
+
+class SampleCLSToken(nn.Module):
+    """
+    Sample-level CLS token that learns population structure.
+    
+    Similar to sequence-level CLS token (like BERT), but operates at sample level.
+    Each sample gets a learnable CLS token that aggregates information across
+    the sequence and interacts with other samples' CLS tokens to learn kinship.
+    
+    This allows the model to:
+    1. Learn sample-level representations
+    2. Model relationships between samples
+    3. Capture population structure automatically
+    """
+    def __init__(self, d_model, num_layers=2, num_heads=8, dim_feedforward=None, 
+                 pooling_type='attention', pool_axis=1, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.pooling_type = pooling_type
+        
+        if dim_feedforward is None:
+            dim_feedforward = d_model * 4
+        
+        # Sample-level pooling: use existing GlobalPooling or MultiHeadPooling
+        # pool_axis=1: pool over sequence -> (batch, d_model) directly
+        # pool_axis=2: pool over features -> (batch, seq_len), then map to (batch, d_model) with Linear
+        if pooling_type == 'attention':
+            # Use existing GlobalPooling with attention
+            self.sample_pooling = GlobalPooling(d_model, pool_type='attention', pool_axis=pool_axis)
+        elif pooling_type == 'multi_head':
+            # Use existing MultiHeadPooling (combines mean, max, attention, std)
+            self.sample_pooling = MultiHeadPooling(d_model, num_heads=4, dropout=dropout, pool_axis=pool_axis)
+        elif pooling_type == 'mean_max':
+            # Combine mean and max pooling manually
+            self.sample_pooling = None  # Will handle in forward
+        else:
+            # Default: simple mean pooling using GlobalPooling
+            self.sample_pooling = GlobalPooling(d_model, pool_type='mean', pool_axis=pool_axis)
+        
+        # Projection to create sample CLS token from sequence summary
+        # Will be created dynamically based on input shape (d_model or seq_len)
+        self.sample_cls_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model)
+        )
+        
+        # Transformer to aggregate sample structure and enable cross-sample interaction
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            activation='gelu'
+        )
+        self.sample_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Projection to inject CLS information back into sequence
+        self.cls_injection = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(d_model)
+        
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (batch, seq_len, d_model) - sequence features
+            mask: (batch, seq_len) - sequence mask (optional)
+        Returns:
+            x_enhanced: (batch, seq_len, d_model) - features enhanced with sample CLS
+        """
+        batch_size, seq_len, d_model = x.shape
+        
+        # Create sample CLS token from sequence summary
+        if self.sample_pooling is not None:
+            # Use existing pooling module (GlobalPooling or MultiHeadPooling)
+            sample_summary = self.sample_pooling(x, mask=mask)  # (batch, d_model) or (batch, seq_len)
+        elif self.pooling_type == 'mean_max':
+            # Combine mean and max pooling
+            if mask is not None:
+                x_masked = x * mask.unsqueeze(-1)
+                mean_pooled = x_masked.sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)
+                # Max pooling with mask
+                x_masked_for_max = x.clone()
+                x_masked_for_max[~mask.unsqueeze(-1)] = float('-inf')
+                max_pooled = x_masked_for_max.max(dim=1)[0]
+            else:
+                mean_pooled = x.mean(dim=1)
+                max_pooled = x.max(dim=1)[0]
+            # Average of mean and max
+            sample_summary = (mean_pooled + max_pooled) / 2
+        else:
+            # Fallback to mean pooling
+            if mask is not None:
+                x_masked = x * mask.unsqueeze(-1)
+                sample_summary = x_masked.sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)
+            else:
+                sample_summary = x.mean(dim=1)
+        
+        # Project to create sample CLS token
+        # Create sample_cls_proj dynamically based on pool_axis
+        if self.sample_cls_proj is None:
+            # Determine input dimension based on pool_axis
+            if self.pool_axis == 2:
+                input_dim = seq_len  # pool_axis=2: input is (batch, seq_len)
+            else:
+                input_dim = d_model  # pool_axis=1: input is (batch, d_model)
+            
+            self.sample_cls_proj = nn.Sequential(
+                nn.Linear(input_dim, self.d_model),
+                nn.LayerNorm(self.d_model),
+                nn.GELU(),
+                nn.Dropout(self.dropout_rate_cls),
+                nn.Linear(self.d_model, self.d_model),
+                nn.LayerNorm(self.d_model)
+            ).to(sample_summary.device)
+        
+        sample_cls = self.sample_cls_proj(sample_summary)  # (batch, d_model)
+        
+        # Prepare input for transformer: [sample_cls, sequence]
+        # This allows the CLS token to attend to the sequence and vice versa
+        sample_cls_expanded = sample_cls.unsqueeze(1)  # (batch, 1, d_model)
+        x_with_cls = torch.cat([sample_cls_expanded, x], dim=1)  # (batch, seq_len+1, d_model)
+        
+        # Extend mask to include CLS token (always valid)
+        if mask is not None:
+            cls_mask = torch.ones(batch_size, 1, device=mask.device, dtype=torch.bool)
+            extended_mask = torch.cat([cls_mask, mask], dim=1)
+            key_padding_mask = ~extended_mask
+        else:
+            key_padding_mask = None
+        
+        # Apply transformer (enables cross-sample interaction through CLS tokens)
+        encoded = self.sample_transformer(x_with_cls, src_key_padding_mask=key_padding_mask)
+        
+        # Extract enhanced CLS and sequence
+        enhanced_cls = encoded[:, 0, :]  # (batch, d_model)
+        enhanced_seq = encoded[:, 1:, :]  # (batch, seq_len, d_model)
+        
+        # Inject CLS information into sequence
+        cls_injected = self.cls_injection(enhanced_cls)  # (batch, d_model)
+        x_enhanced = enhanced_seq + cls_injected.unsqueeze(1)  # (batch, seq_len, d_model)
+        
+        # Final normalization
+        x_enhanced = self.layer_norm(x_enhanced)
+        x_enhanced = self.dropout(x_enhanced)
+        
+        return x_enhanced
 
 
 ############################################################
