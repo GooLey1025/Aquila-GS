@@ -6,7 +6,7 @@ import time
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from aquila.data import create_augmentation_from_config
+from aquila.data_aug import create_augmentation_from_config
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple

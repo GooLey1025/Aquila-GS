@@ -89,6 +89,7 @@ class VarTrainer:
         is_distributed: bool = False,
         rank: int = 0,
         use_mixed_precision: bool = False,
+        huber_delta: float = 1.0,
     ):
         """
         Initialize trainer.
@@ -145,7 +146,8 @@ class VarTrainer:
             num_regression_tasks=num_regression_tasks,
             num_classification_tasks=num_classification_tasks,
             loss_type=loss_type,
-            uncertainty_weighting=uncertainty_weighting
+            uncertainty_weighting=uncertainty_weighting,
+            huber_delta=huber_delta,
         ).to(device)
 
         # Optimizer
