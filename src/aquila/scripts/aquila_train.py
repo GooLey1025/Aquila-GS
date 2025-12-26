@@ -256,6 +256,7 @@ def main():
         world_size=world_size,
         use_distributed_sampler=is_distributed,
         data_split_seed=args.data_split_seed,
+        augmentation_config=config.get('augmentation', None),
     )
     time2 = time.time()
     print_rank0(

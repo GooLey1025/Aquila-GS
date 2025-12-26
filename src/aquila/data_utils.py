@@ -6,6 +6,7 @@ import time
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from aquila.data import create_augmentation_from_config
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple
@@ -157,6 +158,7 @@ class VariantsDataset(Dataset):
         normalize_regression: bool = True,
         regression_means: Optional[np.ndarray] = None,
         regression_stds: Optional[np.ndarray] = None,
+        transform=None,
     ):
         """
         Args:
@@ -169,7 +171,9 @@ class VariantsDataset(Dataset):
             normalize_regression: Whether to apply z-score normalization to regression targets
             regression_means: Pre-computed means for normalization (for val/test sets)
             regression_stds: Pre-computed stds for normalization (for val/test sets)
+            transform: Optional augmentation/transform to apply to genotype data (for training)
         """
+        self.transform = transform
         # Handle multi-branch input (dict) or single-branch (array)
         self.is_multi_branch = isinstance(snp_matrix, dict)
 
@@ -316,14 +320,25 @@ class VariantsDataset(Dataset):
 
         item = {'sample_id': self.sample_ids[real_idx]}
 
+        # Get transform (handle legacy cached datasets without transform attribute)
+        transform = getattr(self, 'transform', None)
+
         # Add variant data (single-branch or multi-branch)
         if self.is_multi_branch:
             # Multi-branch: return dict of variant types
             for variant_type, matrix in self.variant_matrices.items():
-                item[variant_type] = matrix[real_idx]
+                variant_data = matrix[real_idx]
+                # Apply transform if provided (only for 3D diploid one-hot encoding)
+                if transform is not None and variant_data.dim() == 2:
+                    variant_data = transform(variant_data)
+                item[variant_type] = variant_data
         else:
             # Single-branch: return single tensor
-            item['snp'] = self.snp_matrix[real_idx]
+            snp_data = self.snp_matrix[real_idx]
+            # Apply transform if provided (only for 3D diploid one-hot encoding)
+            if transform is not None and snp_data.dim() == 2:
+                snp_data = transform(snp_data)
+            item['snp'] = snp_data
 
         # Add phenotype targets
         if self.regression_cols:
@@ -467,6 +482,7 @@ def create_data_loaders(
     world_size: int = 1,
     use_distributed_sampler: bool = False,
     data_split_seed: int = 42,
+    augmentation_config: Optional[Dict] = None,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], Optional[Dict]]:
     """
     Create train/val/test data loaders with z-score normalization for regression targets.
@@ -488,10 +504,23 @@ def create_data_loaders(
         world_size: World size for distributed training (default: 1)
         use_distributed_sampler: Whether to use DistributedSampler (default: False)
         data_split_seed: Random seed for dataset splitting (default: 42)
+        augmentation_config: Optional augmentation configuration dict for training data.
+            Example: {
+                'enabled': True,
+                'p': 1.0,
+                'snp_masking': {'mask_rate': 0.03},
+                'cutout': {'num_segments': 2, 'segment_ratio': 0.01},
+                'allele_swap': {'swap_prob': 0.5}
+            }
 
     Returns:
         train_loader, val_loader, test_loader, normalization_stats
     """
+    # Create augmentation transform for training data
+    train_transform = create_augmentation_from_config(augmentation_config)
+
+    if train_transform is not None and rank == 0:
+        print(f"\n🔀 Data Augmentation enabled: {train_transform}")
     # Check for cached data if cache_dir is provided
     if cache_dir is not None and not data_restart:
         cache_path = Path(cache_dir) / 'data_cache'
@@ -517,6 +546,15 @@ def create_data_loaders(
                 import pickle
                 with open(cache_path / 'train_dataset.pkl', 'rb') as f:
                     train_dataset = pickle.load(f)
+
+                # Apply augmentation transform to training dataset (not cached, applied on-the-fly)
+                # Handle both Subset wrapper and direct VariantsDataset
+                if train_transform is not None:
+                    if isinstance(train_dataset, torch.utils.data.Subset):
+                        # Cached dataset is a Subset, set transform on underlying dataset
+                        train_dataset.dataset.transform = train_transform
+                    else:
+                        train_dataset.transform = train_transform
 
                 # Load val dataset if exists
                 val_dataset_path = cache_path / 'val_dataset.pkl'
@@ -725,13 +763,14 @@ def create_data_loaders(
         print(f"  Stds: {regression_stds_np}")
 
     # Now create normalized datasets using the training statistics
-    # Training set: compute statistics from training data
+    # Training set: compute statistics from training data (with augmentation transform)
     train_dataset = VariantsDataset(
         snp_matrix, pheno_df, sample_ids,
         regression_cols, classification_cols,
         normalize_regression=normalize_regression,
         regression_means=regression_means_np,
-        regression_stds=regression_stds_np
+        regression_stds=regression_stds_np,
+        transform=train_transform
     )
 
     # Create data loaders with optional DistributedSampler
