@@ -2,15 +2,6 @@
 
 Aquila is a powerful deep learning framework for genomic prediction using SNP (Single Nucleotide Polymorphism) data. It supports multi-task learning with both regression and classification tasks, handles missing data elegantly, and uses state-of-the-art transformer architectures.
 
-## Features
-
-- **Multi-task Learning**: Simultaneously predict multiple phenotypic traits (regression and/or classification)
-- **Missing Data Handling**: Built-in support for missing SNP genotypes and phenotype labels
-- **Flexible Architecture**: Choose between Transformer or MLP backbone networks
-- **Uncertainty Weighting**: Automatic task weighting based on learned uncertainty
-- **Early Stopping**: Prevents overfitting with validation-based early stopping
-- **Easy Configuration**: YAML-based configuration system
-
 ## Installation
 
 ### From Source
