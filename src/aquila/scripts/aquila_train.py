@@ -429,8 +429,10 @@ def main():
         is_distributed=is_distributed,
         rank=rank,
         use_mixed_precision=args.mixed_precision,
+        huber_delta=train_config.get('huber_delta', 1.0),
     )
 
+    loss_type = train_config.get('loss_type', 'mse')
     print_rank0(f"\nTraining Configuration:")
     print_rank0(f"  Device: {device}")
     print_rank0(f"  Learning rate: {train_config.get('learning_rate', 1e-4)}")
@@ -438,7 +440,9 @@ def main():
     print_rank0(f"  Max epochs: {train_config.get('num_epochs', 100)}")
     print_rank0(
         f"  Early stopping patience: {train_config.get('early_stopping_patience', 20)}")
-    print_rank0(f"  Loss type: {train_config.get('loss_type', 'mse')}")
+    print_rank0(f"  Loss type: {loss_type}")
+    if loss_type == 'huber':
+        print_rank0(f"  Huber delta: {train_config.get('huber_delta', 1.0)}")
     print_rank0(
         f"  Uncertainty weighting: {train_config.get('uncertainty_weighting', True)}")
     print_rank0(
