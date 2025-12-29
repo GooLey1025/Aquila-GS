@@ -1,0 +1,10 @@
+data
+train_out
+best_metrics.tsv
+train.log
+705Rice.phenos.completed.tsv
+CropARNet_SNP.tsv
+LICENSE
+SNPWeightNet.py
+pheno.aligned.tsv
+train.py
