@@ -82,6 +82,17 @@ class SNPGatedUnit(nn.Module):
         Returns:
             Gated output of shape (B, n_snps, out_dim)
         """
+        # Validate input: must be 3D (diploid one-hot encoding)
+        if x.dim() != 3:
+            raise ValueError(
+                f"SGU requires 3D input (diploid one-hot encoding), got {x.dim()}D input "
+                f"with shape {x.shape}. Please use encoding_type='diploid_onehot' in your config."
+            )
+
+        # Ensure float type (convert from Long/int if needed)
+        if x.dtype != torch.float32 and x.dtype != torch.float64:
+            x = x.float()
+
         # Project to 2*out_dim
         proj = self.proj(x)  # (B, n_snps, 2*out_dim)
 
@@ -151,6 +162,24 @@ class DiploidGatedUnit(nn.Module):
         Returns:
             Gated output of shape (B, n_snps, out_dim)
         """
+        # Validate input: must be 3D (diploid one-hot encoding)
+        if x.dim() != 3:
+            raise ValueError(
+                f"DGU requires 3D input (diploid one-hot encoding), got {x.dim()}D input "
+                f"with shape {x.shape}. Please use encoding_type='diploid_onehot' in your config."
+            )
+
+        # Validate last dimension must be 8
+        if x.shape[-1] != 8:
+            raise ValueError(
+                f"DGU requires input with last dimension = 8 (diploid one-hot), "
+                f"got shape {x.shape}. Please use encoding_type='diploid_onehot' in your config."
+            )
+
+        # Ensure float type (convert from Long/int if needed)
+        if x.dtype != torch.float32 and x.dtype != torch.float64:
+            x = x.float()
+
         # Split into two alleles
         allele1 = x[..., :4]  # (B, n_snps, 4)
         allele2 = x[..., 4:]  # (B, n_snps, 4)
