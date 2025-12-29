@@ -1,3 +1,0 @@
-[submodule "benchmark/benchmark/CropARNet"]
-	path = benchmark/benchmark/CropARNet
-	url = https://github.com/Zhoushuchang-lab/CropARNet

@@ -1,9 +1,9 @@
 # Benchmarking
 
-All benchmarks were conducted using the versions of the compared methods that were available at the time of our experiments.
+All benchmarks were conducted using the versions of the compared methods that were available at the time (2025-12) of our experiments.
 For transparency and reproducibility, we report the exact commit hashes used in our experiments.
 
-## CropAR_Net
+## [CropAR_Net](https://github.com/Zhoushuchang-lab/CropARNet)
 
 Some scripts from CropARNet were copied or adapted into our project repository.
 Therefore, you do not need to clone the original repository to run our code.
@@ -20,7 +20,7 @@ git rev-parse HEAD
 git checkout d53f381de0b453d6ce626e70f0a8b1c2d0c7efde
 ```
 
-## DNNGP
+## [DNNGP](https://github.com/AIBreeding/DNNGP)
 ```sh
 git clone https://github.com/AIBreeding/DNNGP.git
 cd DNNGP
