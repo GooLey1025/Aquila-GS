@@ -20,7 +20,7 @@ Rscript pixant_impute/phenotype_pixant_impute.R GSTP008.pheno 705Rice.pheno.impu
 
 ## Prerequisites
 
-### Install required R packages for [XGBoost](#xgboost), BayesA, rrBLUP, Lasso, ElasticNet.
+### Install required R packages for [XGBoost](#xgboost), [BayesA](#bayesa), [rrBLUP](#rrblup), [Lasso](#lasso),[ ElasticNet](#elasticnet).
 Our R version: 4.3.3
 ```r
 install.packages(c(
@@ -50,10 +50,10 @@ aquila_train.py --config 705rice_benchmark.yaml --vcf 705Rice_Inbred_ssSNP_0.5LD
   --pheno 705Rice.pheno.imputed.tsv -o aquila_benchmark --save-postprocess-data
 ```
 This will create:
-- `aquila_benchmark/data_postprocess/geno_train.vcf`
-- `aquila_benchmark/data_postprocess/geno_valid.vcf`
-- `aquila_benchmark/data_postprocess/pheno_train_normalized.tsv`
-- `aquila_benchmark/data_postprocess/pheno_valid_normalized.tsv`
+- `aquila/aquila_benchmark/data_postprocess/geno_train.vcf`
+- `aquila/aquila_benchmark/data_postprocess/geno_valid.vcf`
+- `aquila/aquila_benchmark/data_postprocess/pheno_train_normalized.tsv`
+- `aquila/aquila_benchmark/data_postprocess/pheno_valid_normalized.tsv`
 
 ### [CropARNet](https://github.com/Zhoushuchang-lab/CropARNet)
 
@@ -67,10 +67,10 @@ The following information is provided solely for reference and reproducibility.
 >git rev-parse HEAD
 ># Commit used in our experiments:
 ># d53f381de0b453d6ce626e70f0a8b1c2d0c7efde
-
-# (Optional) To exactly reproduce our setup:
-git checkout d53f381de0b453d6ce626e70f0a8b1c2d0c7efde
-```
+>
+># (Optional) To exactly reproduce our setup:
+>git checkout d53f381de0b453d6ce626e70f0a8b1c2d0c7efde
+>```
 
 ### [Cropformer](https://github.com/jiekesen/Cropformer.git)
 ```sh
@@ -85,6 +85,13 @@ git rev-parse HEAD
 ```sh
 cd XGboost
 ```
+### BayesA
+```sh
+```
+### rrBLUP
+### Lasso
+### ElasticNet
+
 
 ### [GBLUP]()
 
