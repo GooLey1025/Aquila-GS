@@ -4,8 +4,6 @@ All benchmarks were conducted using the versions of the compared methods that we
 
 Note that for benchmarking purposes, it is not necessary to clone all original repositories, as the required scripts have been integrated or adapted into this project.
 
-Detailed instructions are provided in the `README.md` in the corresponding directories.```
-
 
 ## Data Prepare
 
@@ -22,7 +20,8 @@ Rscript pixant_impute/phenotype_pixant_impute.R GSTP008.pheno 705Rice.pheno.impu
 
 ## Prerequisites
 
-### Install required R packages for XGBoost, BayesA, rrBLUP, Lasso, ElasticNet.
+### Install required R packages for [XGBoost](#xgboost), BayesA, rrBLUP, Lasso, ElasticNet.
+Our R version: 4.3.3
 ```r
 install.packages(c(
   "xgboost",           # XGBoost
@@ -82,7 +81,7 @@ git rev-parse HEAD
 # e0a77cf699b034d956b249f41b2e1f357f486f06
 ```
 
-### XGBOOST
+### XGBoost
 ```sh
 cd XGboost
 ```
