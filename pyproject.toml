@@ -36,6 +36,8 @@ dependencies = [
     "torchinfo>=1.8.0",
     "matplotlib>=3.3.0",
     "torchmetrics>=0.13.0",
+    "wandb>=0.17.0",
+    "optuna>=3.5.0",
 ]
 
 [project.scripts]

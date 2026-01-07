@@ -84,12 +84,13 @@ class VarTrainer:
         scheduler_type: str = 'reduce_on_plateau',
         scheduler_params: Optional[Dict] = None,
         num_epochs: Optional[int] = None,
-        val_score_r_weight: float = 0.8,
-        val_score_r2_weight: float = 0.2,
+        val_score_r_weight: float = 1.0,
+        val_score_r2_weight: float = 0.0,
         is_distributed: bool = False,
         rank: int = 0,
         use_mixed_precision: bool = False,
         huber_delta: float = 1.0,
+        wandb_run=None,
     ):
         """
         Initialize trainer.
@@ -111,11 +112,12 @@ class VarTrainer:
             scheduler_type: Type of learning rate scheduler ('reduce_on_plateau' or 'one_cycle')
             scheduler_params: Additional parameters for the scheduler
             num_epochs: Total number of epochs (required for OneCycleLR)
-            val_score_r_weight: Weight for Pearson R in validation score (default 0.8)
-            val_score_r2_weight: Weight for R² in validation score (default 0.2)
+            val_score_r_weight: Weight for Pearson R in validation score (default 1.0)
+            val_score_r2_weight: Weight for R² in validation score (default 0.0)
             is_distributed: Whether running in distributed mode
             rank: Process rank for distributed training
             use_mixed_precision: Enable mixed precision training (FP16) for faster training
+            wandb_run: Optional wandb run object for experiment tracking (only log on rank 0)
         """
         self.model = model
         self.train_loader = train_loader
@@ -127,6 +129,8 @@ class VarTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.gradient_clip_norm = gradient_clip_norm
         self.use_mixed_precision = use_mixed_precision
+        self.wandb_run = wandb_run if (
+            wandb_run is not None and rank == 0) else None
 
         # Initialize GradScaler for mixed precision training
         if self.use_mixed_precision:
@@ -237,10 +241,10 @@ class VarTrainer:
             raise ValueError(f"Unknown scheduler type: {scheduler_type}. "
                              f"Supported types: 'reduce_on_plateau', 'one_cycle', 'cosine_warmup'")
 
-        # Early stopping (based on weighted validation score, higher is better)
+        # Early stopping (based on validation Pearson R, higher is better)
         self.early_stopping = EarlyStopping(
             patience=early_stopping_patience,
-            mode='max'  # For validation score, higher is better
+            mode='max'  # For validation Pearson R, higher is better
         )
 
         # Metrics
@@ -258,8 +262,8 @@ class VarTrainer:
             'learning_rate': [],
         }
 
-        # Track best model by weighted validation score
-        self.best_val_score = float('-inf')  # Higher is better
+        # Track best model by validation Pearson R
+        self.best_val_r = float('-inf')  # Higher is better
         self.best_epoch = 0
         self.best_metrics = {}
 
@@ -504,7 +508,7 @@ class VarTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'metrics': metrics,
             'history': self.history,
-            'best_val_score': self.best_val_score,
+            'best_val_r': self.best_val_r,
             'best_epoch': self.best_epoch,
             'best_metrics': self.best_metrics,
             'early_stopping_counter': self.early_stopping.counter,
@@ -552,8 +556,14 @@ class VarTrainer:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
         # Restore best model tracking
-        if 'best_val_score' in checkpoint:
-            self.best_val_score = checkpoint['best_val_score']
+        if 'best_val_r' in checkpoint:
+            self.best_val_r = checkpoint['best_val_r']
+        elif 'best_val_score' in checkpoint:
+            # Backward compatibility: if old checkpoint has best_val_score, use best_metrics
+            if 'best_metrics' in checkpoint and 'val_r' in checkpoint['best_metrics']:
+                self.best_val_r = checkpoint['best_metrics']['val_r']
+            else:
+                self.best_val_r = checkpoint['best_val_score']
         if 'best_epoch' in checkpoint:
             self.best_epoch = checkpoint['best_epoch']
         if 'best_metrics' in checkpoint:
@@ -643,9 +653,10 @@ class VarTrainer:
                 self.history['val_r'].append(
                     val_metrics.get('val_pearson', 0.0))
 
-                # Calculate weighted validation score
+                # Get validation Pearson R
                 val_r = val_metrics.get('val_pearson', 0.0)
                 val_r2 = val_metrics.get('val_r2', 0.0)
+                # Calculate weighted validation score for logging (optional)
                 val_score = self.val_score_r_weight * val_r + self.val_score_r2_weight * val_r2
                 self.history['val_score'].append(val_score)
 
@@ -653,10 +664,10 @@ class VarTrainer:
                 if self.scheduler_type == 'reduce_on_plateau':
                     self.scheduler.step(val_metrics['val_loss'])
 
-                # Check for improvement based on weighted validation score
-                is_best = val_score > self.best_val_score
+                # Check for improvement based on validation Pearson R
+                is_best = val_r > self.best_val_r
                 if is_best:
-                    self.best_val_score = val_score
+                    self.best_val_r = val_r
                     self.best_epoch = epoch + 1
                     # Store all metrics for the best model
                     self.best_metrics = {
@@ -677,6 +688,29 @@ class VarTrainer:
                 # Save checkpoint
                 self.save_checkpoint(epoch + 1, val_metrics, is_best)
 
+                # Log to wandb (only on rank 0)
+                if self.wandb_run is not None:
+                    log_dict = {
+                        'epoch': epoch + 1,
+                        'train/loss': train_metrics['train_loss'],
+                        'train/r2': train_metrics.get('train_r2', 0.0),
+                        'train/pearson_r': train_metrics.get('train_pearson', 0.0),
+                        'val/loss': val_metrics['val_loss'],
+                        'val/r2': val_metrics.get('val_r2', 0.0),
+                        'val/pearson_r': val_metrics.get('val_pearson', 0.0),
+                        'val/score': val_score,
+                        'learning_rate': current_lr,
+                    }
+                    # Add detailed regression metrics if available
+                    for key, value in val_metrics.items():
+                        if key.startswith('val_reg_') and isinstance(value, (int, float)):
+                            log_dict[key] = value
+                    # Add detailed classification metrics if available
+                    for key, value in val_metrics.items():
+                        if key.startswith('val_cls_') and isinstance(value, (int, float)):
+                            log_dict[key] = value
+                    self.wandb_run.log(log_dict, step=epoch + 1)
+
                 # Print single-line progress (only on rank 0)
                 if verbose and self.rank == 0:
                     epoch_time = time.time() - epoch_start
@@ -692,16 +726,16 @@ class VarTrainer:
                     output += f"valid_loss: {val_metrics['val_loss']:.4f} - "
                     output += f"valid_r: {val_pearson:.4f} - "
                     output += f"valid_r2: {val_r2:.4f} - "
-                    output += f"valid_score: {val_score:.4f}"
+                    output += f"valid_r: {val_r:.4f}"
 
                     if is_best:
                         output += " - best!"
 
                     print(output)
 
-                # Early stopping (based on weighted validation score)
+                # Early stopping (based on validation Pearson R)
                 # All ranks must check early stopping to stay synchronized
-                should_stop = self.early_stopping(val_score)
+                should_stop = self.early_stopping(val_r)
 
                 # Synchronize early stopping decision across all ranks
                 if self.is_distributed:
@@ -716,13 +750,24 @@ class VarTrainer:
                         print(
                             f"\nEarly stopping triggered at epoch {epoch + 1}")
                         print(
-                            f"Best epoch: {self.best_epoch} with val_score: {self.best_val_score:.4f}")
+                            f"Best epoch: {self.best_epoch} with val_r: {self.best_val_r:.4f}")
                         print(
-                            f"  (val_r: {self.best_metrics.get('val_r', 0.0):.4f}, val_r2: {self.best_metrics.get('val_r2', 0.0):.4f})")
+                            f"  (val_r2: {self.best_metrics.get('val_r2', 0.0):.4f}, val_loss: {self.best_metrics.get('val_loss', 0.0):.4f})")
                     break
             else:
                 # No validation set, just save checkpoint
                 self.save_checkpoint(epoch + 1, train_metrics)
+
+                # Log to wandb (only on rank 0)
+                if self.wandb_run is not None:
+                    log_dict = {
+                        'epoch': epoch + 1,
+                        'train/loss': train_metrics['train_loss'],
+                        'train/r2': train_metrics.get('train_r2', 0.0),
+                        'train/pearson_r': train_metrics.get('train_pearson', 0.0),
+                        'learning_rate': current_lr,
+                    }
+                    self.wandb_run.log(log_dict, step=epoch + 1)
 
                 if verbose and self.rank == 0:
                     epoch_time = time.time() - epoch_start
@@ -736,14 +781,31 @@ class VarTrainer:
             elapsed_time = time.time() - start_time
             print(f"\nTraining completed in {elapsed_time / 60:.2f} minutes")
             print(f"Best model at epoch {self.best_epoch}:")
-            print(f"  Validation Score: {self.best_val_score:.4f}")
+            print(f"  Validation Pearson R: {self.best_val_r:.4f}")
             if self.best_metrics:
-                print(
-                    f"  Validation Pearson R: {self.best_metrics.get('val_r', 0.0):.4f}")
                 print(
                     f"  Validation R²: {self.best_metrics.get('val_r2', 0.0):.4f}")
                 print(
                     f"  Validation Loss: {self.best_metrics.get('val_loss', 0.0):.4f}")
+
+            # Log best metrics to wandb
+            if self.wandb_run is not None:
+                best_log_dict = {
+                    'best/epoch': self.best_epoch,
+                    'best/val_r': self.best_val_r,
+                    'best/val_r2': self.best_metrics.get('val_r2', 0.0),
+                    'best/val_loss': self.best_metrics.get('val_loss', 0.0),
+                    'best/train_loss': self.best_metrics.get('train_loss', 0.0),
+                    'best/train_r': self.best_metrics.get('train_r', 0.0),
+                    'best/train_r2': self.best_metrics.get('train_r2', 0.0),
+                    'training_time_minutes': elapsed_time / 60,
+                }
+                # Add all detailed best metrics
+                for key, value in self.best_metrics.items():
+                    if key.startswith('val_reg_') or key.startswith('val_cls_'):
+                        if isinstance(value, (int, float)):
+                            best_log_dict[f'best/{key}'] = value
+                self.wandb_run.log(best_log_dict)
 
         # Save training history as JSON (only on rank 0)
         if self.rank == 0:
@@ -777,8 +839,8 @@ class VarTrainer:
                               index=False, float_format='%.6f')
             history_path = history_path_tsv
 
-            # Save best model metrics with all details
-            best_metrics_path = self.checkpoint_dir / 'best_metrics.json'
+            # Save best model metrics with all details (in output_dir root, not checkpoints subdirectory)
+            best_metrics_path = self.checkpoint_dir.parent / 'best_metrics.json'
             with open(best_metrics_path, 'w') as f:
                 json.dump(self.best_metrics, f, indent=2)
 
@@ -786,6 +848,10 @@ class VarTrainer:
             print(f"  Training history (TSV): {history_path_tsv}")
             print(f"  Training history (JSON): {history_path_json}")
             print(f"  Best model metrics: {best_metrics_path}")
+
+            # Finish wandb run
+            if self.wandb_run is not None:
+                self.wandb_run.finish()
 
         # Synchronize all ranks after file saving (if distributed)
         if self.is_distributed:

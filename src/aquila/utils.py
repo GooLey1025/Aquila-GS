@@ -13,7 +13,7 @@ from typing import Dict
 def set_seed(seed: int = 42):
     """
     Set random seed for reproducibility.
-    
+
     Args:
         seed: Random seed value
     """
@@ -28,7 +28,7 @@ def set_seed(seed: int = 42):
 def save_config(config: Dict, path: str):
     """
     Save configuration to YAML file.
-    
+
     Args:
         config: Configuration dictionary
         path: Path to save file
@@ -38,13 +38,57 @@ def save_config(config: Dict, path: str):
     print(f"Configuration saved to: {path}")
 
 
+def merge_wandb_config(config: Dict, wandb_config: Dict) -> Dict:
+    """
+    Merge WandB sweep config into YAML config.
+
+    WandB config uses dot notation (e.g., 'train.learning_rate'),
+    which needs to be merged into nested dict structure.
+
+    Args:
+        config: Original YAML configuration dictionary
+        wandb_config: WandB config dictionary with dot notation keys
+
+    Returns:
+        Merged configuration dictionary
+    """
+    merged_config = config.copy()
+
+    for key, value in wandb_config.items():
+        # Skip wandb internal keys
+        if key.startswith('_') or key in ['wandb_version', 'wandb_job_type']:
+            continue
+
+        # Handle dot notation (e.g., 'train.learning_rate')
+        if '.' in key:
+            parts = key.split('.')
+            current = merged_config
+
+            # Navigate/create nested structure
+            for part in parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                elif not isinstance(current[part], dict):
+                    # If existing value is not a dict, convert it
+                    current[part] = {}
+                current = current[part]
+
+            # Set the final value
+            current[parts[-1]] = value
+        else:
+            # Top-level key
+            merged_config[key] = value
+
+    return merged_config
+
+
 def load_config(path: str) -> Dict:
     """
     Load configuration from YAML file.
-    
+
     Args:
         path: Path to YAML file
-        
+
     Returns:
         Configuration dictionary
     """
@@ -56,7 +100,7 @@ def load_config(path: str) -> Dict:
 def print_model_summary(model: torch.nn.Module, input_size=None, device='cpu', verbose=True, encoding_type='token'):
     """
     Print model architecture and parameter counts using torchinfo.
-    
+
     Args:
         model: PyTorch model
         input_size: Input tensor size for detailed summary
@@ -67,10 +111,10 @@ def print_model_summary(model: torch.nn.Module, input_size=None, device='cpu', v
         encoding_type: Type of encoding ('token' or 'diploid_onehot')
     """
     from torchinfo import summary
-    
+
     print("\nModel Architecture Summary:")
     print("=" * 80)
-    
+
     if input_size is not None:
         # Determine dtype based on encoding type
         if encoding_type == 'token':
@@ -82,7 +126,7 @@ def print_model_summary(model: torch.nn.Module, input_size=None, device='cpu', v
         else:
             # Default to long for backward compatibility
             dtype = torch.long
-        
+
         # Detailed summary with input size
         summary(
             model,
@@ -108,23 +152,23 @@ def print_model_summary(model: torch.nn.Module, input_size=None, device='cpu', v
 def count_snps_missing(snp_matrix: np.ndarray) -> Dict[str, float]:
     """
     Count missing SNPs in the data.
-    
+
     Args:
         snp_matrix: (n_samples, n_snps) array
-        
+
     Returns:
         Dictionary with missing statistics
     """
     total_values = snp_matrix.size
     missing_values = (snp_matrix == 3).sum()
     missing_rate = missing_values / total_values
-    
+
     # Per-sample missing rate
     missing_per_sample = (snp_matrix == 3).sum(axis=1) / snp_matrix.shape[1]
-    
+
     # Per-SNP missing rate
     missing_per_snp = (snp_matrix == 3).sum(axis=0) / snp_matrix.shape[0]
-    
+
     return {
         'total_values': int(total_values),
         'missing_values': int(missing_values),
@@ -139,10 +183,10 @@ def count_snps_missing(snp_matrix: np.ndarray) -> Dict[str, float]:
 def format_time(seconds: float) -> str:
     """
     Format time in seconds to human-readable string.
-    
+
     Args:
         seconds: Time in seconds
-        
+
     Returns:
         Formatted time string
     """

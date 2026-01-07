@@ -465,6 +465,53 @@ def detect_skewed_phenotypes(pheno_df: pd.DataFrame, regression_tasks: List[str]
     return transformed_df, log_transformed_tasks
 
 
+def _worker_init_fn(worker_id: int):
+    """
+    Initialize worker process with fixed seed for reproducibility.
+
+    This ensures that data loading is deterministic even with multiple workers.
+    Each worker gets a deterministic seed based on the main process seed.
+
+    IMPORTANT: Worker processes are separate processes and do NOT automatically
+    inherit the random seed from the main process. This function is called when
+    each worker process starts, allowing us to set deterministic seeds.
+
+    How it works:
+    1. Main process calls set_seed(42) -> sets torch.manual_seed(42)
+    2. When DataLoader creates worker processes, PyTorch passes the main process
+       seed to each worker via torch.initial_seed()
+    3. This function uses that seed + worker_id to create a unique but
+       deterministic seed for each worker
+    4. Each worker then sets its own random number generators with this seed
+
+    Args:
+        worker_id: ID of the worker process (0, 1, 2, ...)
+    """
+    import random
+    import numpy as np
+    import torch
+
+    # Get the base seed from the main process
+    # torch.initial_seed() returns the seed that PyTorch passed to this worker
+    # This is the seed set by torch.manual_seed() in the main process
+    base_seed = torch.initial_seed() % (2 ** 32)
+
+    # Create a unique but deterministic seed for each worker
+    # This ensures reproducibility while allowing different workers to have different seeds
+    # Worker 0 gets base_seed, Worker 1 gets base_seed+1, etc.
+    worker_seed = base_seed + worker_id
+
+    # Set seeds for all random number generators in THIS worker process
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+    # Note: We don't set cudnn.deterministic/benchmark here because:
+    # 1. Worker processes typically only do CPU data loading, not GPU computation
+    # 2. These settings are already set in the main process via set_seed()
+    # 3. Setting them in workers is unnecessary overhead
+
+
 def create_data_loaders(
     geno_path: str,
     pheno_path: str,
@@ -483,6 +530,7 @@ def create_data_loaders(
     use_distributed_sampler: bool = False,
     data_split_seed: int = 42,
     augmentation_config: Optional[Dict] = None,
+    data_split_file: Optional[str] = None,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], Optional[Dict]]:
     """
     Create train/val/test data loaders with z-score normalization for regression targets.
@@ -512,6 +560,9 @@ def create_data_loaders(
                 'cutout': {'num_segments': 2, 'segment_ratio': 0.01},
                 'allele_swap': {'swap_prob': 0.5}
             }
+        data_split_file: Optional path to TSV file with columns 'Sample_ID' and 'Split' (train/valid/test).
+            If provided, will use this file to determine data splits instead of random splitting.
+            Format: Sample_ID\tSplit (e.g., "1701\ttrain", "1702\tvalid")
 
     Returns:
         train_loader, val_loader, test_loader, normalization_stats
@@ -583,7 +634,8 @@ def create_data_loaders(
                     train_loader = DataLoader(
                         train_dataset, batch_size=batch_size, sampler=train_sampler,
                         num_workers=num_workers, pin_memory=True,
-                        persistent_workers=True
+                        persistent_workers=True if num_workers > 0 else False,
+                        worker_init_fn=_worker_init_fn if num_workers > 0 else None
                     )
                     if rank == 0:
                         print(
@@ -592,7 +644,8 @@ def create_data_loaders(
                     train_loader = DataLoader(
                         train_dataset, batch_size=batch_size, shuffle=True,
                         num_workers=num_workers, pin_memory=True,
-                        persistent_workers=True
+                        persistent_workers=True if num_workers > 0 else False,
+                        worker_init_fn=_worker_init_fn if num_workers > 0 else None
                     )
                     if rank == 0:
                         print(
@@ -605,16 +658,20 @@ def create_data_loaders(
                         val_sampler = DistributedSampler(
                             val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
                         )
+                        # For validation set, use worker_init_fn to ensure deterministic data loading
                         val_loader = DataLoader(
                             val_dataset, batch_size=batch_size, sampler=val_sampler,
                             num_workers=num_workers, pin_memory=True,
-                            persistent_workers=True
+                            persistent_workers=True if num_workers > 0 else False,
+                            worker_init_fn=_worker_init_fn if num_workers > 0 else None
                         )
                     else:
+                        # For validation set, use worker_init_fn to ensure deterministic data loading
                         val_loader = DataLoader(
                             val_dataset, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=True,
-                            persistent_workers=True
+                            persistent_workers=True if num_workers > 0 else False,
+                            worker_init_fn=_worker_init_fn if num_workers > 0 else None
                         )
                     if rank == 0:
                         print(f"   ✓ Loaded val: {len(val_dataset)} samples")
@@ -695,13 +752,63 @@ def create_data_loaders(
         normalize_regression=False  # Don't normalize yet
     )
 
-    # Split dataset with dedicated seed
+    # Split dataset with dedicated seed or from file
     n_samples = len(dataset_unnormalized)
     indices = np.arange(n_samples)
 
-    # Use dedicated random generator for data splitting to ensure reproducibility
-    rng = np.random.RandomState(data_split_seed)
-    rng.shuffle(indices)
+    if data_split_file is not None:
+        # Load data split from file
+        import pandas as pd
+        split_df = pd.read_csv(data_split_file, sep='\t')
+
+        if 'Sample_ID' not in split_df.columns or 'Split' not in split_df.columns:
+            raise ValueError(
+                f"data_split_file must contain 'Sample_ID' and 'Split' columns. Found columns: {split_df.columns.tolist()}")
+
+        # Create mapping from sample_id to split
+        sample_id_to_split = dict(
+            zip(split_df['Sample_ID'], split_df['Split']))
+
+        # Map sample IDs to indices
+        train_indices_list = []
+        val_indices_list = []
+        test_indices_list = []
+
+        for idx in range(n_samples):
+            sample_id = dataset_unnormalized.sample_ids[idx]
+            split = sample_id_to_split.get(sample_id, None)
+
+            if split == 'train':
+                train_indices_list.append(idx)
+            elif split == 'valid' or split == 'val':
+                val_indices_list.append(idx)
+            elif split == 'test':
+                test_indices_list.append(idx)
+            else:
+                if rank == 0:
+                    print(
+                        f"Warning: Sample {sample_id} not found in data_split_file or has unknown split '{split}', skipping")
+
+        train_indices = np.array(train_indices_list, dtype=np.int64)
+        val_indices = np.array(
+            val_indices_list, dtype=np.int64) if val_indices_list else np.array([], dtype=np.int64)
+        test_indices = np.array(
+            test_indices_list, dtype=np.int64) if test_indices_list else np.array([], dtype=np.int64)
+
+        # Calculate sizes for consistency with the else branch
+        train_size = len(train_indices)
+        val_size = len(val_indices)
+        test_size = len(test_indices)
+
+        if rank == 0:
+            print(f"\nLoaded data split from file: {data_split_file}")
+            print(f"  Train samples: {len(train_indices)}")
+            print(f"  Valid samples: {len(val_indices)}")
+            print(f"  Test samples: {len(test_indices)}")
+    else:
+        # Use dedicated random generator for data splitting to ensure reproducibility
+        rng = np.random.RandomState(data_split_seed)
+        rng.shuffle(indices)
 
     # Calculate split sizes
     test_size = int(n_samples * test_split)
@@ -796,7 +903,8 @@ def create_data_loaders(
             sampler=train_sampler,
             num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=True if num_workers > 0 else False,
+            worker_init_fn=_worker_init_fn if num_workers > 0 else None
         )
     else:
         # Regular DataLoader for single GPU
@@ -806,7 +914,8 @@ def create_data_loaders(
             shuffle=True,
             num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=True if num_workers > 0 else False,
+            worker_init_fn=_worker_init_fn if num_workers > 0 else None
         )
 
     val_loader = None
@@ -820,22 +929,27 @@ def create_data_loaders(
                 shuffle=False,
                 drop_last=False
             )
+            # For validation set, use worker_init_fn to ensure deterministic data loading
             val_loader = DataLoader(
                 val_subset,
                 batch_size=batch_size,
                 sampler=val_sampler,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True
+                persistent_workers=True if num_workers > 0 else False,
+                worker_init_fn=_worker_init_fn if num_workers > 0 else None
             )
         else:
+            # For validation set, use worker_init_fn to ensure deterministic data loading
+            # This is critical for reproducibility when num_workers > 0
             val_loader = DataLoader(
                 val_subset,
                 batch_size=batch_size,
                 shuffle=False,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True
+                persistent_workers=True if num_workers > 0 else False,
+                worker_init_fn=_worker_init_fn if num_workers > 0 else None
             )
 
     test_loader = None
@@ -849,22 +963,26 @@ def create_data_loaders(
                 shuffle=False,
                 drop_last=False
             )
+            # For test set, use worker_init_fn to ensure deterministic data loading
             test_loader = DataLoader(
                 test_subset,
                 batch_size=batch_size,
                 sampler=test_sampler,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True
+                persistent_workers=True if num_workers > 0 else False,
+                worker_init_fn=_worker_init_fn if num_workers > 0 else None
             )
         else:
+            # For test set, use worker_init_fn to ensure deterministic data loading
             test_loader = DataLoader(
                 test_subset,
                 batch_size=batch_size,
                 shuffle=False,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True
+                persistent_workers=True if num_workers > 0 else False,
+                worker_init_fn=_worker_init_fn if num_workers > 0 else None
             )
 
     print(
@@ -1011,22 +1129,25 @@ def create_kfold_data_loaders(
         )
 
         # Create data loaders for this fold
+        # persistent_workers requires num_workers > 0
+        dataloader_kwargs = {
+            'batch_size': batch_size,
+            'num_workers': num_workers,
+            'pin_memory': True,
+        }
+        if num_workers > 0:
+            dataloader_kwargs['persistent_workers'] = True
+
         train_loader = DataLoader(
             torch.utils.data.Subset(fold_dataset, train_indices),
-            batch_size=batch_size,
             shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True
+            **dataloader_kwargs
         )
 
         val_loader = DataLoader(
             torch.utils.data.Subset(fold_dataset, val_indices),
-            batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True
+            **dataloader_kwargs
         )
 
         yield fold_idx, train_loader, val_loader, normalization_stats, seq_length

@@ -23,12 +23,233 @@ import numpy as np
 from pathlib import Path
 import time
 import os
+from typing import Dict, Optional
 from aquila.varnn import create_model_from_config
 from aquila.trainer import VarTrainer
 from aquila.data_utils import create_data_loaders
-from aquila.utils import set_seed, save_config, load_config, print_model_summary
+from aquila.utils import set_seed, save_config, load_config, print_model_summary, merge_wandb_config
+from aquila.hpo import load_hpo_config, run_optuna_search, train_single_run
 import pandas as pd
 from aquila.metrics import MetricsCalculator
+
+
+def save_postprocess_data(
+    train_loader,
+    val_loader,
+    test_loader,
+    vcf_file: str,
+    pheno_file: str,
+    normalization_stats: Dict,
+    output_dir: Path,
+    print_func=None
+):
+    """
+    Save postprocessed genotype (VCF) and normalized phenotype data for benchmark models.
+
+    Args:
+        train_loader: Training data loader
+        val_loader: Validation data loader (optional)
+        test_loader: Test data loader (optional)
+        vcf_file: Path to original VCF file
+        pheno_file: Path to original phenotype file
+        normalization_stats: Normalization statistics dict
+        output_dir: Output directory
+        print_func: Print function (for distributed training)
+    """
+    if print_func is None:
+        print_func = print
+
+    postprocess_dir = output_dir / 'data_postprocess'
+    postprocess_dir.mkdir(parents=True, exist_ok=True)
+
+    print_func("\n" + "=" * 80)
+    print_func("Saving Postprocessed Data for Benchmark Models")
+    print_func("=" * 80)
+
+    # Collect normalized phenotypes from datasets (not loaders, to avoid DistributedSampler issues)
+    def collect_phenotypes_from_dataset(dataset):
+        """
+        Collect phenotypes directly from dataset to avoid DistributedSampler sampling.
+        """
+        sample_ids = []
+        regression_targets = []
+        regression_masks = []
+        classification_targets = []
+        classification_masks = []
+
+        # Collect data from all samples in the dataset
+        # Subset.__getitem__ handles index mapping automatically
+        for idx in range(len(dataset)):
+            item = dataset[idx]
+
+            if 'sample_id' in item:
+                sample_ids.append(item['sample_id'])
+
+            if 'regression_targets' in item:
+                reg_target = item['regression_targets']
+                reg_mask = item['regression_mask']
+                if isinstance(reg_target, torch.Tensor):
+                    regression_targets.append(reg_target.cpu().numpy())
+                    regression_masks.append(reg_mask.cpu().numpy())
+                else:
+                    regression_targets.append(np.array(reg_target))
+                    regression_masks.append(np.array(reg_mask))
+
+            if 'classification_targets' in item:
+                cls_target = item['classification_targets']
+                cls_mask = item['classification_mask']
+                if isinstance(cls_target, torch.Tensor):
+                    classification_targets.append(cls_target.cpu().numpy())
+                    classification_masks.append(cls_mask.cpu().numpy())
+                else:
+                    classification_targets.append(np.array(cls_target))
+                    classification_masks.append(np.array(cls_mask))
+
+        result = {
+            'sample_ids': sample_ids,
+            'regression_targets': np.array(regression_targets) if regression_targets else None,
+            'regression_masks': np.array(regression_masks) if regression_masks else None,
+            'classification_targets': np.array(classification_targets) if classification_targets else None,
+            'classification_masks': np.array(classification_masks) if classification_masks else None,
+        }
+        return result
+
+    # Collect phenotypes for each split (access datasets directly to avoid DistributedSampler)
+    train_pheno = collect_phenotypes_from_dataset(train_loader.dataset)
+    val_pheno = collect_phenotypes_from_dataset(
+        val_loader.dataset) if val_loader else None
+    test_pheno = collect_phenotypes_from_dataset(
+        test_loader.dataset) if test_loader else None
+
+    # Get task names
+    regression_task_names = normalization_stats.get(
+        'regression_tasks', []) if normalization_stats else []
+
+    # Get classification task names from dataset
+    classification_task_names = None
+    if train_loader.dataset:
+        # Handle Subset wrapper
+        if isinstance(train_loader.dataset, torch.utils.data.Subset):
+            actual_dataset = train_loader.dataset.dataset
+        else:
+            actual_dataset = train_loader.dataset
+
+        if hasattr(actual_dataset, 'classification_cols') and actual_dataset.classification_cols:
+            classification_task_names = actual_dataset.classification_cols
+
+    # Save normalized phenotype files
+    def save_phenotype_file(pheno_data, split_name):
+        pheno_data_list = []
+
+        for i, sample_id in enumerate(pheno_data['sample_ids']):
+            row = {'Sample_ID': sample_id}
+
+            # Add regression tasks
+            if pheno_data['regression_targets'] is not None:
+                for j, task_name in enumerate(regression_task_names):
+                    if pheno_data['regression_masks'][i, j]:
+                        row[task_name] = pheno_data['regression_targets'][i, j]
+                    else:
+                        row[task_name] = np.nan
+
+            # Add classification tasks
+            if pheno_data['classification_targets'] is not None and classification_task_names:
+                for j, task_name in enumerate(classification_task_names):
+                    if pheno_data['classification_masks'][i, j]:
+                        row[task_name] = pheno_data['classification_targets'][i, j]
+                    else:
+                        row[task_name] = np.nan
+
+            pheno_data_list.append(row)
+
+        df = pd.DataFrame(pheno_data_list)
+        pheno_path = postprocess_dir / f'pheno_{split_name}_normalized.tsv'
+        df.to_csv(pheno_path, sep='\t', index=False, float_format='%.6f')
+        print_func(
+            f"  Saved normalized phenotypes: {pheno_path} ({len(df)} samples)")
+        return pheno_path
+
+    train_pheno_path = save_phenotype_file(train_pheno, 'train')
+    if val_pheno:
+        val_pheno_path = save_phenotype_file(val_pheno, 'valid')
+    if test_pheno:
+        test_pheno_path = save_phenotype_file(test_pheno, 'test')
+
+    # Filter and save VCF files for each split
+    def filter_vcf_by_samples(vcf_file, sample_ids, output_vcf_path):
+        """
+        Filter VCF file to include only specified samples.
+        """
+        sample_set = set(sample_ids)
+        keep_indices = None
+
+        with open(vcf_file, 'r') as f_in, open(output_vcf_path, 'w') as f_out:
+            # Copy header lines
+            for line in f_in:
+                if line.startswith('#'):
+                    if line.startswith('#CHROM'):
+                        # Parse header to get sample column indices
+                        header_fields = line.strip().split('\t')
+                        # Samples start after FORMAT column
+                        vcf_sample_ids = header_fields[9:]
+
+                        # Find indices of samples to keep
+                        keep_indices = []
+                        for i, vcf_sample_id in enumerate(vcf_sample_ids):
+                            if vcf_sample_id in sample_set:
+                                # +9 because first 9 columns are metadata
+                                keep_indices.append(i + 9)
+
+                        if not keep_indices:
+                            print_func(
+                                f"  Warning: No matching samples found in VCF for split")
+                            return False
+
+                        # Write header with filtered samples
+                        filtered_header = header_fields[:9] + \
+                            [vcf_sample_ids[i - 9] for i in keep_indices]
+                        f_out.write('\t'.join(filtered_header) + '\n')
+                    else:
+                        f_out.write(line)
+                else:
+                    # Process variant lines
+                    if keep_indices is None:
+                        print_func(f"  Error: VCF header not found")
+                        return False
+
+                    fields = line.strip().split('\t')
+                    if len(fields) < 10:
+                        continue
+
+                    # Keep metadata columns (first 9) and filtered sample columns
+                    filtered_fields = fields[:9] + \
+                        [fields[i] for i in keep_indices]
+                    f_out.write('\t'.join(filtered_fields) + '\n')
+
+        return True
+
+    # Save filtered VCF files
+    def save_vcf_for_split(pheno_data, split_name):
+        sample_ids = pheno_data['sample_ids']
+        vcf_path = postprocess_dir / f'geno_{split_name}.vcf'
+
+        if filter_vcf_by_samples(vcf_file, sample_ids, vcf_path):
+            print_func(
+                f"  Saved filtered VCF: {vcf_path} ({len(sample_ids)} samples)")
+            return vcf_path
+        else:
+            return None
+
+    train_vcf_path = save_vcf_for_split(train_pheno, 'train')
+    if val_pheno:
+        val_vcf_path = save_vcf_for_split(val_pheno, 'valid')
+    if test_pheno:
+        test_vcf_path = save_vcf_for_split(test_pheno, 'test')
+
+    print_func(f"\nPostprocessed data saved to: {postprocess_dir}")
+    print_func(
+        "  - Normalized phenotype files: pheno_{train/valid/test}_normalized.tsv")
+    print_func("  - Filtered VCF files: geno_{train/valid/test}.vcf")
 
 
 def parse_args():
@@ -124,10 +345,58 @@ def parse_args():
     )
 
     parser.add_argument(
+        '--data-split-file',
+        type=str,
+        default=None,
+        help='Path to TSV file with columns Sample_ID and Split (train/valid/test). If provided, will use this file to determine data splits instead of random splitting.'
+    )
+
+    parser.add_argument(
         '-mp',
         '--mixed-precision',
         action='store_true',
         help='Enable mixed precision training (FP16) for faster training and reduced memory usage'
+    )
+
+    parser.add_argument(
+        '--use-wandb',
+        action='store_true',
+        help='Enable Weights & Biases (wandb) logging for experiment tracking'
+    )
+
+    parser.add_argument(
+        '--wandb-project',
+        type=str,
+        default='aquila-gs',
+        help='W&B project name (default: aquila-gs)'
+    )
+
+    parser.add_argument(
+        '--wandb-name',
+        type=str,
+        default=None,
+        help='W&B run name (default: auto-generated from config and timestamp)'
+    )
+
+    parser.add_argument(
+        '--wandb-tags',
+        type=str,
+        nargs='+',
+        default=None,
+        help='W&B tags for organizing runs'
+    )
+
+    parser.add_argument(
+        '-hpo',
+        '--hyperparameter-optimization',
+        action='store_true',
+        help='Enable hyperparameter optimization using Optuna (reads hpo section from config)'
+    )
+
+    parser.add_argument(
+        '--save-postprocess-data',
+        action='store_true',
+        help='Save postprocessed genotype and normalized phenotype data for benchmark models (saved to output_dir/data_postprocess/)'
     )
 
     return parser.parse_args()
@@ -173,6 +442,97 @@ def main():
 
     print_rank0(f"\nLoading configuration from: {args.config}")
     config = load_config(args.config)
+
+    # Check if running hyperparameter optimization
+    if args.hyperparameter_optimization:
+        # HPO is incompatible with distributed training
+        if is_distributed:
+            print_rank0(
+                "\n❌ Error: Hyperparameter optimization cannot be used with distributed training (torchrun).")
+            print_rank0(
+                "   Please run HPO without torchrun.")
+            print_rank0(
+                "   Example: python aquila_train.py --config params.yaml -hpo")
+            if is_distributed:
+                dist.destroy_process_group()
+            return
+
+        hpo_config = config.get('hpo')
+        if not hpo_config:
+            print_rank0(
+                "\n❌ Error: --hyperparameter-optimization (-hpo) specified but 'hpo' section not found in config file.")
+            print_rank0(
+                "   Please add an 'hpo' section to your config file with hyperparameter search space.")
+            return
+
+        try:
+            hpo_config_normalized = load_hpo_config(hpo_config)
+        except ValueError as e:
+            print_rank0(f"\n❌ Error loading HPO configuration: {e}")
+            return
+
+        # Remove hpo section from base config (will be merged per trial)
+        base_config = {k: v for k, v in config.items() if k != 'hpo'}
+
+        # Create Optuna output directory
+        optuna_output_dir = Path(args.output) / 'optuna_search'
+        optuna_output_dir.mkdir(parents=True, exist_ok=True)
+
+        print_rank0("\n" + "=" * 80)
+        print_rank0("Optuna Hyperparameter Optimization")
+        print_rank0("=" * 80)
+
+        # Prepare arguments for train_single_run
+        train_kwargs = {
+            'args': args,
+            'is_distributed': False,
+            'rank': 0,
+            'world_size': 1,
+            'local_rank': 0,
+            'print_rank0_func': None  # Will use default print function in train_single_run
+        }
+
+        # Run Optuna optimization
+        study = run_optuna_search(
+            base_config=base_config,
+            hpo_config=hpo_config_normalized,
+            output_dir=optuna_output_dir,
+            train_single_run_func=train_single_run,
+            train_single_run_kwargs=train_kwargs,
+            n_trials=hpo_config_normalized.get('n_trials', 100),
+            use_wandb=args.use_wandb,
+            wandb_project=args.wandb_project,
+            wandb_name=args.wandb_name
+        )
+
+        # Cleanup distributed training
+        if is_distributed:
+            dist.destroy_process_group()
+
+        return
+
+    # Check if running in WandB sweep mode
+    is_sweep = False
+    wandb_config = None
+    if args.use_wandb and rank == 0:
+        try:
+            import wandb
+            # Check if wandb is initialized (sweep mode)
+            if wandb.run is not None:
+                is_sweep = True
+                wandb_config = dict(wandb.config)
+                print_rank0("\n🔍 WandB Sweep mode detected!")
+                print_rank0(f"   Sweep ID: {wandb.run.sweep_id}")
+                print_rank0(f"   Run ID: {wandb.run.id}")
+
+                # Merge wandb config into YAML config
+                config = merge_wandb_config(config, wandb_config)
+                print_rank0(
+                    "   Merged WandB sweep hyperparameters into config")
+        except ImportError:
+            pass
+        except Exception as e:
+            print_rank0(f"   Warning: Could not detect sweep mode: {e}")
 
     # Override with command line arguments
     if args.vcf:
@@ -257,6 +617,7 @@ def main():
         use_distributed_sampler=is_distributed,
         data_split_seed=args.data_split_seed,
         augmentation_config=config.get('augmentation', None),
+        data_split_file=args.data_split_file,
     )
     time2 = time.time()
     print_rank0(
@@ -315,6 +676,62 @@ def main():
         print_rank0(f"Validation samples: {len(val_loader.dataset)}")
     if test_loader:
         print_rank0(f"Test samples: {len(test_loader.dataset)}")
+
+    # Save data split information (sample IDs with train/valid/test flags)
+    if rank == 0:
+        split_data = []
+
+        # Collect train sample IDs
+        for batch in train_loader:
+            if 'sample_id' in batch:
+                for sample_id in batch['sample_id']:
+                    split_data.append(
+                        {'Sample_ID': sample_id, 'Split': 'train'})
+
+        # Collect validation sample IDs
+        if val_loader:
+            for batch in val_loader:
+                if 'sample_id' in batch:
+                    for sample_id in batch['sample_id']:
+                        split_data.append(
+                            {'Sample_ID': sample_id, 'Split': 'valid'})
+
+        # Collect test sample IDs
+        if test_loader:
+            for batch in test_loader:
+                if 'sample_id' in batch:
+                    for sample_id in batch['sample_id']:
+                        split_data.append(
+                            {'Sample_ID': sample_id, 'Split': 'test'})
+
+        # Save to TSV file
+        if split_data:
+            split_df = pd.DataFrame(split_data)
+            split_path = output_dir / 'data_split.tsv'
+            split_df.to_csv(split_path, sep='\t', index=False)
+            print_rank0(f"\nData split information saved to: {split_path}")
+            print_rank0(f"  Total samples: {len(split_df)}")
+            print_rank0(
+                f"  Train: {len(split_df[split_df['Split'] == 'train'])}")
+            if val_loader:
+                print_rank0(
+                    f"  Valid: {len(split_df[split_df['Split'] == 'valid'])}")
+            if test_loader:
+                print_rank0(
+                    f"  Test: {len(split_df[split_df['Split'] == 'test'])}")
+
+    # Save postprocessed data for benchmark models if requested
+    if args.save_postprocess_data and rank == 0:
+        save_postprocess_data(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            vcf_file=vcf_file,
+            pheno_file=pheno_file,
+            normalization_stats=normalization_stats,
+            output_dir=output_dir,
+            print_func=print_rank0
+        )
 
     # Create model
     print_rank0("\n" + "=" * 80)
@@ -403,6 +820,57 @@ def main():
         encoding_type=encoding_type
     )
 
+    # Initialize wandb (only on rank 0)
+    wandb_run = None
+    if args.use_wandb and rank == 0:
+        try:
+            import wandb
+            from datetime import datetime
+
+            # Check if already initialized (sweep mode)
+            if wandb.run is None:
+                # Normal run mode - initialize wandb
+                # Generate run name if not provided
+                wandb_name = args.wandb_name
+                if wandb_name is None:
+                    config_name = Path(args.config).stem
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    wandb_name = f"{config_name}_{timestamp}"
+
+                # Initialize wandb
+                wandb.init(
+                    project=args.wandb_project,
+                    name=wandb_name,
+                    tags=args.wandb_tags,
+                    config={
+                        'config_file': str(args.config),
+                        'seed': args.seed,
+                        'data_split_seed': args.data_split_seed,
+                        'device': device,
+                        'encoding_type': encoding_type,
+                        'is_distributed': is_distributed,
+                        'world_size': world_size,
+                        'mixed_precision': args.mixed_precision,
+                        **config  # Include all config parameters
+                    },
+                    dir=str(output_dir),  # Save wandb logs to output directory
+                )
+                wandb_run = wandb.run
+                print_rank0(f"\n📊 W&B initialized: {wandb_run.url}")
+            else:
+                # Sweep mode - wandb already initialized
+                wandb_run = wandb.run
+                print_rank0(f"\n📊 W&B Sweep Run: {wandb_run.url}")
+                # Update config with merged values
+                wandb.config.update(config, allow_val_change=True)
+        except ImportError:
+            print_rank0(
+                "\n⚠️  Warning: wandb not installed. Install with: pip install wandb")
+            args.use_wandb = False
+        except Exception as e:
+            print_rank0(f"\n⚠️  Warning: Failed to initialize wandb: {e}")
+            args.use_wandb = False
+
     # Create trainer
     print_rank0("\n" + "=" * 80)
     print_rank0("Training Setup")
@@ -430,6 +898,7 @@ def main():
         rank=rank,
         use_mixed_precision=args.mixed_precision,
         huber_delta=train_config.get('huber_delta', 1.0),
+        wandb_run=wandb_run,
     )
 
     loss_type = train_config.get('loss_type', 'mse')
@@ -458,7 +927,7 @@ def main():
             trainer.start_epoch = epoch
             print(f"Resuming from epoch {epoch + 1}")
             print(
-                f"Best validation score so far: {trainer.best_val_score:.4f} at epoch {trainer.best_epoch}")
+                f"Best validation Pearson R so far: {trainer.best_val_r:.4f} at epoch {trainer.best_epoch}")
             print(
                 f"Early stopping counter: {trainer.early_stopping.counter}/{train_config.get('early_stopping_patience', 20)}")
         else:

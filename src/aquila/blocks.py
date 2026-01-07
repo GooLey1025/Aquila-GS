@@ -727,6 +727,24 @@ class ConvBlockCNA(nn.Module):
         if self.residual:
             if self.residual_proj is not None:
                 identity = self.residual_proj(identity)
+
+            # Ensure identity and x have the same sequence length
+            # This handles cases where padding='same' doesn't perfectly preserve length
+            # (e.g., with even kernel sizes or when residual_proj changes stride)
+            # dimension 2 is sequence length in (batch, channels, seq_len)
+            seq_len_x = x.size(2)
+            seq_len_identity = identity.size(2)
+
+            if seq_len_identity != seq_len_x:
+                if seq_len_identity > seq_len_x:
+                    # Crop identity to match x
+                    identity = identity[:, :, :seq_len_x]
+                else:
+                    # Pad identity to match x
+                    padding_size = seq_len_x - seq_len_identity
+                    identity = torch.nn.functional.pad(
+                        identity, (0, padding_size), mode='replicate')
+
             x = x + identity
 
         x = self.norm(x)
@@ -902,6 +920,24 @@ class ConvBlockNAC(nn.Module):
         if self.residual:
             if self.residual_proj is not None:
                 identity = self.residual_proj(identity)
+
+            # Ensure identity and x have the same sequence length
+            # This handles cases where padding='same' doesn't perfectly preserve length
+            # (e.g., with even kernel sizes or when residual_proj changes stride)
+            # dimension 2 is sequence length in (batch, channels, seq_len)
+            seq_len_x = x.size(2)
+            seq_len_identity = identity.size(2)
+
+            if seq_len_identity != seq_len_x:
+                if seq_len_identity > seq_len_x:
+                    # Crop identity to match x
+                    identity = identity[:, :, :seq_len_x]
+                else:
+                    # Pad identity to match x
+                    padding_size = seq_len_x - seq_len_identity
+                    identity = torch.nn.functional.pad(
+                        identity, (0, padding_size), mode='replicate')
+
             # Both identity and x are now (batch, out_channels, seq_len_out)
             x = x + identity
 
