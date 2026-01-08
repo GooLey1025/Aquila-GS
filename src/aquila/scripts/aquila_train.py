@@ -290,8 +290,8 @@ def parse_args():
         '-o',
         '--output',
         type=str,
-        default='./outputs',
-        help='Output directory for checkpoints and results'
+        default=None,
+        help='Output directory for checkpoints and results (overrides config, default: ./outputs)'
     )
 
     parser.add_argument(
@@ -444,7 +444,16 @@ def main():
     config = load_config(args.config)
 
     # Check if running hyperparameter optimization
-    if args.hyperparameter_optimization:
+    # Enable HPO if: 1) command line flag is set, OR 2) config has hpo.enabled: true
+    hpo_enabled = args.hyperparameter_optimization
+    hpo_config = config.get('hpo')
+
+    if not hpo_enabled and hpo_config and hpo_config.get('enabled', False):
+        hpo_enabled = True
+        if rank == 0:
+            print_rank0("\n🔍 HPO enabled via config file (hpo.enabled: true)")
+
+    if hpo_enabled:
         # HPO is incompatible with distributed training
         if is_distributed:
             print_rank0(
@@ -457,10 +466,9 @@ def main():
                 dist.destroy_process_group()
             return
 
-        hpo_config = config.get('hpo')
         if not hpo_config:
             print_rank0(
-                "\n❌ Error: --hyperparameter-optimization (-hpo) specified but 'hpo' section not found in config file.")
+                "\n❌ Error: Hyperparameter optimization enabled but 'hpo' section not found in config file.")
             print_rank0(
                 "   Please add an 'hpo' section to your config file with hyperparameter search space.")
             return
@@ -559,8 +567,14 @@ def main():
     else:
         device = args.device
 
-    # Create output directory
-    output_dir = Path(args.output)
+    # Determine output directory: command line > config > default
+    if args.output:
+        output_dir = Path(args.output)
+    elif 'output_dir' in config:
+        output_dir = Path(config['output_dir'])
+    else:
+        output_dir = Path('./outputs')
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save configuration (only on rank 0)

@@ -1098,7 +1098,7 @@ class DenseBlock(nn.Module):
     Features grow by growth_rate at each layer.
     """
 
-    def __init__(self, in_channels, num_layers=4, growth_rate=32,
+    def __init__(self, in_channels=None, num_layers=4, growth_rate=32,
                  kernel_size=3, activation='relu', dropout=0.1,
                  norm_type='layer', order='nac', bottleneck=True,
                  bottleneck_channels=128):
@@ -1269,7 +1269,7 @@ class TransitionBlock(nn.Module):
         return x, mask
 
 
-def dense_block(in_channels, num_layers=4, growth_rate=32, kernel_size=3,
+def dense_block(in_channels=None, num_layers=4, growth_rate=32, kernel_size=3,
                 activation='relu', dropout=0.1, norm_type='layer', order='nac',
                 bottleneck=True, bottleneck_channels=128, **kwargs):
     """Dense block with feature concatenation.

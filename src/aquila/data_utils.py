@@ -810,14 +810,14 @@ def create_data_loaders(
         rng = np.random.RandomState(data_split_seed)
         rng.shuffle(indices)
 
-    # Calculate split sizes
-    test_size = int(n_samples * test_split)
-    val_size = int(n_samples * val_split)
-    train_size = n_samples - test_size - val_size
+        # Calculate split sizes
+        test_size = int(n_samples * test_split)
+        val_size = int(n_samples * val_split)
+        train_size = n_samples - test_size - val_size
 
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:train_size + val_size]
-    test_indices = indices[train_size + val_size:]
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:train_size + val_size]
+        test_indices = indices[train_size + val_size:]
 
     # Debug: Print train_indices info for verification
     # print(f"\n{'='*80}")
@@ -1022,7 +1022,6 @@ def create_kfold_data_loaders(
     Create k-fold cross-validation data loaders.
 
     Yields data loaders for each fold with proper normalization.
-    For k-fold CV: each fold uses 9 parts as training and 1 part as validation.
     No separate test set is used.
 
     Args:

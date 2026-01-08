@@ -725,8 +725,7 @@ class VarTrainer:
                     output += f"train_r2: {train_r2:.4f} - "
                     output += f"valid_loss: {val_metrics['val_loss']:.4f} - "
                     output += f"valid_r: {val_pearson:.4f} - "
-                    output += f"valid_r2: {val_r2:.4f} - "
-                    output += f"valid_r: {val_r:.4f}"
+                    output += f"valid_r2: {val_r2:.4f}"
 
                     if is_best:
                         output += " - best!"
