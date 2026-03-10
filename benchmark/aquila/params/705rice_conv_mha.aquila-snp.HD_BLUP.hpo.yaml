@@ -1,6 +1,6 @@
 output_dir: 705rice_conv_mha_train_out
 data:
-  geno_file: beagle_impute/705rice_0.005.full.all.impute.biallelic.vcf.gz #705rice_0.005.snp.indel.sv.vcf.gz # beagle_impute/705rice_0.005.full.snp.impute.biallelic.vcf.gz
+  geno_file: beagle_impute/705rice_0.03.full.all.impute.biallelic.vcf.gz #705rice_0.005.snp.indel.sv.vcf.gz # beagle_impute/705rice_0.005.full.snp.impute.biallelic.vcf.gz
   pheno_file: phenotypes/HD_BLUP.tsv #705rice_data/705Rice.phenos.completed.tsv
   encoding_type: diploid_onehot
   variant_type: snp
