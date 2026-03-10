@@ -23,12 +23,12 @@ import numpy as np
 from pathlib import Path
 import time
 import os
+import gzip
 from typing import Dict, Optional
 from aquila.varnn import create_model_from_config
 from aquila.trainer import VarTrainer
 from aquila.data_utils import create_data_loaders
 from aquila.utils import set_seed, save_config, load_config, print_model_summary, merge_wandb_config
-from aquila.hpo import load_hpo_config, run_optuna_search, train_single_run
 import pandas as pd
 from aquila.metrics import MetricsCalculator
 
@@ -179,11 +179,18 @@ def save_postprocess_data(
     def filter_vcf_by_samples(vcf_file, sample_ids, output_vcf_path):
         """
         Filter VCF file to include only specified samples.
+        Supports both .vcf and .vcf.gz input files.
+        Output is always uncompressed .vcf.
         """
         sample_set = set(sample_ids)
         keep_indices = None
 
-        with open(vcf_file, 'r') as f_in, open(output_vcf_path, 'w') as f_out:
+        # Detect if input file is gzipped
+        is_gzipped = vcf_file.endswith('.gz')
+        open_func_in = gzip.open if is_gzipped else open
+        open_mode_in = 'rt' if is_gzipped else 'r'
+
+        with open_func_in(vcf_file, open_mode_in) as f_in, open(output_vcf_path, 'w') as f_out:
             # Copy header lines
             for line in f_in:
                 if line.startswith('#'):
@@ -281,9 +288,9 @@ def parse_args():
     parser.add_argument(
         '--encoding-type',
         type=str,
-        default='snp_vcf',
-        choices=['snp_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
-        help='VCF encoding type: snp_vcf (SNP only), snp_indel_vcf (SNP+INDEL), snp_indel_sv_vcf (SNP+INDEL+SV)'
+        default='diploid_onehot',
+        choices=['token', 'diploid_onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
+        help='Encoding type: token or diploid_onehot for format; snp_vcf, indel_vcf, sv_vcf, snp_indel_vcf, snp_indel_sv_vcf for backward compatibility'
     )
 
     parser.add_argument(
@@ -345,6 +352,7 @@ def parse_args():
     )
 
     parser.add_argument(
+        '-dsf',
         '--data-split-file',
         type=str,
         default=None,
@@ -384,13 +392,6 @@ def parse_args():
         nargs='+',
         default=None,
         help='W&B tags for organizing runs'
-    )
-
-    parser.add_argument(
-        '-hpo',
-        '--hyperparameter-optimization',
-        action='store_true',
-        help='Enable hyperparameter optimization using Optuna (reads hpo section from config)'
     )
 
     parser.add_argument(
@@ -442,82 +443,6 @@ def main():
 
     print_rank0(f"\nLoading configuration from: {args.config}")
     config = load_config(args.config)
-
-    # Check if running hyperparameter optimization
-    # Enable HPO if: 1) command line flag is set, OR 2) config has hpo.enabled: true
-    hpo_enabled = args.hyperparameter_optimization
-    hpo_config = config.get('hpo')
-
-    if not hpo_enabled and hpo_config and hpo_config.get('enabled', False):
-        hpo_enabled = True
-        if rank == 0:
-            print_rank0("\n🔍 HPO enabled via config file (hpo.enabled: true)")
-
-    if hpo_enabled:
-        # HPO is incompatible with distributed training
-        if is_distributed:
-            print_rank0(
-                "\n❌ Error: Hyperparameter optimization cannot be used with distributed training (torchrun).")
-            print_rank0(
-                "   Please run HPO without torchrun.")
-            print_rank0(
-                "   Example: python aquila_train.py --config params.yaml -hpo")
-            if is_distributed:
-                dist.destroy_process_group()
-            return
-
-        if not hpo_config:
-            print_rank0(
-                "\n❌ Error: Hyperparameter optimization enabled but 'hpo' section not found in config file.")
-            print_rank0(
-                "   Please add an 'hpo' section to your config file with hyperparameter search space.")
-            return
-
-        try:
-            hpo_config_normalized = load_hpo_config(hpo_config)
-        except ValueError as e:
-            print_rank0(f"\n❌ Error loading HPO configuration: {e}")
-            return
-
-        # Remove hpo section from base config (will be merged per trial)
-        base_config = {k: v for k, v in config.items() if k != 'hpo'}
-
-        # Create Optuna output directory
-        optuna_output_dir = Path(args.output) / 'optuna_search'
-        optuna_output_dir.mkdir(parents=True, exist_ok=True)
-
-        print_rank0("\n" + "=" * 80)
-        print_rank0("Optuna Hyperparameter Optimization")
-        print_rank0("=" * 80)
-
-        # Prepare arguments for train_single_run
-        train_kwargs = {
-            'args': args,
-            'is_distributed': False,
-            'rank': 0,
-            'world_size': 1,
-            'local_rank': 0,
-            'print_rank0_func': None  # Will use default print function in train_single_run
-        }
-
-        # Run Optuna optimization
-        study = run_optuna_search(
-            base_config=base_config,
-            hpo_config=hpo_config_normalized,
-            output_dir=optuna_output_dir,
-            train_single_run_func=train_single_run,
-            train_single_run_kwargs=train_kwargs,
-            n_trials=hpo_config_normalized.get('n_trials', 100),
-            use_wandb=args.use_wandb,
-            wandb_project=args.wandb_project,
-            wandb_name=args.wandb_name
-        )
-
-        # Cleanup distributed training
-        if is_distributed:
-            dist.destroy_process_group()
-
-        return
 
     # Check if running in WandB sweep mode
     is_sweep = False
@@ -623,6 +548,7 @@ def main():
         num_workers=train_config.get('num_workers', 4),
         normalize_regression=train_config.get('normalize_regression', True),
         encoding_type=encoding_type,
+        variant_type=config.get('data', {}).get('variant_type'),
         cache_dir=output_dir,
         data_restart=args.data_restart,
         skew_threshold=args.skew_threshold,
@@ -663,7 +589,9 @@ def main():
     num_classification_tasks = 0
 
     # Determine sequence length(s) for multi-branch
-    is_multi_branch = encoding_type in ['snp_indel_vcf', 'snp_indel_sv_vcf']
+    # Check both old format (encoding_type) and new format (variant_type)
+    variant_type = config.get('data', {}).get('variant_type')
+    is_multi_branch = encoding_type in ['snp_indel_vcf', 'snp_indel_sv_vcf'] or variant_type in ['snp_indel', 'snp_indel_sv']
 
     if is_multi_branch:
         # Multi-branch: get seq_length for each variant type
@@ -761,6 +689,25 @@ def main():
         if normalization_stats and 'regression_tasks' in normalization_stats:
             regression_task_names = normalization_stats['regression_tasks']
         else:
+            # Fallback: try to read from phenotype file if normalization_stats doesn't have it
+            try:
+                from aquila.data_utils import parse_phenotype_file
+                _, regression_cols, _ = parse_phenotype_file(
+                    pheno_file,
+                    classification_tasks=classification_tasks
+                )
+                if len(regression_cols) == num_regression_tasks:
+                    regression_task_names = regression_cols
+                    print_rank0(
+                        f"  Loaded phenotype names from file: {regression_task_names}")
+                else:
+                    print_rank0(
+                        f"  Warning: Mismatch between num_regression_tasks ({num_regression_tasks}) and phenotype file columns ({len(regression_cols)}), using generic names")
+                    regression_task_names = [
+                        f"regression_task_{i}" for i in range(num_regression_tasks)]
+            except Exception as e:
+                print_rank0(
+                    f"  Warning: Could not read phenotype names from file: {e}")
             regression_task_names = [
                 f"regression_task_{i}" for i in range(num_regression_tasks)]
 
@@ -776,6 +723,38 @@ def main():
         print_rank0(f"  Regression tasks: {regression_task_names}")
     if classification_task_names:
         print_rank0(f"  Classification tasks: {classification_task_names}")
+
+    # Save task mapping (task_idx -> phenotype name) to TSV file
+    if rank == 0:
+        task_mapping = []
+        task_idx = 0
+
+        # Add regression tasks first
+        if regression_task_names:
+            for i, task_name in enumerate(regression_task_names):
+                task_mapping.append({
+                    'task_idx': task_idx,
+                    'task_name': task_name,
+                    'task_type': 'regression'
+                })
+                task_idx += 1
+
+        # Add classification tasks
+        if classification_task_names:
+            for i, task_name in enumerate(classification_task_names):
+                task_mapping.append({
+                    'task_idx': task_idx,
+                    'task_name': task_name,
+                    'task_type': 'classification'
+                })
+                task_idx += 1
+
+        # Save to TSV file
+        if task_mapping:
+            task_df = pd.DataFrame(task_mapping)
+            task_mapping_path = output_dir / 'task_mapping.tsv'
+            task_df.to_csv(task_mapping_path, sep='\t', index=False)
+            print_rank0(f"\nTask mapping saved to: {task_mapping_path}")
 
     # Create model from config
     model = create_model_from_config(
@@ -913,6 +892,7 @@ def main():
         use_mixed_precision=args.mixed_precision,
         huber_delta=train_config.get('huber_delta', 1.0),
         wandb_run=wandb_run,
+        regression_task_names=regression_task_names,
     )
 
     loss_type = train_config.get('loss_type', 'mse')

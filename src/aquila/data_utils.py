@@ -522,6 +522,7 @@ def create_data_loaders(
     num_workers: int = 8,
     normalize_regression: bool = True,
     encoding_type: str = 'token',
+    variant_type: str = None,
     cache_dir: Optional[str] = None,
     data_restart: bool = False,
     skew_threshold: float = 2.0,
@@ -545,6 +546,7 @@ def create_data_loaders(
         num_workers: Number of data loading workers
         normalize_regression: Apply z-score normalization to regression targets
         encoding_type: Encoding strategy ('token' or 'diploid_onehot')
+        variant_type: Which variant types to use ('snp', 'snp_indel', 'snp_indel_sv')
         cache_dir: Directory to save/load data cache (None = no caching)
         data_restart: If True, ignore cache and re-process data
         skew_threshold: Threshold for absolute skewness to trigger log(x+1) transformation
@@ -711,13 +713,21 @@ def create_data_loaders(
     # Load data using specified encoding
     from aquila.encoding import parse_genotype_file as parse_geno_with_encoding
 
-    # Check if multi-branch encoding
+    # Get variant_type: use parameter, or use config if config dict was passed
+    # Note: variant_type parameter was added to support new format
+    variant_type_from_param = variant_type  # Already passed as parameter
+    # Get encoding_type from function parameter
+    encoding_type = encoding_type if encoding_type else 'token'
+
+    # Check if multi-branch encoding (support both old and new format)
+    # Old format: encoding_type = 'snp_indel_vcf' or 'snp_indel_sv_vcf'
+    # New format: encoding_type = 'diploid_onehot' and variant_type = 'snp_indel' or 'snp_indel_sv'
     multi_branch_encodings = ['snp_indel_vcf', 'snp_indel_sv_vcf']
-    is_multi_branch = encoding_type in multi_branch_encodings
+    is_multi_branch = encoding_type in multi_branch_encodings or variant_type_from_param in ['snp_indel', 'snp_indel_sv']
 
     if is_multi_branch:
         # Multi-branch VCF: returns dict
-        variant_data = parse_geno_with_encoding(geno_path, encoding_type)
+        variant_data = parse_geno_with_encoding(geno_path, encoding_type, variant_type_from_param)
         # Extract sample IDs from first variant type
         first_variant_type = list(variant_data.keys())[0]
         _, sample_ids, _ = variant_data[first_variant_type]
@@ -725,14 +735,10 @@ def create_data_loaders(
         # Create dict of matrices (n_samples, n_variants, 8)
         snp_matrix = {vtype: data[0] for vtype, data in variant_data.items()}
     else:
-        # Single-branch: returns tuple
-        result = parse_geno_with_encoding(geno_path, encoding_type)
-        if encoding_type == 'snp_vcf':
-            # snp_vcf returns tuple
-            snp_matrix, sample_ids, snp_ids = result
-        else:
-            # token or diploid_onehot
-            snp_matrix, sample_ids, snp_ids = result
+        # Single-branch: returns tuple (matrix, sample_ids, variant_ids)
+        # Supports: token, diploid_onehot, snp_vcf, indel_vcf, sv_vcf
+        result = parse_geno_with_encoding(geno_path, encoding_type, variant_type_from_param)
+        snp_matrix, sample_ids, snp_ids = result
 
     pheno_df, regression_cols, classification_cols = parse_phenotype_file(
         pheno_path, classification_tasks
@@ -836,38 +842,50 @@ def create_data_loaders(
     regression_means_np = None
     regression_stds_np = None
 
-    if normalize_regression and regression_cols:
-        # Get training sample IDs
-        train_sample_ids = [dataset_unnormalized.sample_ids[i]
-                            for i in train_indices]
+    # Always create normalization_stats to store phenotype names, even if normalization is disabled
+    if regression_cols:
+        if normalize_regression:
+            # Get training sample IDs
+            train_sample_ids = [dataset_unnormalized.sample_ids[i]
+                                for i in train_indices]
 
-        # Compute statistics from original phenotype data for training samples only
-        regression_means_np = np.zeros(len(regression_cols))
-        regression_stds_np = np.ones(len(regression_cols))
+            # Compute statistics from original phenotype data for training samples only
+            regression_means_np = np.zeros(len(regression_cols))
+            regression_stds_np = np.ones(len(regression_cols))
 
-        for i, col in enumerate(regression_cols):
-            # Get original values for training samples
-            train_pheno_subset = pheno_df[pheno_df['sample_id'].isin(
-                train_sample_ids)]
-            valid_values = train_pheno_subset[col].dropna().values
+            for i, col in enumerate(regression_cols):
+                # Get original values for training samples
+                train_pheno_subset = pheno_df[pheno_df['sample_id'].isin(
+                    train_sample_ids)]
+                valid_values = train_pheno_subset[col].dropna().values
 
-            if len(valid_values) > 0:
-                regression_means_np[i] = np.mean(valid_values)
-                regression_stds_np[i] = np.std(valid_values)
-                if regression_stds_np[i] < 1e-6:  # Avoid division by zero
-                    regression_stds_np[i] = 1.0
+                if len(valid_values) > 0:
+                    regression_means_np[i] = np.mean(valid_values)
+                    regression_stds_np[i] = np.std(valid_values)
+                    if regression_stds_np[i] < 1e-6:  # Avoid division by zero
+                        regression_stds_np[i] = 1.0
 
-        normalization_stats = {
-            'regression_means': regression_means_np,
-            'regression_stds': regression_stds_np,
-            'regression_tasks': regression_cols,
-            'log_transformed_tasks': log_transformed_tasks,
-            'skew_threshold': skew_threshold,
-        }
+            normalization_stats = {
+                'regression_means': regression_means_np,
+                'regression_stds': regression_stds_np,
+                'regression_tasks': regression_cols,
+                'log_transformed_tasks': log_transformed_tasks,
+                'skew_threshold': skew_threshold,
+            }
 
-        print(f"Computed normalization statistics from training set:")
-        print(f"  Means: {regression_means_np}")
-        print(f"  Stds: {regression_stds_np}")
+            print(f"Computed normalization statistics from training set:")
+            print(f"  Means: {regression_means_np}")
+            print(f"  Stds: {regression_stds_np}")
+        else:
+            # Even if normalization is disabled, save phenotype names for reference
+            normalization_stats = {
+                'regression_tasks': regression_cols,
+                'log_transformed_tasks': log_transformed_tasks,
+                'skew_threshold': skew_threshold,
+            }
+            if rank == 0:
+                print(
+                    f"Normalization disabled, but saving phenotype names: {regression_cols}")
 
     # Now create normalized datasets using the training statistics
     # Training set: compute statistics from training data (with augmentation transform)
@@ -1016,6 +1034,7 @@ def create_kfold_data_loaders(
     num_workers: int = 4,
     normalize_regression: bool = True,
     encoding_type: str = 'token',
+    variant_type: str = None,
     random_seed: int = 42,
 ):
     """
@@ -1033,6 +1052,7 @@ def create_kfold_data_loaders(
         num_workers: Number of data loading workers
         normalize_regression: Apply z-score normalization to regression targets
         encoding_type: Encoding strategy ('token' or 'diploid_onehot')
+        variant_type: Which variant types to use ('snp', 'snp_indel', 'snp_indel_sv')
         random_seed: Random seed for fold splitting
 
     Yields:
@@ -1042,8 +1062,19 @@ def create_kfold_data_loaders(
 
     # Load data once using specified encoding
     from aquila.encoding import parse_genotype_file as parse_geno_with_encoding
-    snp_matrix, sample_ids, snp_ids = parse_geno_with_encoding(
-        geno_path, encoding_type)
+
+    # Check if multi-branch
+    multi_branch_encodings = ['snp_indel_vcf', 'snp_indel_sv_vcf']
+    is_multi_branch = encoding_type in multi_branch_encodings or variant_type in ['snp_indel', 'snp_indel_sv']
+
+    if is_multi_branch:
+        variant_data = parse_geno_with_encoding(geno_path, encoding_type, variant_type)
+        # seq_length will be a dict for multi-branch
+        seq_length = {k: v.shape[1] for k, v in variant_data.items()}
+    else:
+        result = parse_geno_with_encoding(geno_path, encoding_type, variant_type)
+        snp_matrix, sample_ids, snp_ids = result
+        seq_length = snp_matrix.shape[1] if snp_matrix.ndim == 2 else snp_matrix.shape[1]
 
     pheno_df, regression_cols, classification_cols = parse_phenotype_file(
         pheno_path, classification_tasks

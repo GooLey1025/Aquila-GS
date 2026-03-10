@@ -5,6 +5,7 @@ These blocks can be composed via YAML configuration to build custom architecture
 
 import torch
 import torch.nn as nn
+import numpy as np
 from typing import Optional
 from . import layers
 
@@ -225,10 +226,39 @@ def dgu(out_dim=64, dropout=0.1, **kwargs):
 class TransformerBlock(nn.Module):
     """Single transformer encoder block."""
 
-    def __init__(self, d_model, num_heads, d_ff, dropout=0.1, activation='gelu'):
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
+                 use_rope=False, use_positional_encoding=False, positional_encoding_type='sinusoidal',
+                 max_position=50000, **kwargs):
         super().__init__()
-        self.attention = layers.MultiHeadSelfAttention(
-            d_model, num_heads, dropout)
+
+        # Positional encoding (applied before attention)
+        self.use_positional_encoding = use_positional_encoding
+        if use_positional_encoding:
+            if positional_encoding_type == 'sinusoidal':
+                self.pos_encoding = layers.PositionalEncoding(
+                    d_model=d_model,
+                    max_len=max_position,
+                    dropout=dropout
+                )
+            elif positional_encoding_type == 'learnable':
+                self.pos_encoding = layers.LearnablePositionalEmbedding(
+                    d_model=d_model,
+                    max_positions=max_position,
+                    dropout=dropout
+                )
+            else:
+                raise ValueError(f"Unknown positional_encoding_type: {positional_encoding_type}. "
+                                 f"Supported types: 'sinusoidal', 'learnable'")
+        else:
+            self.pos_encoding = None
+
+        # Choose attention mechanism based on use_rope
+        if use_rope:
+            self.attention = layers.MultiHeadSelfAttentionRoPE(
+                d_model, num_heads, dropout)
+        else:
+            self.attention = layers.MultiHeadSelfAttention(
+                d_model, num_heads, dropout)
         self.ffn = layers.FeedForward(d_model, d_ff, dropout, activation)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -236,6 +266,10 @@ class TransformerBlock(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
+        # Apply positional encoding before attention (if enabled)
+        if self.pos_encoding is not None:
+            x = self.pos_encoding(x)
+
         # Self-attention with residual
         attn_out = self.attention(self.norm1(x), mask)
         x = x + self.dropout1(attn_out)
@@ -247,7 +281,136 @@ class TransformerBlock(nn.Module):
         return x
 
 
-def transformer(d_model, num_heads, d_ff, dropout=0.1, activation='gelu', **kwargs):
+class TransformerBlockTranspose(nn.Module):
+    """Transformer block with transpose mode: MHA operates on channel dimension.
+
+    When transpose=True, the input is transposed so that MHA operates on the channel
+    dimension instead of the sequence dimension. The feature dimension (seq_len) is
+    reduced to d_model after transpose.
+    """
+
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
+                 use_rope=False, use_positional_encoding=False, positional_encoding_type='sinusoidal',
+                 max_position=50000, **kwargs):
+        """
+        Args:
+            d_model: Model dimension (channel dimension)
+            num_heads: Number of attention heads
+            d_ff: Feed-forward dimension
+            dropout: Dropout rate
+            activation: Activation function
+            use_rope: Whether to use RoPE (default False)
+            use_positional_encoding: Whether to use positional encoding (default False)
+            positional_encoding_type: Type of positional encoding - 'sinusoidal' or 'learnable' (default 'sinusoidal')
+            max_position: Maximum sequence length for positional encoding (default 50000)
+        """
+        super().__init__()
+        self.d_model = d_model
+
+        # Positional encoding (applied before attention)
+        self.use_positional_encoding = use_positional_encoding
+        if use_positional_encoding:
+            if positional_encoding_type == 'sinusoidal':
+                self.pos_encoding = layers.PositionalEncoding(
+                    d_model=d_model,
+                    max_len=max_position,
+                    dropout=dropout
+                )
+            elif positional_encoding_type == 'learnable':
+                self.pos_encoding = layers.LearnablePositionalEmbedding(
+                    d_model=d_model,
+                    max_positions=max_position,
+                    dropout=dropout
+                )
+            else:
+                raise ValueError(f"Unknown positional_encoding_type: {positional_encoding_type}. "
+                                 f"Supported types: 'sinusoidal', 'learnable'")
+        else:
+            self.pos_encoding = None
+
+        # Choose attention mechanism based on use_rope
+        if use_rope:
+            self.attention = layers.MultiHeadSelfAttentionRoPE(
+                d_model, num_heads, dropout)
+        else:
+            self.attention = layers.MultiHeadSelfAttention(
+                d_model, num_heads, dropout)
+        self.ffn = layers.FeedForward(d_model, d_ff, dropout, activation)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        # Projection layers to reduce/expand seq_len to/from d_model after transpose
+        # These will be initialized dynamically in forward based on actual seq_len
+        self.seq_len_proj_down = None  # seq_len -> d_model
+        self.seq_len_proj_up = None    # d_model -> seq_len
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+            mask: (batch, seq_len) boolean mask (not used in transpose mode)
+        Returns:
+            (batch, seq_len, d_model)
+        """
+        batch_size, seq_len, d_model = x.shape
+
+        # Transpose: (batch, seq_len, C) -> (batch, C, seq_len)
+        # Now C is the sequence dimension (T), seq_len is the feature dimension (C)
+        x = x.transpose(1, 2)  # (batch, C, seq_len)
+
+        # Project seq_len (feature dimension) to d_model if needed
+        if seq_len != d_model:
+            # Initialize projection layer if not exists or size changed
+            if self.seq_len_proj_down is None or self.seq_len_proj_down.in_features != seq_len:
+                self.seq_len_proj_down = nn.Linear(
+                    seq_len, d_model).to(x.device)
+                self.seq_len_proj_up = nn.Linear(d_model, seq_len).to(x.device)
+            x = self.seq_len_proj_down(x)  # (batch, C, D)
+        # Now x is (batch, C, D), where D is the d_model
+
+        # Apply positional encoding after transpose (if enabled)
+        # Positional encoding is applied on the channel dimension (d_model), which is now the sequence dimension
+        if self.pos_encoding is not None:
+            # Positional encoding expects (batch, seq_len, d_model) and operates on seq_len dimension
+            # Current: (batch, d_model, d_model), where first d_model is the sequence dimension
+            # We need to transpose so that d_model becomes the seq_len dimension for PositionalEncoding
+            # (batch, d_model, d_model) -> (batch, d_model, d_model)
+            x = x.transpose(1, 2)
+            # Now x is (batch, d_model, d_model), where second d_model is the sequence dimension
+            # PositionalEncoding will add pe to the second dimension (seq_len), which is what we want
+            # Apply positional encoding on d_model (channel) dimension
+            x = self.pos_encoding(x)
+            x = x.transpose(1, 2)  # Transpose back: (batch, d_model, d_model)
+
+        # Normalize along feature dimension (last dimension)
+        # x is (batch, C, D), where:
+        #   - C is channel dimension of the input
+        #   - D is model dimension
+        x_norm = self.norm1(x)
+
+        attn_out = self.attention(x_norm, mask=None)
+
+        x = x + self.dropout1(attn_out)
+
+        ffn_out = self.ffn(self.norm2(x))
+
+        x = x + self.dropout2(ffn_out)
+
+        # Project back to original seq_len if needed
+        if seq_len != d_model:
+            x = self.seq_len_proj_up(x)  # (batch, C, seq_len)
+
+        # Transpose back: (batch, C, seq_len) -> (batch, seq_len, C)
+        x = x.transpose(1, 2)
+
+        return x
+
+
+def transformer(d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
+                use_rope=False, use_positional_encoding=False, positional_encoding_type='sinusoidal',
+                max_position=50000, **kwargs):
     """Single transformer encoder block.
 
     Args:
@@ -256,31 +419,301 @@ def transformer(d_model, num_heads, d_ff, dropout=0.1, activation='gelu', **kwar
         d_ff: Feed-forward dimension
         dropout: Dropout rate
         activation: Activation function
+        use_rope: Whether to use RoPE (default False)
+        use_positional_encoding: Whether to use positional encoding (default False)
+        positional_encoding_type: Type of positional encoding - 'sinusoidal' or 'learnable' (default 'sinusoidal')
+        max_position: Maximum sequence length for positional encoding (default 50000)
 
     Returns:
         TransformerBlock module
+
+    Note:
+        Positional encoding is applied before attention in the forward pass.
+        If use_rope=True, positional encoding is typically not needed (RoPE already encodes position),
+        but both can be used together if desired.
     """
     return TransformerBlock(d_model=d_model, num_heads=num_heads, d_ff=d_ff,
-                            dropout=dropout, activation=activation)
+                            dropout=dropout, activation=activation, use_rope=use_rope,
+                            use_positional_encoding=use_positional_encoding,
+                            positional_encoding_type=positional_encoding_type,
+                            max_position=max_position, **kwargs)
+
+
+def transformerTranspose(d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
+                         use_rope=False, use_positional_encoding=False, positional_encoding_type='sinusoidal',
+                         max_position=50000, **kwargs):
+    """Single transformer encoder block with transpose mode: MHA operates on channel dimension.
+
+    Args:
+        d_model: Model dimension (channel dimension)
+        num_heads: Number of attention heads
+        d_ff: Feed-forward dimension
+        dropout: Dropout rate
+        activation: Activation function
+        use_rope: Whether to use RoPE (default False)
+        use_positional_encoding: Whether to use positional encoding (default False)
+        positional_encoding_type: Type of positional encoding - 'sinusoidal' or 'learnable' (default 'sinusoidal')
+        max_position: Maximum sequence length for positional encoding (default 50000)
+
+    Returns:
+        TransformerBlockTranspose module
+
+    Note:
+        When transpose mode is enabled, the input is transposed so that MHA operates on the channel
+        dimension instead of the sequence dimension. The feature dimension (seq_len) is reduced to
+        d_model after transpose.
+    """
+    return TransformerBlockTranspose(d_model=d_model, num_heads=num_heads, d_ff=d_ff,
+                                     dropout=dropout, activation=activation, use_rope=use_rope,
+                                     use_positional_encoding=use_positional_encoding,
+                                     positional_encoding_type=positional_encoding_type,
+                                     max_position=max_position, **kwargs)
+
+
+class TransformerBlockMqaTranspose(nn.Module):
+    """Transformer block with Multi-Query Attention and transpose mode: MQA operates on channel dimension.
+
+    When transpose=True, the input is transposed so that MQA operates on the channel
+    dimension instead of the sequence dimension. The feature dimension (seq_len) is
+    reduced to d_model after transpose.
+    """
+
+    def __init__(self, d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
+                 dropout=0.1, max_position=8192, norm_type='layer', activation='gelu',
+                 use_rope=True, use_positional_encoding=False, positional_encoding_type='sinusoidal',
+                 **kwargs):
+        """
+        Args:
+            d_model: Model dimension (channel dimension)
+            num_query_heads: Number of query heads (default 8)
+            qk_head_dim: Dimension of each query/key head (default 128)
+            v_head_dim: Dimension of value head (default 192)
+            dropout: Dropout rate
+            max_position: Maximum position for RoPE
+            norm_type: 'layer' for LayerNorm (default) or 'rms' for RMSNorm
+            activation: Activation function
+            use_rope: Whether to use RoPE (default True)
+            use_positional_encoding: Whether to use positional encoding (default False)
+            positional_encoding_type: Type of positional encoding - 'sinusoidal' or 'learnable' (default 'sinusoidal')
+        """
+        super().__init__()
+        self.d_model = d_model
+
+        # Positional encoding (applied after transpose)
+        self.use_positional_encoding = use_positional_encoding
+        if use_positional_encoding:
+            if positional_encoding_type == 'sinusoidal':
+                self.pos_encoding = layers.PositionalEncoding(
+                    d_model=d_model,
+                    max_len=max_position,
+                    dropout=dropout
+                )
+            elif positional_encoding_type == 'learnable':
+                self.pos_encoding = layers.LearnablePositionalEmbedding(
+                    d_model=d_model,
+                    max_positions=max_position,
+                    dropout=dropout
+                )
+            else:
+                raise ValueError(f"Unknown positional_encoding_type: {positional_encoding_type}. "
+                                 f"Supported types: 'sinusoidal', 'learnable'")
+        else:
+            self.pos_encoding = None
+
+        # Choose normalization type
+        if norm_type == 'rms':
+            self.norm1 = layers.RMSNorm(d_model)
+            self.norm2 = layers.RMSNorm(d_model)
+            self.norm3 = layers.RMSNorm(d_model)
+            self.norm4 = layers.RMSNorm(d_model)
+        else:  # layer
+            self.norm1 = nn.LayerNorm(d_model)
+            self.norm2 = nn.LayerNorm(d_model)
+            self.norm3 = nn.LayerNorm(d_model)
+            self.norm4 = nn.LayerNorm(d_model)
+
+        # Multi-Query Attention with RoPE (optional)
+        self.attention = layers.MultiQueryAttentionRoPE(
+            d_model=d_model,
+            num_query_heads=num_query_heads,
+            qk_head_dim=qk_head_dim,
+            v_head_dim=v_head_dim,
+            dropout=dropout,
+            max_position=max_position,
+            use_rope=use_rope
+        )
+
+        # Feed-forward network (2x expansion with activation, AlphaGenome style)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 2 * d_model),
+            layers.Activation(activation),
+            nn.Dropout(dropout),
+            nn.Linear(2 * d_model, d_model)
+        )
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        # Projection layers to reduce/expand seq_len to/from d_model after transpose
+        # These will be initialized dynamically in forward based on actual seq_len
+        self.seq_len_proj_down = None  # seq_len -> d_model
+        self.seq_len_proj_up = None    # d_model -> seq_len
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+            mask: (batch, seq_len) boolean mask (not used in transpose mode)
+        Returns:
+            (batch, seq_len, d_model)
+        """
+        batch_size, seq_len, d_model = x.shape
+
+        # Transpose: (batch, seq_len, C) -> (batch, C, seq_len)
+        # Now C is the sequence dimension (T), seq_len is the feature dimension (C)
+        x = x.transpose(1, 2)  # (batch, C, seq_len)
+
+        # Project seq_len (feature dimension) to d_model if needed
+        if seq_len != d_model:
+            # Initialize projection layer if not exists or size changed
+            if self.seq_len_proj_down is None or self.seq_len_proj_down.in_features != seq_len:
+                self.seq_len_proj_down = nn.Linear(
+                    seq_len, d_model).to(x.device)
+                self.seq_len_proj_up = nn.Linear(d_model, seq_len).to(x.device)
+            x = self.seq_len_proj_down(x)  # (batch, C, D)
+        # Now x is (batch, C, D), where D is the d_model
+
+        # Apply positional encoding after transpose (if enabled)
+        # Positional encoding is applied on the channel dimension (d_model), which is now the sequence dimension
+        if self.pos_encoding is not None:
+            # Positional encoding expects (batch, seq_len, d_model) and operates on seq_len dimension
+            # Current: (batch, d_model, d_model), where first d_model is the sequence dimension
+            # We need to transpose so that d_model becomes the seq_len dimension for PositionalEncoding
+            x = x.transpose(1, 2)
+            # Now x is (batch, d_model, d_model), where second d_model is the sequence dimension
+            # PositionalEncoding will add pe to the second dimension (seq_len), which is what we want
+            # Apply positional encoding on d_model (channel) dimension
+            x = self.pos_encoding(x)
+            x = x.transpose(1, 2)  # Transpose back: (batch, d_model, d_model)
+
+        # Normalize along feature dimension (last dimension)
+        # x is (batch, C, D), where:
+        #   - C is channel dimension of the input
+        #   - D is model dimension
+        x_norm = self.norm1(x)
+
+        # Attention block with residual
+        attn_out = self.attention(x_norm, mask=None)
+        attn_out = self.norm2(attn_out)
+        x = x + self.dropout1(attn_out)
+
+        # FFN block with residual
+        x_norm = self.norm3(x)
+        ffn_out = self.ffn(x_norm)
+        ffn_out = self.norm4(ffn_out)
+        x = x + self.dropout2(ffn_out)
+
+        # Project back to original seq_len if needed
+        if seq_len != d_model:
+            x = self.seq_len_proj_up(x)  # (batch, C, seq_len)
+
+        # Transpose back: (batch, C, seq_len) -> (batch, seq_len, C)
+        x = x.transpose(1, 2)
+
+        return x
+
+
+def transformerMqaTranspose(d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
+                            dropout=0.1, max_position=8192, norm_type='layer', activation='gelu',
+                            use_rope=True, use_positional_encoding=False, positional_encoding_type='sinusoidal',
+                            **kwargs):
+    """Single transformer block with Multi-Query Attention and transpose mode: MQA operates on channel dimension.
+
+    Args:
+        d_model: Model dimension (channel dimension)
+        num_query_heads: Number of query heads (default 8)
+        qk_head_dim: Dimension of each query/key head (default 128)
+        v_head_dim: Dimension of value head (default 192)
+        dropout: Dropout rate
+        max_position: Maximum position for RoPE
+        norm_type: 'layer' for LayerNorm (default) or 'rms' for RMSNorm
+        activation: Activation function
+        use_rope: Whether to use RoPE (default True)
+        use_positional_encoding: Whether to use positional encoding (default False)
+        positional_encoding_type: Type of positional encoding - 'sinusoidal' or 'learnable' (default 'sinusoidal')
+
+    Returns:
+        TransformerBlockMqaTranspose module
+
+    Note:
+        When transpose mode is enabled, the input is transposed so that MQA operates on the channel
+        dimension instead of the sequence dimension. The feature dimension (seq_len) is reduced to
+        d_model after transpose.
+    """
+    return TransformerBlockMqaTranspose(
+        d_model=d_model,
+        num_query_heads=num_query_heads,
+        qk_head_dim=qk_head_dim,
+        v_head_dim=v_head_dim,
+        dropout=dropout,
+        max_position=max_position,
+        norm_type=norm_type,
+        activation=activation,
+        use_rope=use_rope,
+        use_positional_encoding=use_positional_encoding,
+        positional_encoding_type=positional_encoding_type,
+        **kwargs
+    )
 
 
 class TransformerTower(nn.Module):
     """Stack of transformer encoder blocks."""
 
-    def __init__(self, embed_dim, num_heads, d_ff, repeat, dropout=0.1, activation='gelu'):
+    def __init__(self, embed_dim, num_heads, d_ff, repeat, dropout=0.1, activation='gelu',
+                 use_rope=False, use_positional_encoding=False, positional_encoding_type='sinusoidal',
+                 max_position=50000, **kwargs):
         super().__init__()
+
+        # Positional encoding (applied before transformer blocks)
+        self.use_positional_encoding = use_positional_encoding
+        if use_positional_encoding:
+            if positional_encoding_type == 'sinusoidal':
+                self.pos_encoding = layers.PositionalEncoding(
+                    d_model=embed_dim,
+                    max_len=max_position,
+                    dropout=dropout
+                )
+            elif positional_encoding_type == 'learnable':
+                self.pos_encoding = layers.LearnablePositionalEmbedding(
+                    d_model=embed_dim,
+                    max_positions=max_position,
+                    dropout=dropout
+                )
+            else:
+                raise ValueError(f"Unknown positional_encoding_type: {positional_encoding_type}. "
+                                 f"Supported types: 'sinusoidal', 'learnable'")
+        else:
+            self.pos_encoding = None
+
         self.layers = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, d_ff, dropout, activation)
+            TransformerBlock(embed_dim, num_heads, d_ff,
+                             dropout, activation, use_rope=use_rope)
             for _ in range(repeat)
         ])
 
     def forward(self, x, mask=None):
+        # Apply positional encoding before transformer blocks
+        if self.pos_encoding is not None:
+            x = self.pos_encoding(x)
+
         for layer in self.layers:
             x = layer(x, mask)
         return x
 
 
-def transformer_tower(embed_dim, num_heads, d_ff, repeat, dropout=0.1, activation='gelu', **kwargs):
+def transformer_tower(embed_dim, num_heads, d_ff, repeat, dropout=0.1, activation='gelu',
+                      use_rope=False, use_positional_encoding=False, positional_encoding_type='sinusoidal',
+                      max_position=50000, **kwargs):
     """Stack of transformer blocks.
 
     Args:
@@ -290,12 +723,24 @@ def transformer_tower(embed_dim, num_heads, d_ff, repeat, dropout=0.1, activatio
         repeat: Number of times to repeat the transformer block
         dropout: Dropout rate
         activation: Activation function
+        use_rope: Whether to use RoPE (default False)
+        use_positional_encoding: Whether to use positional encoding (default False)
+        positional_encoding_type: Type of positional encoding - 'sinusoidal' or 'learnable' (default 'sinusoidal')
+        max_position: Maximum sequence length for positional encoding (default 50000)
 
     Returns:
         TransformerTower module
+
+    Note:
+        Positional encoding is applied before all transformer blocks.
+        If use_rope=True, positional encoding is typically not needed (RoPE already encodes position),
+        but both can be used together if desired.
     """
     return TransformerTower(embed_dim=embed_dim, num_heads=num_heads, d_ff=d_ff,
-                            repeat=repeat, dropout=dropout, activation=activation)
+                            repeat=repeat, dropout=dropout, activation=activation,
+                            use_rope=use_rope, use_positional_encoding=use_positional_encoding,
+                            positional_encoding_type=positional_encoding_type,
+                            max_position=max_position, **kwargs)
 
 
 ############################################################
@@ -493,7 +938,7 @@ class TransformerBlockMQA(nn.Module):
     """Transformer block with Multi-Query Attention and RoPE."""
 
     def __init__(self, d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
-                 dropout=0.1, max_position=8192, norm_type='layer'):
+                 dropout=0.1, max_position=8192, norm_type='layer', activation='gelu', use_rope=True, **kwargs):
         super().__init__()
 
         # Choose normalization type
@@ -508,20 +953,21 @@ class TransformerBlockMQA(nn.Module):
             self.norm3 = nn.LayerNorm(d_model)
             self.norm4 = nn.LayerNorm(d_model)
 
-        # Multi-Query Attention with RoPE
+        # Multi-Query Attention with RoPE (optional)
         self.attention = layers.MultiQueryAttentionRoPE(
             d_model=d_model,
             num_query_heads=num_query_heads,
             qk_head_dim=qk_head_dim,
             v_head_dim=v_head_dim,
             dropout=dropout,
-            max_position=max_position
+            max_position=max_position,
+            use_rope=use_rope
         )
 
-        # Feed-forward network (2x expansion with ReLU, AlphaGenome style)
+        # Feed-forward network (2x expansion with activation, AlphaGenome style)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 2 * d_model),
-            nn.ReLU(),
+            layers.Activation(activation),
             nn.Dropout(dropout),
             nn.Linear(2 * d_model, d_model)
         )
@@ -546,7 +992,7 @@ class TransformerBlockMQA(nn.Module):
 
 
 def transformer_mqa(d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
-                    dropout=0.1, max_position=8192, norm_type='layer', **kwargs):
+                    dropout=0.1, max_position=8192, norm_type='layer', activation='gelu', **kwargs):
     """Single transformer block with Multi-Query Attention.
 
     Args:
@@ -568,7 +1014,9 @@ def transformer_mqa(d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
         v_head_dim=v_head_dim,
         dropout=dropout,
         max_position=max_position,
-        norm_type=norm_type
+        norm_type=norm_type,
+        activation=activation,
+        **kwargs
     )
 
 
@@ -576,7 +1024,7 @@ class TransformerTowerMQA(nn.Module):
     """Stack of transformer blocks with Multi-Query Attention and RoPE."""
 
     def __init__(self, embed_dim, repeat=9, num_query_heads=8, qk_head_dim=128,
-                 v_head_dim=192, dropout=0.1, max_position=8192, norm_type='layer'):
+                 v_head_dim=192, dropout=0.1, max_position=8192, norm_type='layer', activation='gelu', use_rope=True, **kwargs):
         super().__init__()
 
         self.layers = nn.ModuleList([
@@ -587,7 +1035,9 @@ class TransformerTowerMQA(nn.Module):
                 v_head_dim=v_head_dim,
                 dropout=dropout,
                 max_position=max_position,
-                norm_type=norm_type
+                norm_type=norm_type,
+                activation=activation,
+                use_rope=use_rope
             )
             for _ in range(repeat)
         ])
@@ -600,7 +1050,7 @@ class TransformerTowerMQA(nn.Module):
 
 def transformer_tower_mqa(embed_dim, repeat=9, num_query_heads=8, qk_head_dim=128,
                           v_head_dim=192, dropout=0.1, max_position=8192,
-                          norm_type='layer', **kwargs):
+                          norm_type='layer', activation='gelu', use_rope=True, **kwargs):
     """Stack of transformer blocks with Multi-Query Attention.
 
     Args:
@@ -612,6 +1062,7 @@ def transformer_tower_mqa(embed_dim, repeat=9, num_query_heads=8, qk_head_dim=12
         dropout: Dropout rate
         max_position: Maximum sequence length for RoPE
         norm_type: 'layer' for LayerNorm (default) or 'rms' for RMSNorm
+        use_rope: Whether to use RoPE (default True)
 
     Returns:
         TransformerTowerMQA module
@@ -619,10 +1070,10 @@ def transformer_tower_mqa(embed_dim, repeat=9, num_query_heads=8, qk_head_dim=12
     Note:
         Features:
         - Multi-Query Attention (multiple query heads, 1 shared K/V)
-        - RoPE for position encoding (no separate PE needed)
+        - RoPE for position encoding (optional, default enabled)
         - Soft-clipping of attention logits for stability
         - Optional RMSNorm instead of LayerNorm
-        - FFN with 2x expansion and ReLU activation
+        - FFN with 2x expansion and activation
     """
     return TransformerTowerMQA(
         embed_dim=embed_dim,
@@ -632,7 +1083,10 @@ def transformer_tower_mqa(embed_dim, repeat=9, num_query_heads=8, qk_head_dim=12
         v_head_dim=v_head_dim,
         dropout=dropout,
         max_position=max_position,
-        norm_type=norm_type
+        norm_type=norm_type,
+        activation=activation,
+        use_rope=use_rope,
+        **kwargs
     )
 
 
@@ -1085,6 +1539,293 @@ def conv_tower(in_channels, filters_list, kernel_size=3, activation='relu',
                      kernel_size=kernel_size, activation=activation,
                      dropout=dropout, norm_type=norm_type, order=order,
                      pooling_type=pooling_type, pool_size=pool_size, pool_stride=pool_stride)
+
+
+class DownConvBlock(nn.Module):
+    """High-level convolution block that combines feature extraction and downsampling.
+
+    This block consists of two conv_block layers:
+    1. Feature extraction conv_block (stride=1): extracts features
+    2. Downsampling conv_block (stride=2): reduces sequence dimension by half
+
+    Together, this implements a common pattern: extract features then downsample.
+    """
+
+    def __init__(self, in_channels=None, out_channels=None, kernel_size=5,
+                 padding='same', activation='gelu', dropout=0.1, norm_type='layer',
+                 order='nac', residual=True):
+        """
+        Args:
+            in_channels: Input channels (None for automatic detection)
+            out_channels: Output channels (same for both conv blocks)
+            kernel_size: Convolution kernel size (default: 5)
+            padding: Padding mode (default: 'same')
+            activation: Activation function (default: 'gelu')
+            dropout: Dropout rate (default: 0.1)
+            norm_type: Normalization type (default: 'layer')
+            order: Operation order - 'nac' (default) or 'cna'
+            residual: Add residual connections (default: True)
+        """
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # First conv_block: feature extraction (stride=1)
+        self.conv_feat = conv_block(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=padding,
+            activation=activation,
+            dropout=dropout,
+            norm_type=norm_type,
+            order=order,
+            residual=residual
+        )
+
+        # Second conv_block: downsampling (stride=2)
+        self.conv_down = conv_block(
+            in_channels=out_channels,  # Output of first conv becomes input of second
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=2,
+            padding=padding,
+            activation=activation,
+            dropout=dropout,
+            norm_type=norm_type,
+            order=order,
+            residual=residual
+        )
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: Input tensor (batch, seq_len, channels)
+            mask: Optional mask tensor (batch, seq_len)
+
+        Returns:
+            out: Output tensor (batch, seq_len/2, channels)
+            mask: Updated mask (if provided)
+        """
+        # Feature extraction
+        x, mask = self.conv_feat(x, mask)
+
+        # Downsampling
+        x, mask = self.conv_down(x, mask)
+
+        return x, mask
+
+
+class DownConvTower(nn.Module):
+    """Tower of DownConvBlocks that automatically downsamples sequence dimension.
+
+    Stacks multiple DownConvBlocks. Each block reduces the sequence length by half
+    (stride=2 in the downsampling conv). 
+
+    If repeat=None (default), automatically determines the number of blocks needed
+    based on the actual input sequence length and seq_len_threshold. If repeat is
+    specified, uses that fixed number of blocks instead.
+
+    """
+
+    def __init__(self, in_channels=None, out_channels=256, kernel_size=5,
+                 padding='same', activation='gelu', dropout=0.1, norm_type='layer',
+                 order='nac', residual=True, repeat=None, seq_len_threshold=1500):
+        """
+        Args:
+            in_channels: Input channels (None for automatic detection)
+            out_channels: Output channels for all conv blocks (default: 256)
+            kernel_size: Convolution kernel size (default: 5)
+            padding: Padding mode (default: 'same')
+            activation: Activation function (default: 'gelu')
+            dropout: Dropout rate (default: 0.1)
+            norm_type: Normalization type (default: 'layer')
+            order: Operation order - 'nac' (default) or 'cna'
+            residual: Add residual connections (default: True)
+            repeat: Number of DownConvBlocks to stack (default: None)
+                   If None, automatically determines based on input seq_len and seq_len_threshold
+                   If specified, uses that fixed number (disables auto calculation)
+            seq_len_threshold: Sequence length threshold (default: 1500)
+                             Used for auto calculation when repeat=None
+        """
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.repeat = repeat
+        self.seq_len_threshold = seq_len_threshold
+
+        # Store parameters for dynamic block creation
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.activation = activation
+        self.dropout = dropout
+        self.norm_type = norm_type
+        self.order = order
+        self.residual = residual
+
+        # Build blocks
+        # If repeat is specified, create that many blocks upfront
+        # Otherwise, create a reasonable default number (20 blocks can handle sequences up to ~20M length)
+        if repeat is not None:
+            num_blocks = repeat
+        else:
+            # Auto mode: create a reasonable default number
+            # 20 blocks can handle sequences up to ~20M length (2^20 * 1500)
+            num_blocks = 20
+
+        self.blocks = nn.ModuleList()
+        current_channels = in_channels
+        for i in range(num_blocks):
+            block = DownConvBlock(
+                in_channels=current_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                activation=activation,
+                dropout=dropout,
+                norm_type=norm_type,
+                order=order,
+                residual=residual
+            )
+            self.blocks.append(block)
+            current_channels = out_channels
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: Input tensor (batch, seq_len, channels)
+            mask: Optional mask tensor (batch, seq_len)
+
+        Returns:
+            out: Output tensor (batch, final_seq_len, channels)
+            mask: Updated mask (if provided)
+
+        Note:
+            Each block reduces sequence length by half. If repeat=None (auto mode),
+            blocks are created dynamically as needed based on the input sequence
+            length and seq_len_threshold.
+        """
+        if self.repeat is not None:
+            # Fixed mode: use all blocks up to repeat
+            for i in range(self.repeat):
+                x, mask = self.blocks[i](x, mask)
+        else:
+            # Auto mode: use blocks until seq_len <= seq_len_threshold
+            current_seq_len = x.size(1)
+            block_idx = 0
+
+            while current_seq_len > self.seq_len_threshold and block_idx < len(self.blocks):
+                x, mask = self.blocks[block_idx](x, mask)
+                current_seq_len = x.size(1)
+                block_idx += 1
+
+            # Warn if we ran out of blocks before reaching threshold
+            if current_seq_len > self.seq_len_threshold:
+                import warnings
+                warnings.warn(
+                    f"DownConvTower: Sequence length ({current_seq_len}) still exceeds "
+                    f"threshold ({self.seq_len_threshold}) after using all {len(self.blocks)} blocks. "
+                    f"Consider specifying a larger repeat value."
+                )
+
+        return x, mask
+
+
+def down_conv_block(in_channels=None, out_channels=256, kernel_size=5,
+                    padding='same', activation='gelu', dropout=0.1,
+                    norm_type='layer', order='nac', residual=True, **kwargs):
+    """High-level convolution block combining feature extraction and downsampling.
+
+    Args:
+        in_channels: Input channels (None for automatic detection)
+        out_channels: Output channels (default: 256)
+        kernel_size: Convolution kernel size (default: 5)
+        padding: Padding mode (default: 'same')
+        activation: Activation function (default: 'gelu')
+        dropout: Dropout rate (default: 0.1)
+        norm_type: Normalization type (default: 'layer')
+        order: Operation order - 'nac' (default) or 'cna'
+        residual: Add residual connections (default: True)
+
+    Returns:
+        DownConvBlock module
+
+    Note:
+        This block consists of two conv_block layers:
+        1. Feature extraction (stride=1)
+        2. Downsampling (stride=2, reduces sequence length by half)
+    """
+    return DownConvBlock(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        kernel_size=kernel_size,
+        padding=padding,
+        activation=activation,
+        dropout=dropout,
+        norm_type=norm_type,
+        order=order,
+        residual=residual
+    )
+
+
+def down_conv_tower(in_channels=None, out_channels=256, kernel_size=5,
+                    padding='same', activation='gelu', dropout=0.1,
+                    norm_type='layer', order='nac', residual=True,
+                    repeat=None, seq_len_threshold=1500, **kwargs):
+    """Tower of DownConvBlocks that automatically downsamples sequence dimension.
+
+    Args:
+        in_channels: Input channels (None for automatic detection)
+        out_channels: Output channels for all conv blocks (default: 256)
+        kernel_size: Convolution kernel size (default: 5)
+        padding: Padding mode (default: 'same')
+        activation: Activation function (default: 'gelu')
+        dropout: Dropout rate (default: 0.1)
+        norm_type: Normalization type (default: 'layer')
+        order: Operation order - 'nac' (default) or 'cna'
+        residual: Add residual connections (default: True)
+        repeat: Number of DownConvBlocks to stack (default: None)
+               If None, automatically determines based on input seq_len and seq_len_threshold
+               Blocks are created dynamically as needed in forward()
+               If specified, uses that fixed number (disables auto calculation)
+        seq_len_threshold: Sequence length threshold (default: 1500)
+                         Used for auto calculation when repeat=None
+
+    Returns:
+        DownConvTower module
+
+    Example:
+        If repeat=None, input seq_len=12000, seq_len_threshold=1500:
+        - Creates and uses blocks until seq_len <= 1500
+        - Block 1: 12000 -> 6000
+        - Block 2: 6000 -> 3000
+        - Block 3: 3000 -> 1500
+        - Stops (1500 <= threshold)
+        Final seq_len = 1500
+
+    Note:
+        Each DownConvBlock consists of:
+        1. Feature extraction conv_block (stride=1)
+        2. Downsampling conv_block (stride=2)
+
+        When repeat=None (default), blocks are created dynamically in forward()
+        based on the actual input sequence length and seq_len_threshold.
+        When repeat is specified, uses that fixed number of blocks.
+    """
+    return DownConvTower(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        kernel_size=kernel_size,
+        padding=padding,
+        activation=activation,
+        dropout=dropout,
+        norm_type=norm_type,
+        order=order,
+        residual=residual,
+        repeat=repeat,
+        seq_len_threshold=seq_len_threshold
+    )
 
 
 ############################################################
@@ -2106,22 +2847,44 @@ def res_tower(d_model, d_ff, repeat, dropout=0.1, activation='relu', **kwargs):
 ############################################################
 
 class MLPBlock(nn.Module):
-    """MLP block with multiple layers."""
+    """MLP block with multiple layers.
 
-    def __init__(self, d_model, d_ff, num_layers=3, dropout=0.1, activation='gelu'):
+    Args:
+        d_model: Input dimension
+        d_ff: Hidden dimension
+        num_layers: Number of layers (default 3)
+        dropout: Dropout rate (default 0.1)
+        activation: Activation function (default 'gelu')
+        out_features: Output dimension (default: same as d_ff)
+        norm_type: Normalization type - 'layer' for LayerNorm (default), None for no norm
+    """
+
+    def __init__(self, d_model, d_ff, num_layers=3, dropout=0.1, activation='gelu',
+                 out_features=None, norm_type='layer'):
         super().__init__()
         layer_list = []
         current_dim = d_model
+        output_dim = out_features if out_features is not None else d_ff
 
         for i in range(num_layers):
-            layer_list.append(nn.Linear(current_dim, d_ff))
-            layer_list.append(nn.LayerNorm(d_ff))
-            if activation:
-                layer_list.append(
-                    nn.Lambda(lambda x: layers.activate(x, activation)))
-            if dropout > 0:
+            # Last layer uses output_dim, others use d_ff
+            target_dim = output_dim if i == num_layers - 1 else d_ff
+
+            layer_list.append(nn.Linear(current_dim, target_dim))
+
+            # Add normalization after linear (except for last layer if no norm)
+            if norm_type == 'layer':
+                layer_list.append(nn.LayerNorm(target_dim))
+
+            # Add activation (except for last layer)
+            if i < num_layers - 1 and activation:
+                layer_list.append(layers.Activation(activation))
+
+            # Add dropout (except for last layer)
+            if i < num_layers - 1 and dropout > 0:
                 layer_list.append(nn.Dropout(dropout))
-            current_dim = d_ff
+
+            current_dim = target_dim
 
         self.network = nn.Sequential(*layer_list)
 
@@ -2129,41 +2892,40 @@ class MLPBlock(nn.Module):
         return self.network(x)
 
 
-def mlp_block(d_model, d_ff, num_layers=3, dropout=0.1, activation='gelu', **kwargs):
+def mlp_block(in_features=None, hidden_features=None, out_features=None, num_layers=3,
+              dropout=0.1, activation='gelu', norm_type='layer', **kwargs):
     """MLP block.
 
     Args:
-        d_model: Input dimension
-        d_ff: Hidden dimension
-        num_layers: Number of layers
-        dropout: Dropout rate
-        activation: Activation function
+        in_features: Input dimension (required)
+        hidden_features: Hidden dimension (required)
+        out_features: Output dimension (default: same as hidden_features)
+        num_layers: Number of layers (default 3)
+        dropout: Dropout rate (default 0.1)
+        activation: Activation function (default 'gelu')
+        norm_type: Normalization type - 'layer' for LayerNorm (default), None for no norm
 
     Returns:
         MLPBlock module
+
+    Example:
+        - name: mlp_block
+          in_features: 128
+          hidden_features: 256
+          out_features: 128
+          num_layers: 2
+          dropout: 0.1
+          activation: gelu
+          norm_type: layer
     """
-    # Simple implementation without nn.Lambda
-    class SimpleMLP(nn.Module):
-        def __init__(self):
-            super().__init__()
-            layer_list = []
-            current_dim = d_model
+    if in_features is None:
+        raise ValueError("mlp_block requires 'in_features' parameter")
+    if hidden_features is None:
+        raise ValueError("mlp_block requires 'hidden_features' parameter")
 
-            for i in range(num_layers):
-                layer_list.append(nn.Linear(current_dim, d_ff))
-                layer_list.append(nn.LayerNorm(d_ff))
-                layer_list.append(nn.GELU() if activation ==
-                                  'gelu' else nn.ReLU())
-                if dropout > 0:
-                    layer_list.append(nn.Dropout(dropout))
-                current_dim = d_ff
-
-            self.network = nn.Sequential(*layer_list)
-
-        def forward(self, x):
-            return self.network(x)
-
-    return SimpleMLP()
+    return MLPBlock(d_model=in_features, d_ff=hidden_features, num_layers=num_layers,
+                    dropout=dropout, activation=activation, out_features=out_features,
+                    norm_type=norm_type)
 
 
 ############################################################
@@ -2429,21 +3191,34 @@ class GatedFusionBlock(nn.Module):
     learned gating weights with optional residual connections.
     """
 
-    def __init__(self, fusion_dim, num_branches, dropout=0.1, use_residual=True):
+    def __init__(self, fusion_dim, num_branches, dropout=0.1, which_branch_to_add=None, branch_dims=None):
         """
         Args:
             fusion_dim: Common dimension for fusion
             num_branches: Number of branches to fuse
             dropout: Dropout rate
-            use_residual: Whether to use residual connections
+            which_branch_to_add: Which branch to add as residual.
+                                - None (default): no residual connection
+                                - 0: add first branch (snp)
+                                - 1: add second branch (indel)
+                                - 2: add third branch (sv)
+                                - etc.
+            branch_dims: Optional list of input dimensions for each branch.
+                        If provided, branch_projections will be created at init time.
+                        If None, branch_projections will be created dynamically on first forward.
         """
         super().__init__()
         self.fusion_dim = fusion_dim
         self.num_branches = num_branches
-        self.use_residual = use_residual
+        self.which_branch_to_add = which_branch_to_add
 
-        # Per-branch projection layers (will be populated dynamically)
+        # Per-branch projection layers
         self.branch_projections = nn.ModuleList()
+        
+        # If branch_dims is provided, create projections at init time
+        if branch_dims is not None:
+            for in_dim in branch_dims:
+                self.branch_projections.append(nn.Linear(in_dim, fusion_dim))
 
         # Gating mechanism: learn importance weights for each branch
         self.gate_fc = nn.Linear(fusion_dim * num_branches, num_branches)
@@ -2498,9 +3273,13 @@ class GatedFusionBlock(nn.Module):
         gate_weights = gate_weights.unsqueeze(-1)  # (batch, num_branches, 1)
         fused = (stacked * gate_weights).sum(dim=1)  # (batch, fusion_dim)
 
-        # Optional residual: add first branch
-        if self.use_residual:
-            fused = fused + projected[0]
+        # Optional residual: add specified branch
+        if self.which_branch_to_add is not None:
+            branch_idx = self.which_branch_to_add
+            if branch_idx < len(projected):
+                fused = fused + projected[branch_idx]
+            else:
+                raise ValueError(f"which_branch_to_add={branch_idx} but only {len(projected)} branches available")
 
         # Normalize and dropout
         fused = self.layer_norm(fused)
@@ -2515,18 +3294,31 @@ class CrossAttentionFusionBlock(nn.Module):
 
     Allows one branch (query) to attend to patterns in other branches (key/value).
     Useful for letting SV branch sense local SNP/INDEL patterns.
+
+    By default, branch 2 (SV) is used as query to attend to SNP and INDEL branches.
     """
 
-    def __init__(self, d_model, num_heads=4, dropout=0.1):
+    def __init__(self, d_model, num_heads=4, dropout=0.1, which_branch_as_query=2, num_branches=3, branch_dims=None):
         """
         Args:
-            d_model: Model dimension
+            d_model: Common dimension for query/key/value
             num_heads: Number of attention heads
             dropout: Dropout rate
+            which_branch_as_query: Which branch index (0-based) to use as query.
+                                  Default: 2 (SV branch)
+                                  - 0: use first branch (snp) as query
+                                  - 1: use second branch (indel) as query
+                                  - 2: use third branch (sv) as query
+                                  - etc.
+            num_branches: Total number of branches (default: 3)
+            branch_dims: Optional list of input dimensions for each branch.
+                        If provided, branch_projections will be created at init time.
         """
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
+        self.which_branch_as_query = which_branch_as_query
+        self.num_branches = num_branches
 
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=d_model,
@@ -2538,15 +3330,52 @@ class CrossAttentionFusionBlock(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, query_branch, key_value_branches):
+        # Per-branch projection layers
+        self.branch_projections = nn.ModuleList()
+        
+        # If branch_dims is provided, create projections at init time
+        if branch_dims is not None:
+            for in_dim in branch_dims:
+                self.branch_projections.append(nn.Linear(in_dim, d_model))
+
+    def forward(self, *branches):
         """
         Args:
-            query_branch: Query tensor (batch, seq_len_q, d_model)
-            key_value_branches: List of K/V tensors [(batch, seq_len_i, d_model), ...]
+            branches: List of branch tensors [(batch, seq_len_i, d_model_i), ...]
+                     Uses which_branch_as_query to select query branch automatically.
 
         Returns:
             Enhanced query: (batch, seq_len_q, d_model)
         """
+        batch_size = branches[0].shape[0]
+
+        # Ensure we have the right number of projection layers
+        if len(self.branch_projections) == 0:
+            for branch_out in branches:
+                in_dim = branch_out.shape[-1]
+                self.branch_projections.append(
+                    nn.Linear(in_dim, self.d_model).to(branch_out.device)
+                )
+
+        # Project each branch to common d_model
+        projected = []
+        for i, branch_out in enumerate(branches):
+            proj = self.branch_projections[i](branch_out)  # (batch, ..., d_model)
+            projected.append(proj)
+
+        # Select query branch
+        query_idx = self.which_branch_as_query
+        query_branch = projected[query_idx]
+        key_value_branches = [projected[i] for i in range(len(projected)) if i != query_idx]
+
+        # Check if input is 2D or 3D
+        is_2d = query_branch.dim() == 2
+
+        # For 2D input: pool to (batch, d_model) before attention
+        if is_2d:
+            query_branch = query_branch.unsqueeze(1)  # (batch, 1, d_model)
+            key_value_branches = [kv.unsqueeze(1) for kv in key_value_branches]
+
         # Concatenate all key/value branches along sequence dimension
         # (batch, sum(seq_len_i), d_model)
         kv = torch.cat(key_value_branches, dim=1)
@@ -2558,13 +3387,18 @@ class CrossAttentionFusionBlock(nn.Module):
             value=kv
         )
 
+        # For 2D input: pool back to (batch, d_model)
+        if is_2d:
+            attn_out = attn_out.squeeze(1)  # (batch, d_model)
+            query_branch = query_branch.squeeze(1)
+
         # Residual connection and normalization
         output = self.norm(query_branch + self.dropout(attn_out))
 
         return output
 
 
-def gated_fusion(fusion_dim, num_branches, dropout=0.1, use_residual=True, **kwargs):
+def gated_fusion(fusion_dim, num_branches, dropout=0.1, which_branch_to_add=None, **kwargs):
     """
     Factory function for GatedFusionBlock.
 
@@ -2572,35 +3406,258 @@ def gated_fusion(fusion_dim, num_branches, dropout=0.1, use_residual=True, **kwa
         fusion_dim: Common dimension for fusion
         num_branches: Number of branches to fuse
         dropout: Dropout rate
-        use_residual: Whether to use residual connections
+        which_branch_to_add: Which branch to add as residual.
+                            - None (default): no residual connection
+                            - 0: add first branch (snp)
+                            - 1: add second branch (indel)
+                            - 2: add third branch (sv)
+                            - etc.
 
     Returns:
         GatedFusionBlock module
+
+    Example YAML:
+        - name: gated_fusion
+          fusion_dim: 128
+          num_branches: 3
+          dropout: 0.1
+          which_branch_to_add: 0  # Add first branch (SNP) as residual
     """
     return GatedFusionBlock(
         fusion_dim=fusion_dim,
         num_branches=num_branches,
         dropout=dropout,
-        use_residual=use_residual
+        which_branch_to_add=which_branch_to_add
     )
 
 
-def cross_attention_fusion(d_model, num_heads=4, dropout=0.1, **kwargs):
+def cross_attention_fusion(d_model, num_heads=4, dropout=0.1, which_branch_as_query=2, num_branches=3, **kwargs):
     """
     Factory function for CrossAttentionFusionBlock.
+
+    By default, branch 2 (SV) is used as query to attend to SNP and INDEL branches.
 
     Args:
         d_model: Model dimension
         num_heads: Number of attention heads
         dropout: Dropout rate
+        which_branch_as_query: Which branch index (0-based) to use as query.
+                              Default: 2 (SV branch)
+                              - 0: use first branch (snp) as query
+                              - 1: use second branch (indel) as query
+                              - 2: use third branch (sv) as query
+                              - etc.
+        num_branches: Total number of branches (default: 3)
 
     Returns:
         CrossAttentionFusionBlock module
+
+    Example YAML:
+        # Default: SV branch (2) attends to SNP (0) and INDEL (1)
+        - name: cross_attention_fusion
+          d_model: 128
+          num_heads: 4
+
+        # Custom: SNP branch (0) attends to INDEL (1) and SV (2)
+        - name: cross_attention_fusion
+          d_model: 128
+          num_heads: 4
+          which_branch_as_query: 0
+          num_branches: 3
     """
     return CrossAttentionFusionBlock(
         d_model=d_model,
         num_heads=num_heads,
-        dropout=dropout
+        dropout=dropout,
+        which_branch_as_query=which_branch_as_query,
+        num_branches=num_branches
+    )
+
+
+class PerceiverCrossFusionBlock(nn.Module):
+    """
+    Perceiver-style cross-attention fusion block for inter-branch communication.
+
+    Fusion process:
+      1. Project each branch tokens to fusion_dim
+      2. Concat tokens across branches
+      3. K learnable latent tokens cross-attend to all tokens
+      4. Pool latents to a single fused vector
+
+    This approach allows all branches to interact through learnable latent queries,
+    rather than having one branch attend to others. More symmetric and expressive
+    than CrossAttentionFusionBlock.
+
+    Args:
+        d_model: Common dimension for fusion (and latent tokens)
+        num_heads: Number of attention heads
+        dropout: Dropout rate
+        latent_k: Number of learnable latent tokens (default: 2)
+        pool_latents: How to pool latent tokens - 'mean', 'max', 'first' (default: 'mean')
+    """
+
+    def __init__(self, d_model, num_heads=4, dropout=0.1, latent_k=2, pool_latents='mean', branch_dims=None):
+        """
+        Args:
+            d_model: Common dimension for fusion
+            num_heads: Number of attention heads
+            dropout: Dropout rate
+            latent_k: Number of learnable latent tokens (default: 2)
+            pool_latents: Pooling strategy for latents - 'mean', 'max', 'first' (default: 'mean')
+            branch_dims: Optional list of input dimensions for each branch.
+                        If provided, branch_projections will be created at init time.
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.latent_k = latent_k
+        self.pool_latents = pool_latents
+
+        # Learnable latent tokens
+        self.latents = nn.Parameter(torch.randn(latent_k, d_model) * 0.02)
+
+        # Cross-attention: query=latents, key/value=branch tokens
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # Normalization layers (pre-norm architecture)
+        self.ln_q = nn.LayerNorm(d_model)
+        self.ln_kv = nn.LayerNorm(d_model)
+
+        # Feed-forward network on latents
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+        self.ln_out = nn.LayerNorm(d_model)
+
+        # Per-branch projection layers
+        self.branch_projections = nn.ModuleList()
+        
+        # If branch_dims is provided, create projections at init time
+        if branch_dims is not None:
+            for in_dim in branch_dims:
+                self.branch_projections.append(nn.Linear(in_dim, d_model))
+
+    def _build_projs_if_needed(self, branch_outputs):
+        """Build projection layers if not already built."""
+        if len(self.branch_projections) == 0:
+            for x in branch_outputs:
+                in_dim = x.shape[-1]
+                self.branch_projections.append(
+                    nn.Linear(in_dim, self.d_model).to(x.device)
+                )
+
+    def forward(self, *branches):
+        """
+        Args:
+            branches: List of branch tensors [(batch, seq_len_i, d_model_i), ...]
+                     Each tensor can be 3D (batch, seq_len, dim) or 2D (batch, dim).
+
+        Returns:
+            Fused output: (batch, d_model)
+        """
+        batch_size = branches[0].shape[0]
+
+        # Ensure projection layers are built
+        self._build_projs_if_needed(branches)
+
+        # Project each branch to common d_model
+        proj_tokens = []
+        for i, branch_out in enumerate(branches):
+            # Handle 2D input (already pooled): (batch, d_model) -> (batch, 1, d_model)
+            if branch_out.dim() == 2:
+                x = branch_out.unsqueeze(1)  # (batch, 1, d_model_i)
+            else:
+                x = branch_out  # (batch, seq_len_i, d_model_i)
+            x = self.branch_projections[i](x)  # (batch, ..., d_model)
+            proj_tokens.append(x)
+
+        # Concatenate all branch tokens along sequence dimension
+        # (batch, sum(seq_len_i), d_model)
+        tokens = torch.cat(proj_tokens, dim=1)
+
+        # Prepare latents for batch: (K, D) -> (B, K, D)
+        latents = self.latents.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Pre-norm architecture
+        q = self.ln_q(latents)  # (B, K, D)
+        kv = self.ln_kv(tokens)  # (B, L_total, D)
+
+        # Cross-attention: latents attend to all branch tokens
+        attn_out, _ = self.cross_attn(query=q, key=kv, value=kv, need_weights=False)
+        latents = latents + attn_out  # Residual connection
+
+        # Feed-forward network on latents
+        latents = latents + self.ffn(self.ln_out(latents))
+
+        # Pool latent tokens to single fused vector
+        if self.pool_latents == 'mean':
+            fused = latents.mean(dim=1)  # (B, D)
+        elif self.pool_latents == 'max':
+            fused = latents.max(dim=1)[0]  # (B, D)
+        elif self.pool_latents == 'first':
+            fused = latents[:, 0, :]  # (B, D)
+        else:
+            raise ValueError(f"Unknown pool_latents: {self.pool_latents}")
+
+        return fused
+
+
+def perceiver_cross_fusion(d_model, num_heads=4, dropout=0.1, latent_k=2, pool_latents='mean', **kwargs):
+    """
+    Factory function for PerceiverCrossFusionBlock.
+
+    Perceiver-style cross-attention fusion:
+      1. Project each branch tokens to fusion_dim
+      2. Concat tokens across branches
+      3. K learnable latent tokens cross-attend to all tokens
+      4. Pool latents to a single fused vector
+
+    This approach allows all branches to interact through learnable latent queries,
+    rather than having one branch attend to others. More symmetric and expressive.
+
+    Args:
+        d_model: Model dimension (common dimension for fusion)
+        num_heads: Number of attention heads
+        dropout: Dropout rate
+        latent_k: Number of learnable latent tokens (default: 2)
+        pool_latents: Pooling strategy for latents (default: 'mean')
+            - 'mean': mean pooling across latent tokens
+            - 'max': max pooling across latent tokens
+            - 'first': use first latent token only
+
+    Returns:
+        PerceiverCrossFusionBlock module
+
+    Example YAML:
+        # Default settings
+        - name: perceiver_cross_fusion
+          d_model: 256
+          num_heads: 4
+          latent_k: 2
+          pool_latents: mean
+
+        # More latent tokens for more expressive fusion
+        - name: perceiver_cross_fusion
+          d_model: 256
+          num_heads: 4
+          latent_k: 4
+          pool_latents: mean
+    """
+    return PerceiverCrossFusionBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        dropout=dropout,
+        latent_k=latent_k,
+        pool_latents=pool_latents
     )
 
 
@@ -2679,9 +3736,46 @@ def sample_cls_token(d_model, num_layers=2, num_heads=8, dim_feedforward=None,
     )
 
 
+def linear_block(out_features, bias=True, transpose=False, **kwargs):
+    """Linear layer block with optional transpose support.
+
+    Args:
+        out_features: Output feature dimension (required)
+        bias: Whether to use bias (default True)
+        transpose: If True, transpose input from (batch, seq_len, C) to (batch, C, seq_len)
+                   before applying linear layer, then transpose back. Default False.
+
+    Returns:
+        LinearBlock module
+
+    Note:
+        Uses LazyLinear to automatically infer in_features from input shape.
+    """
+    if transpose:
+        class TransposeLinear(nn.Module):
+            def __init__(self, out_features, bias=True):
+                super().__init__()
+                self.linear = nn.LazyLinear(out_features, bias=bias)
+
+            def forward(self, x):
+                # x: (batch, seq_len, C)
+                # Transpose: (batch, seq_len, C) -> (batch, C, seq_len)
+                x = x.transpose(1, 2)  # (batch, C, seq_len)
+                # Apply linear: Linear operates on last dimension
+                # (batch, C, seq_len) -> (batch, C, out_features)
+                x = self.linear(x)  # (batch, C, out_features)
+                # Transpose back: (batch, C, out_features) -> (batch, out_features, C)
+                x = x.transpose(1, 2)  # (batch, out_features, C)
+                return x
+
+        return TransposeLinear(out_features, bias=bias)
+    else:
+        return nn.LazyLinear(out_features, bias=bias)
+
 ############################################################
 # Block Dictionary
 ############################################################
+
 
 name_func = {
     # Embeddings
@@ -2696,6 +3790,9 @@ name_func = {
     'transformer': transformer,
     'transformer_tower': transformer_tower,
 
+    # Transpose Transformers
+    'transformerTranspose': transformerTranspose,
+
     # RoPE Transformers
     'transformer_rope': transformer_rope,
     'transformer_tower_rope': transformer_tower_rope,
@@ -2707,10 +3804,13 @@ name_func = {
     # Multi-Query Attention Transformers
     'transformer_mqa': transformer_mqa,
     'transformer_tower_mqa': transformer_tower_mqa,
+    'transformerMqaTranspose': transformerMqaTranspose,
 
     # Convolutions
     'conv_block': conv_block,
     'conv_tower': conv_tower,
+    'down_conv_block': down_conv_block,
+    'down_conv_tower': down_conv_tower,
 
     # Dense blocks (DenseNet)
     'dense_block': dense_block,
@@ -2742,8 +3842,11 @@ name_func = {
     # Fusion (Multi-Branch)
     'gated_fusion': gated_fusion,
     'cross_attention_fusion': cross_attention_fusion,
+    'perceiver_cross_fusion': perceiver_cross_fusion,
 
     # Sample Structure Blocks
     'sample_structure_encoder': sample_structure_encoder,
     'sample_cls_token': sample_cls_token,
+
+    'linear_block': linear_block,
 }

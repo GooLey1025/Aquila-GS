@@ -38,6 +38,7 @@ dependencies = [
     "torchmetrics>=0.13.0",
     "wandb>=0.17.0",
     "optuna>=3.5.0",
+    "cyvcf2>=0.10.0",
 ]
 
 [project.scripts]

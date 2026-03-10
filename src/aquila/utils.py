@@ -104,8 +104,8 @@ def print_model_summary(model: torch.nn.Module, input_size=None, device='cpu', v
     Args:
         model: PyTorch model
         input_size: Input tensor size for detailed summary
-                    - For 'token': (batch_size, seq_length)
-                    - For 'diploid_onehot': (batch_size, seq_length, 8)
+                    - For single-branch: (batch_size, seq_length) or (batch_size, seq_length, 8)
+                    - For multi-branch: dict like {'snp': (batch, seq, 8), 'indel': (batch, seq, 8)}
         device: Device to use for summary
         verbose: If True, print detailed layer-by-layer summary
         encoding_type: Type of encoding ('token' or 'diploid_onehot')
@@ -127,17 +127,44 @@ def print_model_summary(model: torch.nn.Module, input_size=None, device='cpu', v
             # Default to long for backward compatibility
             dtype = torch.long
 
-        # Detailed summary with input size
-        summary(
-            model,
-            input_size=input_size,
-            dtypes=[dtype],
-            device=device,
-            depth=2 if verbose else 1,
-            col_names=["input_size", "output_size", "num_params"],
-            row_settings=["var_names"] if verbose else [],
-            verbose=1
-        )
+        # Handle multi-branch models (dict input_size)
+        if isinstance(input_size, dict):
+            # Multi-branch models: skip detailed torchinfo summary (requires dict input)
+            # Just print basic info
+            print("Multi-branch model detected.")
+            print(f"  Branches: {list(input_size.keys())}")
+            for name, shape in input_size.items():
+                print(f"    {name}: {shape}")
+
+            # Try to print parameter count (handle lazy modules)
+            print("\nTotal parameters:")
+            try:
+                # Only count parameters that are properly initialized
+                total_params = 0
+                trainable_params = 0
+                for p in model.parameters():
+                    if hasattr(p, 'numel') and p.numel() > 0:
+                        total_params += p.numel()
+                        if p.requires_grad:
+                            trainable_params += p.numel()
+                print(f"  Total: {total_params:,}")
+                print(f"  Trainable: {trainable_params:,}")
+            except (ValueError, RuntimeError):
+                print("  (Parameter count not available due to lazy modules)")
+
+            return  # Skip detailed torchinfo summary for multi-branch models
+        else:
+            # Single input (tuple)
+            summary(
+                model,
+                input_size=input_size,
+                dtypes=[dtype],
+                device=device,
+                depth=2 if verbose else 1,
+                col_names=["input_size", "output_size", "num_params"],
+                row_settings=["var_names"] if verbose else [],
+                verbose=1
+            )
     else:
         # Summary without input size
         summary(

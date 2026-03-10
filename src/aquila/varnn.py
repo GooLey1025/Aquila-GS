@@ -301,9 +301,6 @@ class MultiBranchNeuralNetwork(VariantsNeuralNetwork):
         # Build multi-branch model
         self.build_multi_branch_model()
         
-        # Initialize weights
-        self.apply(self._init_weights)
-    
     def build_multi_branch_model(self):
         """Build multi-branch architecture from config."""
         branches_config = self.params.get('branches', {})
@@ -313,9 +310,17 @@ class MultiBranchNeuralNetwork(VariantsNeuralNetwork):
         self.branch_trunks = nn.ModuleDict()
         
         for branch_name, branch_config in branches_config.items():
-            # Build embedder for this branch
-            if 'embedder' in branch_config:
-                self.branch_embedders[branch_name] = self.build_block(branch_config['embedder'])
+            # Build embedder for this branch (support both 'embedder' and 'embedding' keys)
+            embedder_config = branch_config.get('embedder') or branch_config.get('embedding')
+            if embedder_config:
+                # Support both single dict and list of blocks (for stacked embedders)
+                if isinstance(embedder_config, list):
+                    embedder_blocks = nn.ModuleList()
+                    for block_params in embedder_config:
+                        embedder_blocks.append(self.build_block(block_params))
+                    self.branch_embedders[branch_name] = embedder_blocks
+                else:
+                    self.branch_embedders[branch_name] = self.build_block(embedder_config)
             
             # Build trunk for this branch
             trunk_blocks = nn.ModuleList()
@@ -365,21 +370,47 @@ class MultiBranchNeuralNetwork(VariantsNeuralNetwork):
         if not isinstance(x, dict):
             raise ValueError(f"MultiBranchNeuralNetwork expects dict input, got {type(x)}")
         
+        # Normalize input keys to lowercase to match model config keys
+        # Data loader may use uppercase keys like 'SNP', 'INDEL', 'SV'
+        # Model config uses lowercase like 'snp', 'indel', 'sv'
+        x_normalized = {k.lower(): v for k, v in x.items()}
+        
         # Process each branch
         branch_outputs = {}
-        for branch_name, branch_input in x.items():
+        for branch_name, branch_input in x_normalized.items():
             if branch_name not in self.branch_trunks:
                 continue
             
             # Embedder
             if branch_name in self.branch_embedders:
-                current = self.branch_embedders[branch_name](branch_input)
+                embedder = self.branch_embedders[branch_name]
+                if isinstance(embedder, nn.ModuleList):
+                    current = branch_input
+                    for embedder_block in embedder:
+                        result = embedder_block(current)
+                        # Handle blocks that return (x, mask) tuple
+                        if isinstance(result, tuple):
+                            current = result[0]  # Use only the tensor, ignore mask
+                        else:
+                            current = result
+                else:
+                    result = embedder(branch_input)
+                    # Handle blocks that return (x, mask) tuple
+                    if isinstance(result, tuple):
+                        current = result[0]
+                    else:
+                        current = result
             else:
                 current = branch_input
             
             # Branch trunk
             for block in self.branch_trunks[branch_name]:
-                current = block(current)
+                result = block(current)
+                # Handle blocks that return (x, mask) tuple
+                if isinstance(result, tuple):
+                    current = result[0]
+                else:
+                    current = result
             
             branch_outputs[branch_name] = current
         
@@ -393,8 +424,8 @@ class MultiBranchNeuralNetwork(VariantsNeuralNetwork):
                 # Gated fusion takes list of all branches
                 fused = fusion_block(branch_list)
             elif isinstance(fusion_block, blocks.CrossAttentionFusionBlock):
-                # Cross-attention: query = fused, kv = all branches
-                fused = fusion_block(fused.unsqueeze(1) if fused.dim() == 2 else fused, branch_list)
+                # Cross-attention: pass all branches, uses which_branch_as_query to select
+                fused = fusion_block(*branch_list)
             else:
                 # Generic fusion block
                 fused = fusion_block(fused)
@@ -427,31 +458,53 @@ def create_model_from_config(
 ) -> VariantsNeuralNetwork:
     """
     Create a VariantsNeuralNetwork from a configuration dictionary.
-    
+
     Automatically detects and fills in task dimensions based on provided task lists.
     Detects architecture_type to create single-branch or multi-branch models.
-    
+
     Args:
         config: Configuration dictionary with model parameters
         seq_length: Sequence length (number of variants) or dict for multi-branch
         regression_tasks: List of regression task column names
         classification_tasks: List of classification task column names
-        
+
     Returns:
         Initialized VariantsNeuralNetwork or MultiBranchNeuralNetwork
     """
     import copy
-    
+
     # Deep copy to avoid modifying original config
     model_params = copy.deepcopy(config.get('model', {}))
-    
+    train_config = config.get('train', {})
+
     # Check for multi-branch architecture
+    # First check if model has architecture_type, then check if train.branches exists
     architecture_type = model_params.get('architecture_type', 'single')
-    
+
+    # Handle multi-branch config that uses train.branches instead of model.branches
+    # This supports configs like aquila-vars.hpo.yaml where branches are in train section
+    if architecture_type == 'multi_branch' or 'branches' in train_config:
+        # If branches are in train config but not in model config, use train.branches
+        if 'branches' not in model_params and 'branches' in train_config:
+            model_params['branches'] = train_config['branches']
+
+        # Also extract fusion, shared_trunk, heads from train config if present
+        # These are model-related configs that some HPO configs put under train section
+        if 'fusion' not in model_params and 'fusion' in train_config:
+            model_params['fusion'] = train_config['fusion']
+        if 'shared_trunk' not in model_params and 'shared_trunk' in train_config:
+            model_params['shared_trunk'] = train_config['shared_trunk']
+        if 'heads' not in model_params and 'heads' in train_config:
+            model_params['heads'] = train_config['heads']
+
+        # Set architecture_type to multi_branch if using train.branches
+        if 'branches' in model_params:
+            architecture_type = 'multi_branch'
+
     # Set tasks
     model_params['regression_tasks'] = regression_tasks or []
     model_params['classification_tasks'] = classification_tasks or []
-    
+
     # Auto-update head dimensions based on detected tasks
     if 'heads' in model_params:
         # Update regression head
@@ -463,7 +516,7 @@ def create_model_from_config(
                         block['num_targets'] = len(regression_tasks)
             elif isinstance(head_blocks, dict) and head_blocks.get('name') == 'regression_head':
                 head_blocks['num_targets'] = len(regression_tasks)
-        
+
         # Update classification head
         if 'classification' in model_params['heads'] and classification_tasks:
             head_blocks = model_params['heads']['classification']
@@ -473,7 +526,7 @@ def create_model_from_config(
                         block['num_tasks'] = len(classification_tasks)
             elif isinstance(head_blocks, dict) and head_blocks.get('name') == 'classification_head':
                 head_blocks['num_tasks'] = len(classification_tasks)
-    
+
     if architecture_type == 'multi_branch':
         # Multi-branch architecture
         model_params['seq_length'] = seq_length  # Can be dict for multi-branch

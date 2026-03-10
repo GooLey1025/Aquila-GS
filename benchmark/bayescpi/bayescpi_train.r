@@ -94,16 +94,16 @@ load_vcf_to_matrix <- function(vcf_file) {
     stop(sprintf("Error extracting genotypes: %s", e$message))
   })
   
-  # Convert genotypes to numeric: 0/0 -> 0, 0/1 or 1/0 -> 1, 1/1 -> 2
+  # Convert genotypes to numeric: 0/0 or 0|0 -> 0, 0/1 or 1/0 or 0|1 or 1|0 -> 1, 1/1 or 1|1 -> 2
   # hibayes requires 0, 1, 2 format (number of ALT alleles)
   cat("  Converting genotypes to numeric format (0/1/2 for hibayes)...\n")
   tryCatch({
-    # Use more efficient conversion method for large matrices
-    geno[geno == "0/0"] <- 0
-    geno[geno == "0/1" | geno == "1/0"] <- 1
-    geno[geno == "1/1"] <- 2
-    # Handle missing values (./.) - use 0 as default (homozygous reference)
-    geno[geno == "./." | is.na(geno)] <- 0
+    # Handle both slash (0/0) and pipe (0|0) formats
+    geno[geno == "0/0" | geno == "0|0"] <- 0
+    geno[geno == "0/1" | geno == "1/0" | geno == "0|1" | geno == "1|0"] <- 1
+    geno[geno == "1/1" | geno == "1|1"] <- 2
+    # Handle missing values (./. or .|.)
+    geno[geno == "./." | geno == ".|." | is.na(geno)] <- NA
     
     # Convert to numeric matrix (more efficient than apply)
     # Row names are already set above, so don't overwrite them
@@ -112,6 +112,23 @@ load_vcf_to_matrix <- function(vcf_file) {
   }, error = function(e) {
     stop(sprintf("Error converting genotypes: %s", e$message))
   })
+  
+  # Check for missing values and impute with column means
+  n_missing <- sum(is.na(geno))
+  if (n_missing > 0) {
+    cat(sprintf("  Found %d missing values (%.2f%%)\n", 
+                n_missing, 100 * n_missing / length(geno)))
+    cat("  Imputing missing values with column means...\n")
+    # Calculate column means (for each SNP, across samples)
+    col_means <- rowMeans(geno, na.rm = TRUE)
+    # Replace NA with column mean (round to nearest integer for 0/1/2 encoding)
+    for (i in seq_len(nrow(geno))) {
+      geno[i, is.na(geno[i, ])] <- round(col_means[i])
+    }
+    cat("  Imputation completed\n")
+  } else {
+    cat("  No missing values found\n")
+  }
   
   # Transpose: rows = samples, columns = variants
   cat("  Transposing matrix...\n")

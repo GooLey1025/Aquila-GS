@@ -27,6 +27,7 @@ import pandas as pd
 from typing import List, Dict, Tuple, Optional
 import multiprocessing as mp
 import subprocess
+import gzip
 # NOTE: Do NOT import torch at module level - import it inside functions after setting CUDA_VISIBLE_DEVICES
 
 from aquila.utils import load_config, save_config, set_seed
@@ -53,6 +54,7 @@ def parse_args():
     )
 
     parser.add_argument(
+        '-dsf',
         '--data-split-file',
         type=str,
         default=None,
@@ -121,9 +123,9 @@ def parse_args():
     parser.add_argument(
         '--encoding-type',
         type=str,
-        default='snp_vcf',
-        choices=['snp_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
-        help='VCF encoding type'
+        default='diploid_onehot',
+        choices=['token', 'diploid_onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
+        help='Encoding type (overrides config file if specified)'
     )
 
     parser.add_argument(
@@ -191,7 +193,13 @@ def generate_fold_data_split_file(
     # 1. Get sample IDs from VCF file (read header only)
     print(f"Reading sample IDs from VCF file...")
     vcf_sample_ids = None
-    with open(vcf_file, 'r') as f:
+
+    # Detect if file is gzipped
+    is_gzipped = vcf_file.endswith('.gz')
+    open_func = gzip.open if is_gzipped else open
+    open_mode = 'rt' if is_gzipped else 'r'
+
+    with open_func(vcf_file, open_mode) as f:
         for line in f:
             if line.startswith('#CHROM'):
                 fields = line.strip().split('\t')
@@ -766,11 +774,13 @@ def main():
         config['data']['geno_file'] = args.vcf
     if args.pheno:
         config['data']['pheno_file'] = args.pheno
-    config['data']['encoding_type'] = args.encoding_type
+    if args.encoding_type is not None:
+        config['data']['encoding_type'] = args.encoding_type
 
     # Get data paths and convert to absolute paths
     vcf_file = args.vcf or config['data']['geno_file']
     pheno_file = args.pheno or config['data']['pheno_file']
+    encoding_type = config['data']['encoding_type']  # Get final encoding type from config
 
     # Convert data file paths to absolute paths if they are relative
     if vcf_file and not Path(vcf_file).is_absolute():
@@ -842,7 +852,7 @@ def main():
             generate_fold_data_split_file(
                 vcf_file=vcf_file,
                 pheno_file=pheno_file,
-                encoding_type=args.encoding_type,
+                encoding_type=encoding_type,
                 classification_tasks=classification_tasks,
                 fold_idx=fold_idx,
                 n_folds=args.n_folds,
@@ -952,7 +962,7 @@ def main():
                 split_files_str,  # Use string version
                 vcf_file,
                 pheno_file,
-                args.encoding_type,
+                encoding_type,
                 args.mixed_precision,
                 args.use_wandb,
                 args.wandb_project,

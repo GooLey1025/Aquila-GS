@@ -34,7 +34,8 @@ install.packages(c(
   "rBayesianOptimization",  # HPO (optional)
   "foreach",           # Parallel processing
   "doParallel",        # Parallel backend
-  "optparse"           # Command-line arguments
+  "optparse",           # Command-line arguments
+  "hibayes"
 ))
 ```
 
@@ -46,7 +47,8 @@ First, run Aquila training to generate fair data for benchmarking:
 ```sh
 conda activate aquila
 cd aquila
-aquila_train.py --config 705rice_benchmark.yaml --vcf 705Rice_Inbred_ssSNP_0.5LD.ID.reheader.vcf \
+aquila_train.py --config params/705rice_conv_mha.aquila-snp.hpo.yaml \
+  --vcf beagle_impute/705rice_0.005.full.snp.impute.biallelic.vcf.gz \
   --pheno 705Rice.pheno.imputed.tsv -o aquila_benchmark --save-postprocess-data
 ```
 This will create:
@@ -54,6 +56,22 @@ This will create:
 - `aquila/aquila_benchmark/data_postprocess/geno_valid.vcf`
 - `aquila/aquila_benchmark/data_postprocess/pheno_train_normalized.tsv`
 - `aquila/aquila_benchmark/data_postprocess/pheno_valid_normalized.tsv`
+
+#### Aquila-SNP
+Run hpo search for Aquila-SNP
+```sh
+yaml=705rice_conv_mha.aquila-snp.hpo.yaml
+rm -rf ${yaml%.yaml}
+nohup aquila_train_hpo.py --config params/$yaml -o ${yaml%.yaml} -dsf aquila_benchmark/data_split.tsv > ${yaml%.yaml}.log 2>&1 &
+```
+#### For Aquila-Vars
+Run hpo search for Aquila-Vars
+```sh
+yaml=705rice_conv_mha.aquila-vars.hpo.yaml
+rm -rf ${yaml%.yaml}
+nohup aquila_train_hpo.py --config params/$yaml -o ${yaml%.yaml} -dsf aquila_benchmark/data_split.tsv > ${yaml%.yaml}.log 2>&1 &
+
+```
 
 ### [CropARNet](https://github.com/Zhoushuchang-lab/CropARNet)
 
@@ -73,13 +91,16 @@ Therefore, you do not need to clone the original repository to run our code.
 >```
 
 ```sh
+conda activate aquila
+model=croparnet
+cd $model
 python train_benchmark.py \
   --train-vcf ../aquila/aquila_benchmark/data_postprocess/geno_train.vcf \
   --valid-vcf ../aquila/aquila_benchmark/data_postprocess/geno_valid.vcf \
   --train-pheno ../aquila/aquila_benchmark/data_postprocess/pheno_train_normalized.tsv \
   --valid-pheno ../aquila/aquila_benchmark/data_postprocess/pheno_valid_normalized.tsv \
-  --output-dir croparnet_output_hpo \
-  --config croparnet_config.yaml \
+  --output-dir ${model}_output \
+  --config ${model}_config.yaml \
   --enable-hpo \
   --seed 42
 ```
@@ -94,14 +115,15 @@ python train_benchmark.py \
 >```
 ```sh
 conda activate aquila
-cd Cropformer
+model=cropformer
+cd cropformer
 python model_benchmark.py \
   --train-vcf ../aquila/aquila_benchmark/data_postprocess/geno_train.vcf \
   --valid-vcf ../aquila/aquila_benchmark/data_postprocess/geno_valid.vcf \
   --train-pheno ../aquila/aquila_benchmark/data_postprocess/pheno_train_normalized.tsv \
   --valid-pheno ../aquila/aquila_benchmark/data_postprocess/pheno_valid_normalized.tsv \
-  --output-dir cropformer_output_hpo \
-  --config cropformer_config.yaml \
+  --output-dir ${model}_output \
+  --config ${model}_config.yaml \
   --enable-hpo \
   --seed 42
 ```
@@ -116,13 +138,13 @@ Rscript ${model}_train.r \
   --valid-vcf ../aquila/aquila_benchmark/data_postprocess/geno_valid.vcf \
   --train-pheno ../aquila/aquila_benchmark/data_postprocess/pheno_train_normalized.tsv \
   --valid-pheno ../aquila/aquila_benchmark/data_postprocess/pheno_valid_normalized.tsv \
-  --output-dir ${model}_output_hpo --n-cores 32 \
+  --output-di ${model}_output --n-cores 32 \
   --enable-hpo
 
 ```
-### BayesA
+### BayesCpi
 ```sh
-model=bayesa
+model=bayescpi
 cd $model
 Rscript ${model}_train.r \
   --config ${model}_config.yaml \

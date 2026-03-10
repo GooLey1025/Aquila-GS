@@ -7,11 +7,12 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 import numpy as np
 from pathlib import Path
 import json
 import time
+import pandas as pd
 
 from .metrics import MultiTaskLoss, MetricsCalculator
 
@@ -91,6 +92,7 @@ class VarTrainer:
         use_mixed_precision: bool = False,
         huber_delta: float = 1.0,
         wandb_run=None,
+        regression_task_names: Optional[List[str]] = None,
     ):
         """
         Initialize trainer.
@@ -185,7 +187,9 @@ class VarTrainer:
                 raise ValueError(
                     "num_epochs must be provided for OneCycleLR scheduler")
 
-            steps_per_epoch = len(train_loader)
+            # Ensure all values are integers (YAML/HPO may pass strings)
+            num_epochs = int(num_epochs)
+            steps_per_epoch = int(len(train_loader))
             total_steps = num_epochs * steps_per_epoch
 
             default_params = {
@@ -207,9 +211,11 @@ class VarTrainer:
                 raise ValueError(
                     "num_epochs must be provided for cosine_warmup scheduler")
 
-            steps_per_epoch = len(train_loader)
+            # Ensure all values are integers (YAML/HPO may pass strings)
+            num_epochs = int(num_epochs)
+            steps_per_epoch = int(len(train_loader))
             total_steps = num_epochs * steps_per_epoch
-            warmup_epochs = scheduler_params.get('warmup_epochs', 5)
+            warmup_epochs = int(scheduler_params.get('warmup_epochs', 5))
             warmup_steps = warmup_epochs * steps_per_epoch
 
             # Cosine annealing steps (after warmup)
@@ -218,7 +224,7 @@ class VarTrainer:
             # Create warmup scheduler
             warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
                 self.optimizer,
-                start_factor=scheduler_params.get('warmup_start_factor', 0.01),
+                start_factor=float(scheduler_params.get('warmup_start_factor', 0.01)),
                 end_factor=1.0,
                 total_iters=warmup_steps
             )
@@ -227,7 +233,7 @@ class VarTrainer:
             cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
                 T_max=cosine_steps,
-                eta_min=scheduler_params.get('min_lr', 1e-6)
+                eta_min=float(scheduler_params.get('min_lr', 1e-6))
             )
 
             # Combine them using SequentialLR
@@ -267,6 +273,9 @@ class VarTrainer:
         self.best_epoch = 0
         self.best_metrics = {}
 
+        # Store regression task names for mapping metrics to phenotype names
+        self.regression_task_names = regression_task_names
+
         # Track starting epoch for resume functionality
         self.start_epoch = 0
 
@@ -278,9 +287,23 @@ class VarTrainer:
         all_targets = []
         all_masks = []
 
+        # Check if this is a multi-branch model
+        is_multi_branch = hasattr(self.model, 'branch_trunks')
+
         for batch in self.train_loader:
             # Move data to device
-            snp_data = batch['snp'].to(self.device)
+            if is_multi_branch:
+                # Multi-branch: collect all variant data as dict
+                # Keys are typically uppercase: 'SNP', 'INDEL', 'SV'
+                input_data = {}
+                for key, value in batch.items():
+                    if key not in ['sample_id', 'regression_targets', 'regression_mask',
+                                   'classification_targets', 'classification_mask']:
+                        input_data[key] = value.to(self.device)
+            else:
+                # Single-branch: use 'snp' key
+                snp_key = 'snp' if 'snp' in batch else 'SNP'
+                input_data = batch[snp_key].to(self.device)
 
             targets = {}
             masks = {}
@@ -304,7 +327,7 @@ class VarTrainer:
             if self.use_mixed_precision:
                 # Use autocast for forward pass
                 with torch.amp.autocast(device_type='cuda'):
-                    predictions = self.model(snp_data)
+                    predictions = self.model(input_data)
                     # Compute loss
                     loss, loss_dict = self.criterion(
                         predictions, targets, masks)
@@ -337,7 +360,7 @@ class VarTrainer:
                     self.scheduler.step()
             else:
                 # Standard precision training
-                predictions = self.model(snp_data)
+                predictions = self.model(input_data)
 
                 # Compute loss
                 loss, loss_dict = self.criterion(predictions, targets, masks)
@@ -399,8 +422,22 @@ class VarTrainer:
         all_targets = {'regression': [], 'classification': []}
         all_masks = {'regression': [], 'classification': []}
 
+        # Check if this is a multi-branch model
+        is_multi_branch = hasattr(self.model, 'branch_trunks')
+
         for batch in self.val_loader:
-            snp_data = batch['snp'].to(self.device)
+            # Move data to device
+            if is_multi_branch:
+                # Multi-branch: collect all variant data as dict
+                input_data = {}
+                for key, value in batch.items():
+                    if key not in ['sample_id', 'regression_targets', 'regression_mask',
+                                   'classification_targets', 'classification_mask']:
+                        input_data[key] = value.to(self.device)
+            else:
+                # Single-branch: use 'snp' key
+                snp_key = 'snp' if 'snp' in batch else 'SNP'
+                input_data = batch[snp_key].to(self.device)
 
             targets = {}
             masks = {}
@@ -427,11 +464,11 @@ class VarTrainer:
             # Forward pass (use autocast for mixed precision if enabled)
             if self.use_mixed_precision:
                 with torch.amp.autocast(device_type='cuda'):
-                    predictions = self.model(snp_data)
+                    predictions = self.model(input_data)
                     # Compute loss
                     loss, _ = self.criterion(predictions, targets, masks)
             else:
-                predictions = self.model(snp_data)
+                predictions = self.model(input_data)
                 # Compute loss
                 loss, _ = self.criterion(predictions, targets, masks)
 
@@ -591,12 +628,22 @@ class VarTrainer:
         if self.rank == 0:
             if self.is_distributed:
                 # Get parameter count from module for DDP
-                num_params = sum(p.numel()
-                                 for p in self.model.module.parameters())
+                try:
+                    num_params = sum(p.numel() for p in self.model.module.parameters()
+                                    if hasattr(p, 'numel') and p.numel() > 0)
+                except (ValueError, RuntimeError):
+                    num_params = None
             else:
-                num_params = sum(p.numel() for p in self.model.parameters())
+                try:
+                    num_params = sum(p.numel() for p in self.model.parameters()
+                                    if hasattr(p, 'numel') and p.numel() > 0)
+                except (ValueError, RuntimeError):
+                    num_params = None
             print(f"Training on device: {self.device}")
-            print(f"Number of parameters: {num_params:,}")
+            if num_params is not None:
+                print(f"Number of parameters: {num_params:,}")
+            else:
+                print("Number of parameters: (not available due to lazy modules)")
             print()  # Empty line before training starts
 
         start_time = time.time()
@@ -840,13 +887,135 @@ class VarTrainer:
 
             # Save best model metrics with all details (in output_dir root, not checkpoints subdirectory)
             best_metrics_path = self.checkpoint_dir.parent / 'best_metrics.json'
-            with open(best_metrics_path, 'w') as f:
-                json.dump(self.best_metrics, f, indent=2)
 
-            print(f"\nMetrics saved:")
-            print(f"  Training history (TSV): {history_path_tsv}")
-            print(f"  Training history (JSON): {history_path_json}")
-            print(f"  Best model metrics: {best_metrics_path}")
+            # Create metrics dict with phenotype names if available
+            best_metrics_to_save = self.best_metrics.copy()
+
+            # Map task indices to phenotype names if available
+            if self.regression_task_names and len(self.regression_task_names) > 0:
+                # Create a new dict with phenotype names
+                metrics_with_names = {}
+
+                # Copy all non-task-specific metrics
+                for key, value in best_metrics_to_save.items():
+                    if not (key.startswith('val_reg_task_') or key.startswith('train_reg_task_')):
+                        metrics_with_names[key] = value
+
+                # Map task-specific metrics to phenotype names (simplified keys)
+                for i, pheno_name in enumerate(self.regression_task_names):
+                    # Validation metrics - use simplified keys: {phenotype}_val_{metric}
+                    metric_mapping = {
+                        '_pearson': '_val_r',
+                        '_r2': '_val_r2',
+                        '_mse': '_val_mse',
+                        '_rmse': '_val_rmse',
+                        '_mae': '_val_mae'
+                    }
+                    for metric_suffix, simplified_suffix in metric_mapping.items():
+                        task_key = f'val_reg_task_{i}{metric_suffix}'
+                        if task_key in best_metrics_to_save:
+                            pheno_key = f'{pheno_name}{simplified_suffix}'
+                            metrics_with_names[pheno_key] = best_metrics_to_save[task_key]
+
+                    # Training metrics - use simplified keys: {phenotype}_train_{metric}
+                    metric_mapping_train = {
+                        '_pearson': '_train_r',
+                        '_r2': '_train_r2',
+                        '_mse': '_train_mse',
+                        '_rmse': '_train_rmse',
+                        '_mae': '_train_mae'
+                    }
+                    for metric_suffix, simplified_suffix in metric_mapping_train.items():
+                        task_key = f'train_reg_task_{i}{metric_suffix}'
+                        if task_key in best_metrics_to_save:
+                            pheno_key = f'{pheno_name}{simplified_suffix}'
+                            metrics_with_names[pheno_key] = best_metrics_to_save[task_key]
+
+                # Also keep original task-indexed keys for backward compatibility
+                for key, value in best_metrics_to_save.items():
+                    if key.startswith('val_reg_task_') or key.startswith('train_reg_task_'):
+                        metrics_with_names[key] = value
+
+                best_metrics_to_save = metrics_with_names
+
+            with open(best_metrics_path, 'w') as f:
+                json.dump(best_metrics_to_save, f, indent=2)
+
+            # Generate best_metrics_per_phenotype.tsv for easy viewing
+            if self.regression_task_names and len(self.regression_task_names) > 0:
+                per_phenotype_metrics = []
+                for i, pheno_name in enumerate(self.regression_task_names):
+                    row = {'phenotype': pheno_name}
+
+                    # Extract validation metrics (use simplified keys)
+                    row['valid_r'] = best_metrics_to_save.get(
+                        f'{pheno_name}_val_r',
+                        best_metrics_to_save.get(
+                            f'val_reg_task_{i}_pearson', None)
+                    )
+                    row['valid_r2'] = best_metrics_to_save.get(
+                        f'{pheno_name}_val_r2',
+                        best_metrics_to_save.get(f'val_reg_task_{i}_r2', None)
+                    )
+                    row['valid_mse'] = best_metrics_to_save.get(
+                        f'{pheno_name}_val_mse',
+                        best_metrics_to_save.get(f'val_reg_task_{i}_mse', None)
+                    )
+                    row['valid_rmse'] = best_metrics_to_save.get(
+                        f'{pheno_name}_val_rmse',
+                        best_metrics_to_save.get(
+                            f'val_reg_task_{i}_rmse', None)
+                    )
+                    row['valid_mae'] = best_metrics_to_save.get(
+                        f'{pheno_name}_val_mae',
+                        best_metrics_to_save.get(f'val_reg_task_{i}_mae', None)
+                    )
+
+                    # Extract training metrics (use simplified keys)
+                    row['train_r'] = best_metrics_to_save.get(
+                        f'{pheno_name}_train_r',
+                        best_metrics_to_save.get(
+                            f'train_reg_task_{i}_pearson', None)
+                    )
+                    row['train_r2'] = best_metrics_to_save.get(
+                        f'{pheno_name}_train_r2',
+                        best_metrics_to_save.get(
+                            f'train_reg_task_{i}_r2', None)
+                    )
+                    row['train_mse'] = best_metrics_to_save.get(
+                        f'{pheno_name}_train_mse',
+                        best_metrics_to_save.get(
+                            f'train_reg_task_{i}_mse', None)
+                    )
+                    row['train_rmse'] = best_metrics_to_save.get(
+                        f'{pheno_name}_train_rmse',
+                        best_metrics_to_save.get(
+                            f'train_reg_task_{i}_rmse', None)
+                    )
+                    row['train_mae'] = best_metrics_to_save.get(
+                        f'{pheno_name}_train_mae',
+                        best_metrics_to_save.get(
+                            f'train_reg_task_{i}_mae', None)
+                    )
+
+                    per_phenotype_metrics.append(row)
+
+                # Create DataFrame and save
+                per_phenotype_df = pd.DataFrame(per_phenotype_metrics)
+                per_phenotype_path = self.checkpoint_dir.parent / 'best_metrics_per_phenotype.tsv'
+                per_phenotype_df.to_csv(
+                    per_phenotype_path, sep='\t', index=False, float_format='%.6f')
+
+                print(f"\nMetrics saved:")
+                print(f"  Training history (TSV): {history_path_tsv}")
+                print(f"  Training history (JSON): {history_path_json}")
+                print(f"  Best model metrics: {best_metrics_path}")
+                print(f"  Best metrics per phenotype: {per_phenotype_path}")
+            else:
+                print(f"\nMetrics saved:")
+                print(f"  Training history (TSV): {history_path_tsv}")
+                print(f"  Training history (JSON): {history_path_json}")
+                print(f"  Best model metrics: {best_metrics_path}")
 
             # Finish wandb run
             if self.wandb_run is not None:

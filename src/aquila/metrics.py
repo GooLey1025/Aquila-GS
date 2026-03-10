@@ -169,7 +169,7 @@ class MultiTaskLoss(nn.Module):
             loss_dict: Dictionary with individual task losses
         """
         loss_dict = {}
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, dtype=torch.float32)
 
         # Regression tasks
         if 'regression' in predictions and self.num_regression_tasks > 0:
