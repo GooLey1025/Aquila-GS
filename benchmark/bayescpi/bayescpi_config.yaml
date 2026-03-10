@@ -1,0 +1,11 @@
+model: bayescpi
+seed: 42
+
+# BayesCpi hyperparameters
+# Note: BayesCpi uses MCMC with fixed hyperparameters, no external HPO needed
+hyperparameters:
+  Pi: 0.95        # Prior probability that a marker has zero effect (sparsity parameter)
+  niter: 12000    # Number of MCMC iterations
+  nburn: 2000     # Number of burn-in iterations
+  thin: 5         # Thinning interval (save every nth sample)
+  verbose: false  # Whether to print progress during MCMC

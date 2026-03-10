@@ -1,0 +1,3 @@
+[submodule "VarsGT/GATK-DELLY-Allele_based-Genotyping"]
+	path = VarsGT/GATK-DELLY-Allele_based-Genotyping
+	url = https://github.com/GooLey1025/GATK-DELLY-Allele_based-Genotyping.git
