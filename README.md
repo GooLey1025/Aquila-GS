@@ -11,6 +11,7 @@ Aquila is a powerful deep learning framework for genomic prediction using SNP (S
 
 git clone https://github.com/GooLey1025/Aquila-GS.git
 cd Aquila-GS
+chmod +x src/aquila/scripts/*
 echo "export PATH=\$PATH:$(pwd)/src/aquila/scripts" >> ~/.bashrc
 source ~/.bashrc
 
