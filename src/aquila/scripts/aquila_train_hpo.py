@@ -150,6 +150,13 @@ def parse_args():
         help='Ignore data cache and re-process data from scratch'
     )
 
+    parser.add_argument(
+        '-rst',
+        '--restart',
+        action='store_true',
+        help='Delete existing Optuna study and start fresh. This will remove all previous trials.'
+    )
+
     return parser.parse_args()
 
 
@@ -689,6 +696,15 @@ def main():
         print(f"  Data split file: {data_split_file} (fixed split)")
     else:
         print(f"  Data split seed: {args.data_split_seed} (random split)")
+
+    # Handle restart: delete existing study if requested
+    if args.restart:
+        print(f"\n⚠️  Restart requested: Deleting existing Optuna study '{study_name}'")
+        if storage_file.exists():
+            storage_file.unlink()
+            print(f"  Deleted: {storage_file}")
+        else:
+            print(f"  Storage file not found: {storage_file}")
 
     # Create study
     study = create_optuna_study(
