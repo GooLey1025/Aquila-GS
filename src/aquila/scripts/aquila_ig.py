@@ -6,7 +6,11 @@ Compute integrated gradients for genomic variant attribution using trained model
 Supports multi-branch architectures for SNP/INDEL/SV variants.
 
 Usage:
+    # Method 1: Provide config and checkpoint explicitly
     python aquila_ig.py --config params.yaml --checkpoint checkpoints/best_checkpoint.pt --vcf input.vcf.gz --output output_dir
+    
+    # Method 2: Provide model directory (auto-detect config and checkpoint)
+    python aquila_ig.py --model-dir /path/to/model_dir --vcf input.vcf.gz --output output_dir
 
 """
 
@@ -18,7 +22,9 @@ import os
 import json
 import pandas as pd
 import h5py
-from typing import Dict, List, Optional, Tuple
+import pickle
+from typing import Dict, List, Optional, Tuple, Union
+import shutil
 
 from aquila.varnn import create_model_from_config
 from aquila.utils import load_config
@@ -31,18 +37,22 @@ def parse_args():
         description='Compute integrated gradients for Aquila model'
     )
 
-    parser.add_argument(
+    # Add mutually exclusive group for --config/--checkpoint vs --model-dir
+    config_group = parser.add_mutually_exclusive_group(required=True)
+    config_group.add_argument(
         '--config',
         type=str,
-        required=True,
         help='Path to configuration YAML file (same as used for training)'
     )
-
-    parser.add_argument(
+    config_group.add_argument(
         '--checkpoint',
         type=str,
-        required=True,
         help='Path to model checkpoint'
+    )
+    config_group.add_argument(
+        '--model-dir',
+        type=str,
+        help='Path to model directory (auto-detect params.yaml and checkpoints)'
     )
 
     parser.add_argument(
@@ -93,7 +103,15 @@ def parse_args():
         '--task',
         type=str,
         default=None,
-        help='Task name to compute IG for (regression task). If not specified, compute for all tasks.'
+        help='Task name to compute IG for. Can be regression or classification task. If not specified, compute for all tasks.'
+    )
+
+    parser.add_argument(
+        '--task-type',
+        type=str,
+        default=None,
+        choices=['regression', 'classification', None],
+        help='Type of task to compute IG for. If not specified, auto-detect from checkpoint.'
     )
 
     parser.add_argument(
@@ -103,7 +121,132 @@ def parse_args():
         help='Path to txt file with sample IDs (one per line). If not specified, compute for all samples.'
     )
 
+    parser.add_argument(
+        '--streaming',
+        action='store_true',
+        help='Enable streaming mode: compute and save results incrementally to reduce memory usage'
+    )
+
     return parser.parse_args()
+
+
+def resolve_model_dir(args):
+    """
+    Resolve config and checkpoint paths from model directory.
+    
+    Returns:
+        Tuple of (config_path, checkpoint_path)
+    """
+    model_dir = Path(args.model_dir)
+    
+    # Find params.yaml
+    config_path = model_dir / 'params.yaml'
+    if not config_path.exists():
+        # Try other possible names
+        for name in ['config.yaml', 'training_config.yaml']:
+            alt_path = model_dir / name
+            if alt_path.exists():
+                config_path = alt_path
+                break
+    if not config_path.exists():
+        raise FileNotFoundError(f"Could not find config file in {model_dir}")
+    
+    # Find checkpoint
+    checkpoint_dir = model_dir / 'checkpoints'
+    checkpoint_path = None
+    
+    # Prefer best_checkpoint.pt
+    if checkpoint_dir.exists():
+        best_ckpt = checkpoint_dir / 'best_checkpoint.pt'
+        if best_ckpt.exists():
+            checkpoint_path = best_ckpt
+        else:
+            # Try latest_checkpoint.pt
+            latest_ckpt = checkpoint_dir / 'latest_checkpoint.pt'
+            if latest_ckpt.exists():
+                checkpoint_path = latest_ckpt
+    
+    if checkpoint_path is None:
+        raise FileNotFoundError(f"Could not find checkpoint in {model_dir}/checkpoints")
+    
+    return str(config_path), str(checkpoint_path)
+
+
+def load_task_names_from_model_dir(model_dir: Path) -> Tuple[List[str], List[str], Dict]:
+    """
+    Load task names and config from model directory.
+    
+    Returns:
+        Tuple of (regression_tasks, classification_tasks, extra_info)
+    """
+    regression_tasks = []
+    classification_tasks = []
+    extra_info = {}
+    
+    # Try normalization_stats.pkl
+    norm_stats_path = model_dir / 'normalization_stats.pkl'
+    if norm_stats_path.exists():
+        with open(norm_stats_path, 'rb') as f:
+            norm_stats = pickle.load(f)
+        regression_tasks = norm_stats.get('regression_tasks', [])
+        extra_info['regression_means'] = norm_stats.get('regression_means', {})
+        extra_info['regression_stds'] = norm_stats.get('regression_stds', {})
+    
+    # Try task_mapping.tsv
+    task_mapping_path = model_dir / 'task_mapping.tsv'
+    if task_mapping_path.exists():
+        df = pd.read_csv(task_mapping_path, sep='\t')
+        if 'task_name' in df.columns and 'task_type' in df.columns:
+            for _, row in df.iterrows():
+                if row['task_type'] == 'regression' and row['task_name'] not in regression_tasks:
+                    regression_tasks.append(row['task_name'])
+                elif row['task_type'] == 'classification' and row['task_name'] not in classification_tasks:
+                    classification_tasks.append(row['task_name'])
+    
+    # Try data_config.json
+    data_config_path = model_dir / 'data_cache' / 'data_config.json'
+    if data_config_path.exists():
+        with open(data_config_path, 'r') as f:
+            data_config = json.load(f)
+        if 'regression_tasks' in data_config and not regression_tasks:
+            regression_tasks = data_config['regression_tasks']
+        if 'classification_tasks' in data_config and not classification_tasks:
+            classification_tasks = data_config['classification_tasks']
+    
+    return regression_tasks, classification_tasks, extra_info
+
+
+def detect_num_targets_from_checkpoint(state_dict: Dict, task_type: str = 'regression') -> Optional[int]:
+    """
+    Detect number of targets from checkpoint state dict.
+    
+    Args:
+        state_dict: Model state dictionary
+        task_type: 'regression' or 'classification'
+    
+    Returns:
+        Number of targets, or None if not detected
+    """
+    # Try different patterns for regression head weights
+    patterns = [
+        f'head_blocks.{task_type}.0.network.4.weight',  # Standard pattern
+        f'head_blocks.{task_type}.0.network.3.weight',    # Alternative with fewer layers
+    ]
+    
+    for pattern in patterns:
+        if pattern in state_dict:
+            return state_dict[pattern].shape[0]
+    
+    # Fallback: search for any weight matching the pattern
+    for key in state_dict.keys():
+        if f'head_blocks.{task_type}' in key and key.endswith('.weight'):
+            # Get the first dimension
+            num_targets = state_dict[key].shape[0]
+            # Verify it's reasonable (not too large)
+            if num_targets < 1000:
+                return num_targets
+    
+    return None
 
 
 def load_model_and_data(args):
@@ -115,11 +258,30 @@ def load_model_and_data(args):
         data_dict: Dictionary with genotype data for each variant type
         sample_ids: List of sample IDs (filtered if samples_set is provided)
         snp_ids: Dictionary with variant IDs for each type
-        regression_task_names: List of regression task names
+        task_info: Dictionary with task information
+        is_multi_branch: Boolean indicating if model is multi-branch
     """
     print("=" * 80)
     print("AQUILA: Integrated Gradients")
     print("=" * 80)
+
+    # Handle --model-dir option
+    if args.model_dir:
+        print(f"\nResolving paths from model directory: {args.model_dir}")
+        config_path, checkpoint_path = resolve_model_dir(args)
+        args.config = config_path
+        args.checkpoint = checkpoint_path
+        model_dir = Path(args.model_dir)
+        
+        # Load task names from model directory
+        regression_tasks, classification_tasks, extra_info = load_task_names_from_model_dir(model_dir)
+        print(f"Loaded {len(regression_tasks)} regression tasks from model directory")
+        print(f"Loaded {len(classification_tasks)} classification tasks from model directory")
+    else:
+        regression_tasks = []
+        classification_tasks = []
+        extra_info = {}
+        model_dir = None
 
     # Load configuration
     print(f"\nLoading configuration from: {args.config}")
@@ -141,22 +303,9 @@ def load_model_and_data(args):
     # Load genotype data
     print(f"\nLoading genotype data from: {args.vcf}")
 
-    # For multi-branch, we need to load SNP, INDEL, SV separately
-    # The VCF file should contain all variant types
-    # We'll use the encoding function which handles the splitting
-
-    # First, load full genotype data to understand structure
-    from aquila.data_utils import create_data_loaders
-
-    # Create a dummy data loader to get the processed data
-    # We only need to load the data, not create full loaders
-    # So we'll directly use the encoding function
-
     # Load genotype data based on encoding
     if encoding_type == 'diploid_onehot':
-        # For diploid_onehot, we need to parse differently based on variant_type
         if is_multi_branch:
-            # Multi-branch: load separate files or single file with variant type annotation
             data_config = config.get('data', {})
 
             # Use command line VCF if provided, otherwise read from config
@@ -169,7 +318,6 @@ def load_model_and_data(args):
                 else:
                     raise ValueError("No VCF file specified. Please provide --vcf or set geno_file in config.")
 
-            # Load multi-branch data using parse_genotype_file (supports .vcf.gz)
             print(f"Loading multi-branch genotype data from: {geno_file}")
             result = parse_genotype_file(geno_file, encoding_type='diploid_onehot', variant_type=variant_type)
 
@@ -232,10 +380,11 @@ def load_model_and_data(args):
         
         print(f"  Found {len(target_indices)} matching samples out of {len(target_samples)} requested")
         
-        # Filter data
+        # Filter data - ensure correct indexing
         filtered_sample_ids = [sample_ids[i] for i in target_indices]
         filtered_data_dict = {}
         for vtype, data in data_dict.items():
+            # Data shape should be (n_samples, seq_len, 8)
             filtered_data_dict[vtype] = data[target_indices]
         
         data_dict = filtered_data_dict
@@ -253,60 +402,67 @@ def load_model_and_data(args):
 
     print(f"\nSequence lengths: {seq_length}")
 
-    # Load normalization stats if available (for task names)
-    output_dir = Path(config.get('output_dir', './outputs'))
-    norm_stats_path = output_dir / 'normalization_stats.pkl'
-
-    regression_task_names = []
-    if norm_stats_path.exists():
-        import pickle
-        with open(norm_stats_path, 'rb') as f:
-            norm_stats = pickle.load(f)
-        regression_task_names = norm_stats.get('regression_tasks', [])
-        print(f"\nRegression tasks: {regression_task_names}")
-
-    # Load checkpoint first to get model dimensions
+    # Load checkpoint
     print(f"\nLoading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
 
-    # Extract num_targets from checkpoint if available
-    checkpoint_num_targets = None
+    # Extract state dict
     if 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
     else:
         state_dict = checkpoint
 
-    # Try to find regression head weights to determine num_targets
-    for key in state_dict.keys():
-        if 'head_blocks.regression' in key and '.network.4.weight' in key:
-            checkpoint_num_targets = state_dict[key].shape[0]
-            print(f"Detected {checkpoint_num_targets} regression targets from checkpoint")
-            break
+    # Detect task type
+    if args.task_type:
+        task_type = args.task_type
+    else:
+        # Auto-detect from checkpoint
+        regression_detected = detect_num_targets_from_checkpoint(state_dict, 'regression')
+        classification_detected = detect_num_targets_from_checkpoint(state_dict, 'classification')
+        
+        if classification_detected and classification_detected > 0:
+            task_type = 'classification'
+        else:
+            task_type = 'regression'
+    
+    print(f"Task type: {task_type}")
 
-    # Update config if checkpoint has different number of targets
-    if checkpoint_num_targets and checkpoint_num_targets != len(regression_task_names):
-        print(f"Updating regression tasks from {len(regression_task_names)} to {checkpoint_num_targets}")
-        # Create dummy task names if not available
-        if not regression_task_names:
-            regression_task_names = [f"task_{i}" for i in range(checkpoint_num_targets)]
-        # Update config for model creation
+    # Detect number of targets
+    num_targets = detect_num_targets_from_checkpoint(state_dict, task_type)
+    print(f"Detected {num_targets} {task_type} targets from checkpoint")
+
+    # Update task lists if needed
+    if task_type == 'regression':
+        if not regression_tasks and num_targets:
+            regression_tasks = [f"task_{i}" for i in range(num_targets)]
+        # Update config
         model_config = config.get('model', {})
         if 'heads' in model_config and 'regression' in model_config['heads']:
             for block in model_config['heads']['regression']:
                 if isinstance(block, dict) and block.get('name') == 'regression_head':
-                    block['num_targets'] = checkpoint_num_targets
+                    if num_targets:
+                        block['num_targets'] = num_targets
+        task_names = regression_tasks
+    else:  # classification
+        if not classification_tasks and num_targets:
+            classification_tasks = [f"task_{i}" for i in range(num_targets)]
+        task_names = classification_tasks
 
     # Determine which task(s) to compute IG for
     if args.task:
-        task_indices = [regression_task_names.index(args.task)] if args.task in regression_task_names else [0]
-    elif regression_task_names:
-        task_indices = list(range(len(regression_task_names)))
+        if args.task in task_names:
+            task_indices = [task_names.index(args.task)]
+        else:
+            raise ValueError(f"Task '{args.task}' not found in available tasks: {task_names}")
     else:
+        task_indices = list(range(len(task_names)))
+
+    if not task_names:
+        task_names = [f'{task_type}_task_0']
         task_indices = [0]
-        regression_task_names = ['regression_task_0']
 
     num_tasks = len(task_indices)
-    print(f"\nComputing IG for {num_tasks} task(s): {[regression_task_names[i] for i in task_indices]}")
+    print(f"\nComputing IG for {num_tasks} task(s): {[task_names[i] for i in task_indices]}")
 
     # Create model
     print("\n" + "=" * 80)
@@ -316,15 +472,9 @@ def load_model_and_data(args):
     model = create_model_from_config(
         config=config,
         seq_length=seq_length,
-        regression_tasks=regression_task_names,
-        classification_tasks=None
+        regression_tasks=regression_tasks,
+        classification_tasks=classification_tasks
     )
-
-    # Handle both DDP and non-DDP checkpoints
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    else:
-        state_dict = checkpoint
 
     # Remove 'module.' prefix if present (from DDP)
     new_state_dict = {}
@@ -341,7 +491,17 @@ def load_model_and_data(args):
 
     print("Model loaded successfully")
 
-    return model, data_dict, sample_ids, snp_ids, task_indices, regression_task_names, is_multi_branch
+    # Package task info
+    task_info = {
+        'task_type': task_type,
+        'task_names': task_names,
+        'task_indices': task_indices,
+        'num_targets': num_targets,
+        'regression_tasks': regression_tasks,
+        'classification_tasks': classification_tasks,
+    }
+
+    return model, data_dict, sample_ids, snp_ids, task_info, is_multi_branch
 
 
 class IntegratedGradients:
@@ -391,8 +551,7 @@ class IntegratedGradients:
         for vtype, input_tensor in input_dict.items():
             baseline_dict[vtype] = torch.zeros_like(input_tensor)
 
-        # Compute integrated gradients using Riemann sum approximation
-        # alpha from 0 to 1
+        # Compute integrated gradients using trapezoidal rule
         alphas = torch.linspace(0, 1, self.num_steps, device=self.device)
 
         # Store gradients at each step
@@ -401,7 +560,7 @@ class IntegratedGradients:
             accumulated_grads[vtype] = torch.zeros_like(input_dict[vtype], device=self.device)
 
         # Compute gradients at each interpolated point
-        for alpha in alphas:
+        for step_idx, alpha in enumerate(alphas):
             # Create interpolated input
             interpolated_dict = {}
             for vtype, input_tensor in input_dict.items():
@@ -410,11 +569,9 @@ class IntegratedGradients:
                 interpolated_dict[vtype] = interpolated_input
 
             # Forward pass
-            # For multi-branch models, pass dict; for single-branch, pass first tensor
             if self.is_multi_branch:
                 outputs = self.model(interpolated_dict)
             else:
-                # Single-branch model: get the first (and only) variant type
                 first_vtype = list(interpolated_dict.keys())[0]
                 outputs = self.model(interpolated_dict[first_vtype])
 
@@ -428,43 +585,116 @@ class IntegratedGradients:
             self.model.zero_grad()
             target.backward()
 
-            # Accumulate gradients (weighted by alpha step)
+            # Accumulate gradients with trapezoidal weights
             for vtype in input_dict.keys():
                 if interpolated_dict[vtype].grad is not None:
-                    # Use trapezoidal rule for better approximation
-                    if alpha == alphas[0] or alpha == alphas[-1]:
+                    # Trapezoidal rule: endpoints have weight 0.5, interior points have weight 1.0
+                    if step_idx == 0 or step_idx == len(alphas) - 1:
                         weight = 0.5
                     else:
                         weight = 1.0
-
-                    # Keep on device for accumulation, convert to CPU at the end
                     accumulated_grads[vtype] += weight * interpolated_dict[vtype].grad
 
-        # Multiply by (input - baseline)
+        # Final IG computation
+        # IG = sum(gradients) * step_size * (input - baseline)
+        # For trapezoidal: step_size = 1 / (num_steps - 1)
+        step_size = 1.0 / (self.num_steps - 1)
+        
         final_ig = {}
         for vtype in input_dict.keys():
-            # Integrated gradients = sum(gradients) * (input - baseline) / num_steps
-            # Actually for trapezoidal: sum(gradients) * step_size where step_size = 1/num_steps
-            step_size = 1.0 / self.num_steps
-            final_ig[vtype] = accumulated_grads[vtype].cpu().numpy() * step_size
-
-            # Also multiply by (input - baseline) for full IG formula
-            # But since baseline=0, this is just the input
-            # Actually the formula is: IG = (input - baseline) * integral
-            # Since baseline=0: IG = input * integral
-            final_ig[vtype] = final_ig[vtype] * input_dict[vtype].cpu().numpy()
+            # Apply step size
+            ig = accumulated_grads[vtype].cpu().numpy() * step_size
+            
+            # Multiply by (input - baseline) for full IG formula
+            # Since baseline=0, this is just input
+            input_np = input_dict[vtype].cpu().numpy()
+            final_ig[vtype] = ig * input_np
 
         return final_ig
 
 
-def compute_ig_for_all_samples_all_tasks(model, data_dict, sample_ids, snp_ids,
-                                         task_indices, regression_task_names,
-                                         is_multi_branch, args):
+def compute_ig_streaming(model, data_dict, sample_ids, snp_ids,
+                         task_info, is_multi_branch, args):
     """
-    Compute integrated gradients for all samples and all tasks.
+    Compute and save integrated gradients in streaming mode (one sample at a time).
+    """
+    print("\n" + "=" * 80)
+    print("Computing Integrated Gradients (Streaming Mode)")
+    print("=" * 80)
 
-    Returns:
-        Dictionary with IG results for each sample and task
+    ig_computer = IntegratedGradients(model, args.device, args.num_steps, is_multi_branch)
+
+    task_type = task_info['task_type']
+    task_names = task_info['task_names']
+    task_indices = task_info['task_indices']
+
+    num_samples = len(sample_ids)
+    num_tasks = len(task_indices)
+    
+    print(f"Processing {num_samples} samples x {num_tasks} tasks = {num_samples * num_tasks} computations...")
+
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    h5_path = output_dir / 'ig_results.h5'
+
+    with h5py.File(h5_path, 'w') as f:
+        # Save metadata
+        f.attrs['num_samples'] = num_samples
+        f.attrs['num_tasks'] = num_tasks
+        f.attrs['num_steps'] = args.num_steps
+        f.attrs['task_type'] = task_type
+        
+        # Save sample IDs
+        f.create_dataset('sample_ids', data=np.array(sample_ids, dtype='S'))
+        
+        # Save task names
+        task_names_bytes = [t.encode('utf-8') for t in task_names]
+        f.create_dataset('task_names', data=np.array(task_names_bytes, dtype='S'))
+        
+        # Save variant IDs
+        for vtype, variant_ids in snp_ids.items():
+            variant_ids_bytes = [v.encode('utf-8') for v in variant_ids]
+            f.create_dataset(f'variant_ids/{vtype}', data=np.array(variant_ids_bytes, dtype='S'))
+
+        # Process each sample
+        for sample_idx in range(num_samples):
+            if sample_idx % 10 == 0:
+                print(f"  Processing sample {sample_idx + 1}/{num_samples}...")
+
+            sample_id = sample_ids[sample_idx]
+
+            # Prepare input for this sample
+            input_dict = {}
+            for vtype, data in data_dict.items():
+                sample_data = data[sample_idx]
+                input_tensor = torch.from_numpy(sample_data).unsqueeze(0).to(args.device)
+                input_dict[vtype] = input_tensor
+
+            # Compute IG for each task
+            for task_idx in task_indices:
+                ig_scores = ig_computer.compute_ig_single_sample_single_task(
+                    input_dict,
+                    task_idx=task_idx,
+                    target_type=task_type
+                )
+                task_name = task_names[task_idx]
+                
+                # Save immediately to HDF5
+                sample_group = f'sample_{sample_idx}'
+                task_group = f'{sample_group}/{task_name}'
+                
+                for vtype, scores in ig_scores.items():
+                    scores_2d = scores[0]  # (1, seq_len, 8) -> (seq_len, 8)
+                    f.create_dataset(f'{task_group}/{vtype}', data=scores_2d)
+
+    print(f"  Saved: {h5_path}")
+    return h5_path
+
+
+def compute_ig_in_memory(model, data_dict, sample_ids, snp_ids,
+                        task_info, is_multi_branch, args):
+    """
+    Compute integrated gradients and keep all results in memory.
     """
     print("\n" + "=" * 80)
     print("Computing Integrated Gradients")
@@ -472,13 +702,15 @@ def compute_ig_for_all_samples_all_tasks(model, data_dict, sample_ids, snp_ids,
 
     ig_computer = IntegratedGradients(model, args.device, args.num_steps, is_multi_branch)
 
+    task_type = task_info['task_type']
+    task_names = task_info['task_names']
+    task_indices = task_info['task_indices']
+
     num_samples = len(sample_ids)
     num_tasks = len(task_indices)
     
     print(f"Processing {num_samples} samples x {num_tasks} tasks = {num_samples * num_tasks} computations...")
 
-    # Store results: results[sample_idx][task_idx] = {vtype: ig_scores}
-    # ig_scores shape: (1, seq_len, 8)
     all_results = {}
 
     for sample_idx in range(num_samples):
@@ -490,7 +722,6 @@ def compute_ig_for_all_samples_all_tasks(model, data_dict, sample_ids, snp_ids,
         # Prepare input for this sample
         input_dict = {}
         for vtype, data in data_dict.items():
-            # Get sample data: shape (seq_len, 8) -> add batch dim -> (1, seq_len, 8)
             sample_data = data[sample_idx]
             input_tensor = torch.from_numpy(sample_data).unsqueeze(0).to(args.device)
             input_dict[vtype] = input_tensor
@@ -501,9 +732,9 @@ def compute_ig_for_all_samples_all_tasks(model, data_dict, sample_ids, snp_ids,
             ig_scores = ig_computer.compute_ig_single_sample_single_task(
                 input_dict,
                 task_idx=task_idx,
-                target_type='regression'
+                target_type=task_type
             )
-            task_name = regression_task_names[task_idx]
+            task_name = task_names[task_idx]
             sample_results[task_name] = ig_scores
 
         all_results[sample_id] = sample_results
@@ -511,11 +742,9 @@ def compute_ig_for_all_samples_all_tasks(model, data_dict, sample_ids, snp_ids,
     return all_results
 
 
-def save_results_h5(results, sample_ids, snp_ids, regression_task_names, args, output_dir):
+def save_results_h5(results, sample_ids, snp_ids, task_info, args, output_dir):
     """
     Save integrated gradients results to HDF5 file.
-    
-    Saves 8-dimensional IG scores (not aggregated).
     """
     print("\n" + "=" * 80)
     print("Saving Results to HDF5")
@@ -526,30 +755,29 @@ def save_results_h5(results, sample_ids, snp_ids, regression_task_names, args, o
 
     h5_path = output_dir / 'ig_results.h5'
 
-    # Determine total number of variants per vtype
-    # Assuming all tasks have the same variant structure
-    first_sample = list(results.keys())[0]
-    first_task = list(results[first_sample].keys())[0]
-    
+    task_type = task_info['task_type']
+    task_names = task_info['task_names']
+
     with h5py.File(h5_path, 'w') as f:
-        # Create groups for metadata
+        # Save metadata
         f.attrs['num_samples'] = len(sample_ids)
-        f.attrs['num_tasks'] = len(regression_task_names)
+        f.attrs['num_tasks'] = len(task_names)
         f.attrs['num_steps'] = args.num_steps
+        f.attrs['task_type'] = task_type
         
         # Save sample IDs
         f.create_dataset('sample_ids', data=np.array(sample_ids, dtype='S'))
         
         # Save task names
-        task_names_bytes = [t.encode('utf-8') for t in regression_task_names]
+        task_names_bytes = [t.encode('utf-8') for t in task_names]
         f.create_dataset('task_names', data=np.array(task_names_bytes, dtype='S'))
         
-        # Save variant IDs for each vtype
+        # Save variant IDs
         for vtype, variant_ids in snp_ids.items():
             variant_ids_bytes = [v.encode('utf-8') for v in variant_ids]
             f.create_dataset(f'variant_ids/{vtype}', data=np.array(variant_ids_bytes, dtype='S'))
         
-        # Save IG scores for each sample and task
+        # Save IG scores
         print("\nSaving IG scores...")
         for sample_idx, sample_id in enumerate(sample_ids):
             if sample_idx % 50 == 0:
@@ -557,27 +785,25 @@ def save_results_h5(results, sample_ids, snp_ids, regression_task_names, args, o
             
             sample_results = results[sample_id]
             
-            for task_name in regression_task_names:
+            for task_name in task_names:
                 ig_scores = sample_results[task_name]
                 
-                # Create group path: /sample_{idx}/task_{name}
                 sample_group = f'sample_{sample_idx}'
                 task_group = f'{sample_group}/{task_name}'
                 
-                # Save each variant type
                 for vtype, scores in ig_scores.items():
-                    # scores shape: (1, seq_len, 8) -> (seq_len, 8)
                     scores_2d = scores[0]
                     f.create_dataset(f'{task_group}/{vtype}', data=scores_2d)
 
     print(f"  Saved: {h5_path}")
 
-    # Also save a summary JSON
+    # Save summary JSON
     summary = {
         'num_samples': len(sample_ids),
         'sample_ids': sample_ids,
-        'num_tasks': len(regression_task_names),
-        'task_names': regression_task_names,
+        'num_tasks': len(task_names),
+        'task_names': task_names,
+        'task_type': task_type,
         'variant_types': list(snp_ids.keys()),
         'num_variants': {vtype: len(ids) for vtype, ids in snp_ids.items()},
         'num_steps': args.num_steps,
@@ -597,17 +823,41 @@ def main():
     args = parse_args()
 
     # Load model and data
-    model, data_dict, sample_ids, snp_ids, task_indices, regression_task_names, is_multi_branch = load_model_and_data(args)
+    model, data_dict, sample_ids, snp_ids, task_info, is_multi_branch = load_model_and_data(args)
 
-    # Compute IG for all samples and all tasks
-    results = compute_ig_for_all_samples_all_tasks(
-        model, data_dict, sample_ids, snp_ids,
-        task_indices, regression_task_names,
-        is_multi_branch, args
-    )
+    # Choose compute method based on streaming flag
+    if args.streaming:
+        h5_path = compute_ig_streaming(
+            model, data_dict, sample_ids, snp_ids,
+            task_info, is_multi_branch, args
+        )
+        
+        # Save summary for streaming mode
+        output_dir = Path(args.output)
+        summary = {
+            'num_samples': len(sample_ids),
+            'sample_ids': sample_ids,
+            'num_tasks': len(task_info['task_names']),
+            'task_names': task_info['task_names'],
+            'task_type': task_info['task_type'],
+            'variant_types': list(snp_ids.keys()),
+            'num_variants': {vtype: len(ids) for vtype, ids in snp_ids.items()},
+            'num_steps': args.num_steps,
+        }
+        summary_output = output_dir / 'ig_summary.json'
+        with open(summary_output, 'w') as f:
+            json.dump(summary, f, indent=2)
+        print(f"  Saved: {summary_output}")
+        print(f"\nAll results saved to: {output_dir}")
+    else:
+        # Compute in memory
+        results = compute_ig_in_memory(
+            model, data_dict, sample_ids, snp_ids,
+            task_info, is_multi_branch, args
+        )
 
-    # Save results to HDF5
-    save_results_h5(results, sample_ids, snp_ids, regression_task_names, args, args.output)
+        # Save results to HDF5
+        save_results_h5(results, sample_ids, snp_ids, task_info, args, args.output)
 
     print("\n" + "=" * 80)
     print("Integrated Gradients Computation Complete!")
