@@ -10,9 +10,9 @@ import re
 import glob
 
 # Paths
-TEMPLATE_FILE = "/home/gulei/projects/Aquila-GS/benchmark/aquila/params/705rice_conv_mha.aquila-vars.hpo.yaml"
-PHENOTYPES_DIR = "/home/gulei/projects/Aquila-GS/benchmark/aquila/phenotypes"
-OUTPUT_DIR = "/home/gulei/projects/Aquila-GS/benchmark/aquila/params"
+TEMPLATE_FILE = "/data4/gulei/projects/Aquila-GS/benchmark/aquila/params/1171rice_conv_mha.aquila-snp.hpo.yaml"
+PHENOTYPES_DIR = "/data4/gulei/projects/Aquila-GS/benchmark/aquila/1171rice_phenotype_split"
+OUTPUT_DIR = "/data4/gulei/projects/Aquila-GS/benchmark/aquila/params"
 
 # Extract template filename prefix (e.g., "705rice_conv_mha.aquila-vars" from "705rice_conv_mha.aquila-vars.hpo.yaml")
 template_basename = os.path.basename(TEMPLATE_FILE)
