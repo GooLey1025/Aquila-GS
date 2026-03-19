@@ -939,7 +939,17 @@ class VarTrainer:
                 best_metrics_to_save = metrics_with_names
 
             with open(best_metrics_path, 'w') as f:
-                json.dump(best_metrics_to_save, f, indent=2)
+                # Convert numpy types to Python floats for JSON serialization
+                def convert_to_python(obj):
+                    if isinstance(obj, dict):
+                        return {k: convert_to_python(v) for k, v in obj.items()}
+                    elif isinstance(obj, (list, tuple)):
+                        return [convert_to_python(x) for x in obj]
+                    elif hasattr(obj, 'item'):  # numpy scalar
+                        return obj.item()
+                    else:
+                        return obj
+                json.dump(convert_to_python(best_metrics_to_save), f, indent=2)
 
             # Generate best_metrics_per_phenotype.tsv for easy viewing
             if self.regression_task_names and len(self.regression_task_names) > 0:

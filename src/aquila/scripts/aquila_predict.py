@@ -6,14 +6,15 @@ Make predictions using a trained model with VCF input.
 Supports both single-branch and multi-branch architectures.
 
 Usage:
+    python aquila_predict.py --model-dir path/to/model_dir \
+                            --vcf path/to/test.vcf \
+                            --output predictions.tsv
+
+    # Or with direct paths:
     python aquila_predict.py --checkpoint path/to/best_checkpoint.pt \
                             --config path/to/params.yaml \
                             --vcf path/to/test.vcf \
                             --output predictions.tsv
-
-    # Or with output directory (auto-finds checkpoint and config):
-    python aquila_predict.py --output-dir ./outputs/run_name \
-                            --vcf path/to/test.vcf
 """
 
 import argparse
@@ -37,7 +38,15 @@ def parse_args():
         description='Make predictions with Aquila VCF model'
     )
 
-    # Option 1: Direct paths to checkpoint and config
+    # Option 1: Model directory (auto-finds checkpoint, config, and normalization stats)
+    parser.add_argument(
+        '--model-dir',
+        type=str,
+        default=None,
+        help='Model directory containing checkpoint, params.yaml, and normalization_stats.pkl'
+    )
+
+    # Option 2: Direct paths to checkpoint and config
     parser.add_argument(
         '--checkpoint',
         type=str,
@@ -52,12 +61,12 @@ def parse_args():
         help='Path to configuration YAML file (params.yaml)'
     )
 
-    # Option 2: Output directory (auto-finds checkpoint and config)
+    # Option 3: Output directory (deprecated, kept for backwards compatibility)
     parser.add_argument(
         '--output-dir',
         type=str,
         default=None,
-        help='Output directory containing checkpoint and config (alternative to --checkpoint and --config)'
+        help='[Deprecated] Use --model-dir instead'
     )
 
     # Input data
@@ -136,31 +145,86 @@ def find_file_in_dir(directory: Path, filename_pattern: str) -> Optional[Path]:
 def load_model_and_config(args) -> Tuple[dict, Path, Path]:
     """
     Load model checkpoint and config based on args.
-    
+
     Returns:
         config: Configuration dictionary
         checkpoint_path: Path to checkpoint
         norm_stats_path: Path to normalization stats
+        output_dir: Base directory (model_dir or output_dir)
     """
+    model_dir = None
     output_dir = None
     checkpoint_path = None
     config_path = None
     norm_stats_path = None
-    
-    if args.output_dir:
+
+    # Model directory takes priority
+    if args.model_dir:
+        model_dir = Path(args.model_dir)
+
+        # If model_dir doesn't exist, try finding it relative to current working directory
+        if not model_dir.exists():
+            cwd_model_dir = Path.cwd() / model_dir
+            if cwd_model_dir.exists():
+                model_dir = cwd_model_dir
+                print(f"\nNote: Resolved model_dir relative to cwd: {model_dir}")
+
+        # Find checkpoint in model_dir root (for when model_dir is a trial directory)
+        checkpoint_path = find_file_in_dir(model_dir / 'checkpoints', 'best_checkpoint.pt')
+        if not checkpoint_path:
+            checkpoint_path = find_file_in_dir(model_dir / 'checkpoints', '*.pt')
+
+        # Find config in model_dir root
+        config_path = find_file_in_dir(model_dir, 'params.yaml')
+
+        # Find normalization stats in model_dir root
+        norm_stats_path = find_file_in_dir(model_dir, 'normalization_stats.pkl')
+
+        # Also check parent directories (for when model_dir is a trial directory)
+        # Check if parent has checkpoints (e.g., model_dir=705rice_conv_mha.../trial_0)
+        if not checkpoint_path:
+            parent_checkpoint = find_file_in_dir(model_dir.parent / 'checkpoints', 'best_checkpoint.pt')
+            if not parent_checkpoint:
+                parent_checkpoint = find_file_in_dir(model_dir.parent / 'checkpoints', '*.pt')
+            if parent_checkpoint:
+                checkpoint_path = parent_checkpoint
+
+        # Also check trial subdirectories (e.g., model_dir=705rice_conv_mha...)
+        if not checkpoint_path or not config_path:
+            for trial_dir in sorted(model_dir.glob('trial_*')):
+                if trial_dir.is_dir():
+                    if not checkpoint_path:
+                        cp = find_file_in_dir(trial_dir / 'checkpoints', 'best_checkpoint.pt')
+                        if cp:
+                            checkpoint_path = cp
+                    if not config_path:
+                        cfg = find_file_in_dir(trial_dir, 'params.yaml')
+                        if cfg:
+                            config_path = cfg
+                    if not norm_stats_path:
+                        ns = find_file_in_dir(trial_dir, 'normalization_stats.pkl')
+                        if ns:
+                            norm_stats_path = ns
+                    if checkpoint_path and config_path:
+                        break
+
+        output_dir = model_dir
+
+    # Fallback to output-dir (backwards compatibility)
+    elif args.output_dir:
         output_dir = Path(args.output_dir)
-        
+
         # Find checkpoint (try various patterns)
         checkpoint_path = find_file_in_dir(output_dir / 'checkpoints', 'best_checkpoint.pt')
         if not checkpoint_path:
             checkpoint_path = find_file_in_dir(output_dir / 'checkpoints', '*.pt')
-        
+
         # Find config
         config_path = find_file_in_dir(output_dir, 'params.yaml')
-        
+
         # Find normalization stats
         norm_stats_path = find_file_in_dir(output_dir, 'normalization_stats.pkl')
-    
+
     # Override with explicit args if provided
     if args.checkpoint:
         checkpoint_path = Path(args.checkpoint)
@@ -168,16 +232,18 @@ def load_model_and_config(args) -> Tuple[dict, Path, Path]:
         config_path = Path(args.config)
     if args.normalization_stats:
         norm_stats_path = Path(args.normalization_stats)
-    
+
     # Validation
     if not checkpoint_path:
-        raise ValueError("Checkpoint not found. Provide --checkpoint or --output-dir with checkpoint.")
+        raise ValueError("Checkpoint not found. Provide --model-dir (with checkpoint in checkpoints/ or trial_*/checkpoints/), "
+                        "--output-dir with checkpoint, or --checkpoint.")
     if not config_path:
-        raise ValueError("Config not found. Provide --config or --output-dir with params.yaml.")
-    
+        raise ValueError("Config not found. Provide --model-dir (with params.yaml in root or trial_*/), "
+                        "--output-dir with params.yaml, or --config.")
+
     # Load config
     config = load_config(str(config_path))
-    
+
     return config, checkpoint_path, norm_stats_path, output_dir
 
 
@@ -505,9 +571,8 @@ def main():
             for vtype, length in seq_length.items():
                 dummy_input[vtype] = torch.randn(1, length, 8, device=device)
         else:
-            # Single branch
-            vtype = list(seq_length.keys())[0]
-            length = seq_length[vtype]
+            # Single branch: seq_length is an integer
+            length = seq_length if isinstance(seq_length, int) else seq_length.get('snp', seq_length)
             dummy_input = torch.randn(1, length, 8, device=device)
         
         # Run dummy forward pass to initialize dynamic layers

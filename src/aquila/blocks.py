@@ -2932,20 +2932,21 @@ def mlp_block(in_features=None, hidden_features=None, out_features=None, num_lay
 # Pooling Blocks
 ############################################################
 
-def global_pool(pool_type='mean', d_model=None, pool_axis=1, **kwargs):
+def global_pool(pool_type='mean', d_model=None, pool_axis=1, dropout=0.1, **kwargs):
     """Global pooling block.
 
     Args:
         pool_type: Pooling type ('mean', 'max', 'attention')
         d_model: Model dimension (required for attention pooling)
         pool_axis: Pooling axis - 1 for sequence dimension (default), 2 for feature dimension
+        dropout: Dropout rate (default 0.1)
 
     Returns:
         GlobalPooling module
     """
     if pool_type == 'attention' and d_model is None:
         raise ValueError("d_model required for attention pooling")
-    return layers.GlobalPooling(d_model=d_model or 128, pool_type=pool_type, pool_axis=pool_axis)
+    return layers.GlobalPooling(d_model=d_model or 128, pool_type=pool_type, pool_axis=pool_axis, dropout=dropout)
 
 
 def multi_head_pool(d_model, num_heads=4, dropout=0.1, pool_axis=1, **kwargs):

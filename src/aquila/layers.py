@@ -423,10 +423,11 @@ class FeedForward(nn.Module):
 class GlobalPooling(nn.Module):
     """Global pooling layer to aggregate sequence information."""
 
-    def __init__(self, d_model, pool_type='mean', pool_axis=1):
+    def __init__(self, d_model, pool_type='mean', pool_axis=1, dropout=0.1):
         super().__init__()
         self.pool_type = pool_type
         self.pool_axis = pool_axis
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
         if pool_type == 'attention':
             if pool_axis == 1:
                 # Pool over sequence dimension: attention over seq_len
@@ -451,15 +452,17 @@ class GlobalPooling(nn.Module):
                 if mask is not None:
                     mask_expanded = mask.unsqueeze(-1).float()
                     x_masked = x * mask_expanded
-                    return x_masked.sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
-                return x.mean(dim=1)
+                    pooled = x_masked.sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+                else:
+                    pooled = x.mean(dim=1)
 
             elif self.pool_type == 'max':
                 if mask is not None:
                     x_masked = x.masked_fill(
                         ~mask.unsqueeze(-1), float('-inf'))
-                    return x_masked.max(dim=1)[0]
-                return x.max(dim=1)[0]
+                    pooled = x_masked.max(dim=1)[0]
+                else:
+                    pooled = x.max(dim=1)[0]
 
             elif self.pool_type == 'attention':
                 # Attention-based pooling over sequence dimension
@@ -469,7 +472,7 @@ class GlobalPooling(nn.Module):
                     attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
                 attn_weights = F.softmax(
                     attn_logits, dim=1).unsqueeze(-1)  # (batch, seq_len, 1)
-                return (x * attn_weights).sum(dim=1)
+                pooled = (x * attn_weights).sum(dim=1)
 
             else:
                 raise ValueError(f"Unknown pool_type: {self.pool_type}")
@@ -477,10 +480,10 @@ class GlobalPooling(nn.Module):
         elif self.pool_axis == 2:
             # Pool over feature dimension
             if self.pool_type == 'mean':
-                return x.mean(dim=2)  # (batch, seq_len)
+                pooled = x.mean(dim=2)  # (batch, seq_len)
 
             elif self.pool_type == 'max':
-                return x.max(dim=2)[0]  # (batch, seq_len)
+                pooled = x.max(dim=2)[0]  # (batch, seq_len)
 
             elif self.pool_type == 'attention':
                 # Attention-based pooling over feature dimension
@@ -493,7 +496,7 @@ class GlobalPooling(nn.Module):
                 # (batch, seq_len, d_model)
                 attn_weights = F.softmax(attn_logits, dim=2)
                 # Weighted sum over feature dimension
-                return (x * attn_weights).sum(dim=2)  # (batch, seq_len)
+                pooled = (x * attn_weights).sum(dim=2)  # (batch, seq_len)
 
             else:
                 raise ValueError(f"Unknown pool_type: {self.pool_type}")
@@ -501,6 +504,8 @@ class GlobalPooling(nn.Module):
         else:
             raise ValueError(
                 f"pool_axis must be 1 (sequence) or 2 (feature), got {self.pool_axis}")
+
+        return self.dropout(pooled)
 
 
 class MultiHeadPooling(nn.Module):
