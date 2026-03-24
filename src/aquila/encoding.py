@@ -4,6 +4,7 @@ Genotype encoding strategies for genomic data.
 This module provides different encoding schemes for SNP genotype data:
 - Additive encoding: Maps genotypes to discrete tokens {0,1,2,3} for embedding
 - Diploid one-hot encoding: Maps genotypes to 8-dimensional one-hot vectors
+- Classic one-hot (onehot): Biallelic SNP as 3-class {REF/REF, het, ALT/ALT}
 """
 
 import pandas as pd
@@ -405,6 +406,139 @@ def parse_genotype_snp_vcf(vcf_path: str) -> Tuple[np.ndarray, List[str], List[s
     return result['SNP']
 
 
+def _gt_to_classic_snp_onehot(
+    gt_field: str, format_field: str, ref: str, alt: str
+) -> np.ndarray:
+    """
+    Map VCF GT to classic 3-way one-hot for a biallelic SNP.
+
+    - REF/REF (0/0): [1, 0, 0]
+    - Heterozygous (0/1 or 1/0): [0, 1, 0]
+    - ALT/ALT (1/1): [0, 0, 1]
+    - Missing or non-biallelic: [0, 0, 0]
+
+    Only sites with single-nucleotide REF and ALT (no comma in ALT) and
+    allele indices in {0, 1} are encoded; otherwise returns zeros.
+    """
+    enc = np.zeros(3, dtype=np.float32)
+    if ',' in alt or len(ref) != 1 or len(alt) != 1:
+        return enc
+
+    gt_idx = format_field.split(':').index('GT') if 'GT' in format_field else 0
+    gt = gt_field.split(':')[gt_idx]
+
+    if '|' in gt:
+        alleles = gt.split('|')
+    elif '/' in gt:
+        alleles = gt.split('/')
+    else:
+        return enc
+
+    if len(alleles) < 2:
+        return enc
+    if alleles[0] == '.' or alleles[1] == '.':
+        return enc
+    try:
+        a1 = int(alleles[0])
+        a2 = int(alleles[1])
+    except ValueError:
+        return enc
+
+    if a1 not in (0, 1) or a2 not in (0, 1):
+        return enc
+
+    if a1 == 0 and a2 == 0:
+        enc[0] = 1.0
+    elif a1 == 1 and a2 == 1:
+        enc[2] = 1.0
+    else:
+        enc[1] = 1.0
+    return enc
+
+
+def parse_genotype_snp_vcf_onehot(vcf_path: str) -> Tuple[np.ndarray, List[str], List[str]]:
+    """
+    Parse VCF file (SNP rows only) with classic 3-dimensional one-hot encoding.
+
+    Same SNP row selection as ``parse_genotype_snp_vcf`` (variant ID contains 'SNP').
+
+    Returns:
+        snp_matrix: (n_samples, n_snps, 3) float32
+        sample_ids: List of sample IDs
+        snp_ids: List of SNP IDs
+    """
+    print(f"Loading VCF file: {vcf_path}")
+    print(f"Filtering for variant types: ['SNP']")
+    print(f"Using encoding: onehot (3-dimensional classic REF/HET/ALT)")
+
+    variants_by_type: dict = {'SNP': []}
+    sample_ids = None
+
+    is_gzipped = vcf_path.endswith('.gz')
+    open_func = gzip.open if is_gzipped else open
+    open_mode = 'rt' if is_gzipped else 'r'
+
+    with open_func(vcf_path, open_mode) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith('#CHROM'):
+                fields = line.split('\t')
+                sample_ids = fields[9:]
+                print(f"Found {len(sample_ids)} samples in VCF")
+                continue
+
+            if line.startswith('#'):
+                continue
+
+            fields = line.split('\t')
+            variant_id = fields[2]
+            ref = fields[3]
+            alt = fields[4]
+            format_field = fields[8]
+            genotypes = fields[9:]
+
+            variant_type = None
+            if 'SNP' in variant_id:
+                variant_type = 'SNP'
+            else:
+                continue
+
+            variant_encodings = []
+            for gt_field in genotypes:
+                variant_encodings.append(
+                    _gt_to_classic_snp_onehot(gt_field, format_field, ref, alt)
+                )
+
+            variants_by_type[variant_type].append({
+                'id': variant_id,
+                'encodings': np.array(variant_encodings),
+            })
+
+    if sample_ids is None:
+        raise ValueError(
+            "No sample IDs found in VCF file. Make sure file has #CHROM header line."
+        )
+
+    variants = variants_by_type['SNP']
+    if len(variants) == 0:
+        raise ValueError("No SNP variants found in VCF file")
+
+    n_variants = len(variants)
+    n_samples = len(sample_ids)
+    matrix = np.zeros((n_samples, n_variants, 3), dtype=np.float32)
+    snp_ids = []
+
+    for i, variant in enumerate(variants):
+        matrix[:, i, :] = variant['encodings']
+        snp_ids.append(variant['id'])
+
+    print(f"  SNP: {n_variants} variants × {n_samples} samples")
+    return matrix, sample_ids, snp_ids
+
+
 def parse_genotype_indel_vcf(vcf_path: str) -> Tuple[np.ndarray, List[str], List[str]]:
     """
     Parse VCF file extracting only INDEL variants.
@@ -465,9 +599,10 @@ def parse_genotype_file(geno_path: str, encoding_type: str = 'token', variant_ty
 
     Args:
         geno_path: Path to genotype file
-        encoding_type: Type of encoding ('token' or 'diploid_onehot')
+        encoding_type: Type of encoding ('token', 'diploid_onehot', or 'onehot')
             - 'token': Returns (n_samples, n_snps) with values {0,1,2,3} for use with snp_embedding
             - 'diploid_onehot': Returns (n_samples, n_snps, 8) with one-hot encoded diploid genotypes
+            - 'onehot': Returns (n_samples, n_snps, 3) classic REF/HET/ALT one-hot from VCF (biallelic SNPs)
         variant_type: Which variant types to extract (for VCF files)
             - 'snp': Only SNPs
             - 'snp_indel': SNPs and INDELs (returns dict)
@@ -498,9 +633,9 @@ def parse_genotype_file(geno_path: str, encoding_type: str = 'token', variant_ty
         encoding_type = 'diploid_onehot'
 
     # Validate inputs
-    if encoding_type not in ['token', 'diploid_onehot']:
+    if encoding_type not in ['token', 'diploid_onehot', 'onehot']:
         raise ValueError(
-            f"encoding_type must be 'token' or 'diploid_onehot', got '{encoding_type}'"
+            f"encoding_type must be 'token', 'diploid_onehot', or 'onehot', got '{encoding_type}'"
         )
 
     if variant_type is not None and variant_type not in ['snp', 'snp_indel', 'snp_indel_sv']:
@@ -508,12 +643,20 @@ def parse_genotype_file(geno_path: str, encoding_type: str = 'token', variant_ty
             f"variant_type must be 'snp', 'snp_indel', or 'snp_indel_sv', got '{variant_type}'"
         )
 
+    if encoding_type == 'onehot' and variant_type not in (None, 'snp'):
+        raise ValueError(
+            "encoding_type 'onehot' is only supported for single-branch SNP VCF "
+            "(variant_type 'snp' or omitted)."
+        )
+
     # Handle single-variant types (non-multi-branch)
     if variant_type is None or variant_type == 'snp':
         if encoding_type == 'token':
             return parse_genotype_token(geno_path)
-        else:  # diploid_onehot
-            return parse_genotype_snp_vcf(geno_path)
+        if encoding_type == 'onehot':
+            return parse_genotype_snp_vcf_onehot(geno_path)
+        # diploid_onehot
+        return parse_genotype_snp_vcf(geno_path)
 
     # Handle multi-branch types
     if variant_type == 'snp_indel':

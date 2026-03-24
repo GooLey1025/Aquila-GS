@@ -98,7 +98,7 @@ def parse_args():
         '--encoding-type',
         type=str,
         default=None,
-        choices=['token', 'diploid_onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
+        choices=['token', 'diploid_onehot', 'onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
         help='Encoding type for VCF parsing (default: read from config file)'
     )
 
@@ -573,7 +573,12 @@ def main():
         else:
             # Single branch: seq_length is an integer
             length = seq_length if isinstance(seq_length, int) else seq_length.get('snp', seq_length)
-            dummy_input = torch.randn(1, length, 8, device=device)
+            if encoding_type == 'token':
+                dummy_input = torch.zeros(1, length, dtype=torch.long, device=device)
+            elif encoding_type == 'onehot':
+                dummy_input = torch.randn(1, length, 3, device=device)
+            else:
+                dummy_input = torch.randn(1, length, 8, device=device)
         
         # Run dummy forward pass to initialize dynamic layers
         _ = model(dummy_input)

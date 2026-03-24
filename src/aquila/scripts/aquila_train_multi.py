@@ -123,9 +123,9 @@ def parse_args():
     parser.add_argument(
         '--encoding-type',
         type=str,
-        default='diploid_onehot',
-        choices=['token', 'diploid_onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
-        help='Encoding type (overrides config file if specified)'
+        default=None,
+        choices=['token', 'diploid_onehot', 'onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
+        help='Encoding type (default: config data.encoding_type, else diploid_onehot)'
     )
 
     parser.add_argument(
@@ -774,13 +774,14 @@ def main():
         config['data']['geno_file'] = args.vcf
     if args.pheno:
         config['data']['pheno_file'] = args.pheno
+    encoding_type = config.get('data', {}).get('encoding_type', 'diploid_onehot')
     if args.encoding_type is not None:
-        config['data']['encoding_type'] = args.encoding_type
+        encoding_type = args.encoding_type
+    config['data']['encoding_type'] = encoding_type
 
     # Get data paths and convert to absolute paths
     vcf_file = args.vcf or config['data']['geno_file']
     pheno_file = args.pheno or config['data']['pheno_file']
-    encoding_type = config['data']['encoding_type']  # Get final encoding type from config
 
     # Convert data file paths to absolute paths if they are relative
     if vcf_file and not Path(vcf_file).is_absolute():

@@ -86,9 +86,9 @@ def parse_args():
     parser.add_argument(
         '--encoding-type',
         type=str,
-        default='diploid_onehot',
-        choices=['token', 'diploid_onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
-        help='Encoding type'
+        default=None,
+        choices=['token', 'diploid_onehot', 'onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
+        help='Encoding type (default: config data.encoding_type, else diploid_onehot)'
     )
 
     parser.add_argument(
@@ -627,7 +627,12 @@ def main():
         config['data']['geno_file'] = args.vcf
     if args.pheno:
         config['data']['pheno_file'] = args.pheno
-    config['data']['encoding_type'] = args.encoding_type
+    encoding_type_resolved = (
+        args.encoding_type
+        if args.encoding_type is not None
+        else config.get('data', {}).get('encoding_type', 'diploid_onehot')
+    )
+    config['data']['encoding_type'] = encoding_type_resolved
 
     # Get data paths
     vcf_file = args.vcf or config['data']['geno_file']
@@ -754,7 +759,7 @@ def main():
                 config_file_abs,
                 vcf_file,
                 pheno_file,
-                args.encoding_type,
+                encoding_type_resolved,
                 args.mixed_precision,
                 args.use_wandb,
                 args.wandb_project,

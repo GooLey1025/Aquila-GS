@@ -74,7 +74,7 @@ def parse_args():
         '--encoding-type',
         type=str,
         default='diploid_onehot',
-        choices=['token', 'diploid_onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
+        choices=['token', 'diploid_onehot', 'onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
         help='Encoding type (must match training)'
     )
 
@@ -304,7 +304,7 @@ def load_model_and_data(args):
     print(f"\nLoading genotype data from: {args.vcf}")
 
     # Load genotype data based on encoding
-    if encoding_type == 'diploid_onehot':
+    if encoding_type in ('diploid_onehot', 'onehot'):
         if is_multi_branch:
             data_config = config.get('data', {})
 
@@ -319,7 +319,7 @@ def load_model_and_data(args):
                     raise ValueError("No VCF file specified. Please provide --vcf or set geno_file in config.")
 
             print(f"Loading multi-branch genotype data from: {geno_file}")
-            result = parse_genotype_file(geno_file, encoding_type='diploid_onehot', variant_type=variant_type)
+            result = parse_genotype_file(geno_file, encoding_type=encoding_type, variant_type=variant_type)
 
             # result is a dict: {'snp': (matrix, samples, ids), 'indel': ..., 'sv': ...}
             data_dict = {}
@@ -358,7 +358,9 @@ def load_model_and_data(args):
                     raise ValueError("No VCF file specified. Please provide --vcf or set geno_file in config.")
 
             print("Loading genotype data...")
-            snp_matrix, sample_ids, snp_id_list = parse_genotype_file(vcf_file, encoding_type='diploid_onehot')
+            snp_matrix, sample_ids, snp_id_list = parse_genotype_file(
+                vcf_file, encoding_type=encoding_type, variant_type=variant_type
+            )
             data_dict = {'snp': snp_matrix}
             snp_ids = {'snp': snp_id_list}
             print(f"Loaded {len(snp_id_list)} variants for {len(sample_ids)} samples")
@@ -384,7 +386,7 @@ def load_model_and_data(args):
         filtered_sample_ids = [sample_ids[i] for i in target_indices]
         filtered_data_dict = {}
         for vtype, data in data_dict.items():
-            # Data shape should be (n_samples, seq_len, 8)
+            # Data shape should be (n_samples, seq_len, C)
             filtered_data_dict[vtype] = data[target_indices]
         
         data_dict = filtered_data_dict
@@ -510,7 +512,7 @@ class IntegratedGradients:
 
     Integrated Gradients = (input - baseline) * integral(gradient at interpolated points)
 
-    For diploid_onehot encoding, baseline is all zeros (missing genotype).
+    For diploid_onehot / onehot encodings, baseline is all zeros (missing genotype).
     """
 
     def __init__(self, model, device, num_steps=50, is_multi_branch=False):
@@ -536,13 +538,13 @@ class IntegratedGradients:
 
         Args:
             input_dict: Dictionary with input tensors for each variant type
-                        Each tensor shape: (1, seq_len, 8)
+                        Each tensor shape: (1, seq_len, C) with C=8 or 3
             task_idx: Task index to compute gradient for
             target_type: 'regression' or 'classification'
 
         Returns:
             Dictionary with integrated gradients for each variant type
-            Each value shape: (1, seq_len, 8)
+            Each value shape: (1, seq_len, C)
         """
         self.model.eval()
 
@@ -684,7 +686,7 @@ def compute_ig_streaming(model, data_dict, sample_ids, snp_ids,
                 task_group = f'{sample_group}/{task_name}'
                 
                 for vtype, scores in ig_scores.items():
-                    scores_2d = scores[0]  # (1, seq_len, 8) -> (seq_len, 8)
+                    scores_2d = scores[0]  # (1, seq_len, C) -> (seq_len, C)
                     f.create_dataset(f'{task_group}/{vtype}', data=scores_2d)
 
     print(f"  Saved: {h5_path}")

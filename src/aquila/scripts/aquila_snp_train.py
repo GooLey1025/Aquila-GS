@@ -221,6 +221,8 @@ def main():
     if encoding_type == 'diploid_onehot':
         # For diploid one-hot: (batch_size, seq_length, 8)
         model_input_size = (batch_size, seq_length, 8)
+    elif encoding_type == 'onehot':
+        model_input_size = (batch_size, seq_length, 3)
     else:
         # For token encoding: (batch_size, seq_length)
         model_input_size = (batch_size, seq_length)

@@ -87,7 +87,7 @@ class SNPGatedUnit(nn.Module):
         if x.dim() != 3:
             raise ValueError(
                 f"SGU requires 3D input (diploid one-hot encoding), got {x.dim()}D input "
-                f"with shape {x.shape}. Please use encoding_type='diploid_onehot' in your config."
+                f"with shape {x.shape}. Please use encoding_type='diploid_onehot' or 'onehot' in your config."
             )
 
         # Ensure float type (convert from Long/int if needed)
@@ -167,14 +167,14 @@ class DiploidGatedUnit(nn.Module):
         if x.dim() != 3:
             raise ValueError(
                 f"DGU requires 3D input (diploid one-hot encoding), got {x.dim()}D input "
-                f"with shape {x.shape}. Please use encoding_type='diploid_onehot' in your config."
+                f"with shape {x.shape}. Please use encoding_type='diploid_onehot' or 'onehot' in your config."
             )
 
         # Validate last dimension must be 8
         if x.shape[-1] != 8:
             raise ValueError(
                 f"DGU requires input with last dimension = 8 (diploid one-hot), "
-                f"got shape {x.shape}. Please use encoding_type='diploid_onehot' in your config."
+                f"got shape {x.shape}. Please use encoding_type='diploid_onehot' or 'onehot' in your config."
             )
 
         # Ensure float type (convert from Long/int if needed)

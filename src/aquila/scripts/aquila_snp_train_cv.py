@@ -424,6 +424,8 @@ def main():
             batch_size = train_config.get('batch_size', 32)
             if encoding_type == 'diploid_onehot':
                 model_input_size = (batch_size, seq_length, 8)
+            elif encoding_type == 'onehot':
+                model_input_size = (batch_size, seq_length, 3)
             else:
                 model_input_size = (batch_size, seq_length)
             

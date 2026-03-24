@@ -104,11 +104,11 @@ def print_model_summary(model: torch.nn.Module, input_size=None, device='cpu', v
     Args:
         model: PyTorch model
         input_size: Input tensor size for detailed summary
-                    - For single-branch: (batch_size, seq_length) or (batch_size, seq_length, 8)
+                    - For single-branch: (batch_size, seq_length) or (batch_size, seq_length, 8 or 3)
                     - For multi-branch: dict like {'snp': (batch, seq, 8), 'indel': (batch, seq, 8)}
         device: Device to use for summary
         verbose: If True, print detailed layer-by-layer summary
-        encoding_type: Type of encoding ('token' or 'diploid_onehot')
+        encoding_type: Type of encoding ('token', 'diploid_onehot', or 'onehot')
     """
     from torchinfo import summary
 
@@ -120,8 +120,8 @@ def print_model_summary(model: torch.nn.Module, input_size=None, device='cpu', v
         if encoding_type == 'token':
             # Token encoding: (batch_size, seq_length) with integer values {0,1,2,3}
             dtype = torch.long
-        elif encoding_type == 'diploid_onehot':
-            # Diploid one-hot encoding: (batch_size, seq_length, 8) with float values
+        elif encoding_type in ('diploid_onehot', 'onehot'):
+            # Float one-hot: (batch_size, seq_length, 8) or (batch_size, seq_length, 3)
             dtype = torch.float
         else:
             # Default to long for backward compatibility

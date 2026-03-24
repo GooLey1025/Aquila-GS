@@ -288,9 +288,20 @@ def parse_args():
     parser.add_argument(
         '--encoding-type',
         type=str,
-        default='diploid_onehot',
-        choices=['token', 'diploid_onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
-        help='Encoding type: token or diploid_onehot for format; snp_vcf, indel_vcf, sv_vcf, snp_indel_vcf, snp_indel_sv_vcf for backward compatibility'
+        default=None,
+        choices=['token', 'diploid_onehot', 'onehot'],
+        help='Encoding type (default: config data.encoding_type, else diploid_onehot). '
+             'onehot = classic 3-way REF/HET/ALT one-hot from VCF (use embedder in_channels: 3).'
+    )
+
+    parser.add_argument(
+        '--variant-type',
+        type=str,
+        default=None,
+        choices=['snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
+        help='Variant type for VCF-based encoding (default: config data.variant_type). '
+             'snp_vcf = SNPs only; indel_vcf = INDELs only; sv_vcf = SVs only; '
+             'snp_indel_vcf = SNPs + INDELs (multi-branch); snp_indel_sv_vcf = SNPs + INDELs + SVs (multi-branch).'
     )
 
     parser.add_argument(
@@ -473,9 +484,21 @@ def main():
     if args.pheno:
         config['data']['pheno_file'] = args.pheno
 
-    # Set encoding type
-    encoding_type = args.encoding_type
+    # Set encoding type (CLI overrides YAML when provided)
+    encoding_type = (
+        args.encoding_type
+        if args.encoding_type is not None
+        else config.get('data', {}).get('encoding_type', 'diploid_onehot')
+    )
     config['data']['encoding_type'] = encoding_type
+
+    # Set variant type (CLI overrides YAML when provided)
+    variant_type = (
+        args.variant_type
+        if args.variant_type is not None
+        else config.get('data', {}).get('variant_type')
+    )
+    config['data']['variant_type'] = variant_type
 
     # Set random seed (different seed per rank for distributed training)
     # if is_distributed:
@@ -776,6 +799,10 @@ def main():
                 dummy_input = {}
                 for vtype, vlen in seq_length.items():
                     dummy_input[vtype] = torch.zeros(1, vlen, 8, device=device)
+            elif encoding_type == 'token':
+                dummy_input = torch.zeros(1, seq_length, dtype=torch.long, device=device)
+            elif encoding_type == 'onehot':
+                dummy_input = torch.zeros(1, seq_length, 3, device=device)
             else:
                 dummy_input = torch.zeros(1, seq_length, 8, device=device)
 
@@ -801,8 +828,12 @@ def main():
         for vtype, vlen in seq_length.items():
             model_input_size[vtype] = (batch_size, vlen, 8)
         print(f"\nMulti-branch model input sizes: {model_input_size}")
+    elif encoding_type == 'token':
+        model_input_size = (batch_size, seq_length)
+    elif encoding_type == 'onehot':
+        model_input_size = (batch_size, seq_length, 3)
     else:
-        # Single-branch
+        # Single-branch diploid_onehot / legacy VCF aliases
         model_input_size = (batch_size, seq_length, 8)
 
     print_model_summary(

@@ -192,12 +192,12 @@ class VariantsDataset(Dataset):
                         f"Unexpected matrix shape for {variant_type}: {matrix.shape}")
             self.snp_matrix = None
         else:
-            # Single-branch: handle both 2D (token) and 3D (diploid_onehot) encodings
+            # Single-branch: 2D (token) or 3D float (diploid_onehot or classic onehot)
             if snp_matrix.ndim == 2:
                 # Token encoding: (n_samples, n_snps) -> convert to long
                 self.snp_matrix = torch.from_numpy(snp_matrix).long()
             elif snp_matrix.ndim == 3:
-                # Diploid one-hot encoding: (n_samples, n_snps, 8) -> keep as float
+                # One-hot encoding: (n_samples, n_snps, 8) or (n_samples, n_snps, 3)
                 self.snp_matrix = torch.from_numpy(snp_matrix).float()
             else:
                 raise ValueError(
@@ -545,7 +545,7 @@ def create_data_loaders(
         test_split: Test split ratio
         num_workers: Number of data loading workers
         normalize_regression: Apply z-score normalization to regression targets
-        encoding_type: Encoding strategy ('token' or 'diploid_onehot')
+        encoding_type: Encoding strategy ('token', 'diploid_onehot', or 'onehot')
         variant_type: Which variant types to use ('snp', 'snp_indel', 'snp_indel_sv')
         cache_dir: Directory to save/load data cache (None = no caching)
         data_restart: If True, ignore cache and re-process data
@@ -732,7 +732,7 @@ def create_data_loaders(
         first_variant_type = list(variant_data.keys())[0]
         _, sample_ids, _ = variant_data[first_variant_type]
 
-        # Create dict of matrices (n_samples, n_variants, 8)
+        # Create dict of matrices (n_samples, n_variants, 8) per branch
         snp_matrix = {vtype: data[0] for vtype, data in variant_data.items()}
     else:
         # Single-branch: returns tuple (matrix, sample_ids, variant_ids)
@@ -1051,7 +1051,7 @@ def create_kfold_data_loaders(
         batch_size: Batch size
         num_workers: Number of data loading workers
         normalize_regression: Apply z-score normalization to regression targets
-        encoding_type: Encoding strategy ('token' or 'diploid_onehot')
+        encoding_type: Encoding strategy ('token', 'diploid_onehot', or 'onehot')
         variant_type: Which variant types to use ('snp', 'snp_indel', 'snp_indel_sv')
         random_seed: Random seed for fold splitting
 

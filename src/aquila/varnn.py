@@ -127,6 +127,7 @@ class VariantsNeuralNetwork(nn.Module):
             x: Input tensor with shape:
                - (batch, seq_length) for token encoding {0, 1, 2, 3}
                - (batch, seq_length, 8) for diploid_onehot encoding
+               - (batch, seq_length, 3) for classic onehot (REF/HET/ALT)
             return_embeddings: If True, also return intermediate embeddings
             
         Returns:
@@ -136,13 +137,12 @@ class VariantsNeuralNetwork(nn.Module):
         """
         # Create mask for non-missing values
         # For token encoding: mask out token 3
-        # For diploid_onehot: mask out all-zero vectors
+        # For float one-hot encodings: mask out all-zero vectors (missing)
         if x.ndim == 2:
             # Token encoding: (batch, seq_length)
             mask = (x != 3)
         elif x.ndim == 3:
-            # Diploid one-hot encoding: (batch, seq_length, 8)
-            # Missing is represented as all zeros
+            # Diploid one-hot (8) or classic onehot (3): missing = all zeros
             mask = (x.sum(dim=-1) > 0)  # (batch, seq_length)
         else:
             raise ValueError(f"Unexpected input shape: {x.shape}")
@@ -361,7 +361,7 @@ class MultiBranchNeuralNetwork(VariantsNeuralNetwork):
         
         Args:
             x: Dict of input tensors: {'snp': tensor, 'indel': tensor, 'sv': tensor}
-               Each tensor has shape (batch, seq_length, 8) for diploid_onehot
+               Each tensor has shape (batch, seq_length, 8) for diploid_onehot (or 3 for onehot if used)
             return_embeddings: If True, also return intermediate embeddings
             
         Returns:
