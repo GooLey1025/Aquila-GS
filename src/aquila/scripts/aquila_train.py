@@ -795,10 +795,12 @@ def main():
         model.eval()
         with torch.no_grad():
             # Create dummy input for initialization
+            # SNP: 8-dim diploid nucleotide one-hot; INDEL/SV: 4-dim genotype-class one-hot
             if is_multi_branch:
                 dummy_input = {}
                 for vtype, vlen in seq_length.items():
-                    dummy_input[vtype] = torch.zeros(1, vlen, 8, device=device)
+                    in_channels = 8 if vtype == 'snp' else 4
+                    dummy_input[vtype] = torch.zeros(1, vlen, in_channels, device=device)
             elif encoding_type == 'token':
                 dummy_input = torch.zeros(1, seq_length, dtype=torch.long, device=device)
             elif encoding_type == 'onehot':
@@ -824,9 +826,11 @@ def main():
 
     if is_multi_branch:
         # Multi-branch: create dict input
+        # SNP: 8-dim; INDEL/SV: 4-dim
         model_input_size = {}
         for vtype, vlen in seq_length.items():
-            model_input_size[vtype] = (batch_size, vlen, 8)
+            in_channels = 8 if vtype == 'snp' else 4
+            model_input_size[vtype] = (batch_size, vlen, in_channels)
         print(f"\nMulti-branch model input sizes: {model_input_size}")
     elif encoding_type == 'token':
         model_input_size = (batch_size, seq_length)

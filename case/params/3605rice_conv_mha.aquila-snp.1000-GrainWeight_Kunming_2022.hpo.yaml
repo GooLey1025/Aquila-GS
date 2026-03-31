@@ -1,0 +1,213 @@
+output_dir: 3605rice_conv_mha_train_out
+data:
+  geno_file: RiceAtlas_MP2025_valid.0.007.impute.id.vcf.gz #705rice_0.005.snp.indel.sv.vcf.gz # beagle_impute/705rice_0.005.full.snp.impute.biallelic.vcf.gz
+  pheno_file: 3605rice_phenotype_split/1000-GrainWeight_Kunming_2022.tsv #705rice_data/705Rice.phenos.completed.tsv
+  encoding_type: diploid_onehot
+  variant_type: snp
+  classification_tasks: null
+
+hpo:
+  enabled: true
+  n_trials: 500
+  metric: best/val_r
+  direction: maximize
+  seed: 42
+  
+  parameters:
+    # =====================================================
+    # Training hyperparameters
+    # =====================================================
+    train.num_epochs:
+      type: int_uniform
+      low: 100
+      high: 500
+    
+    train.learning_rate:
+      type: log_uniform
+      low: 1.0e-5
+      high: 1.0e-3
+    
+    train.weight_decay:
+      type: log_uniform
+      low: 1.0e-6
+      high: 1.0e-2
+
+    train.batch_size:
+      type: categorical
+      choices: [16, 32]
+
+    train.gradient_clip_norm:
+      type: categorical
+      choices: [0.5, 1.0, 2.0, 5.0]
+
+    train.scheduler_params.warmup_epochs:
+      type: categorical
+      choices: [5, 10, 15, 20, 30]
+    
+    train.scheduler_params.warmup_start_factor:
+      type: log_uniform
+      low: 1.0e-3
+      high: 1.0e-2
+
+    train.scheduler_params.min_lr:
+      type: log_uniform
+      low: 1.0e-7
+      high: 1.0e-4
+
+    # =====================================================
+    # Model hyperparameters (single branch architecture)
+    # =====================================================
+    
+    # Embedder (conv_block)
+    model.embedder.0.kernel_size:
+      type: categorical
+      choices: [3, 5, 7, 9, 11, 13, 15]
+    
+    # Down Conv Tower (trunk.0)
+    model.trunk.0.dropout:
+      type: uniform
+      low: 0.0
+      high: 0.4
+    
+    model.trunk.0.kernel_size:
+      type: categorical
+      choices: [3, 5, 7, 9]
+    
+    # Transformer (trunk.1)
+    model.trunk.1.dropout:
+      type: uniform
+      low: 0.0
+      high: 0.4
+    
+    model.trunk.1.kernel_size:
+      type: categorical
+      choices: [3, 5, 7, 9]
+    
+    # Multi Head Pool (trunk.2)
+    model.trunk.2.dropout:
+      type: uniform
+      low: 0.0
+      high: 0.4
+    
+    model.trunk.2.kernel_size:
+      type: categorical
+      choices: [3, 5, 7, 9]
+    
+    # Transformer (trunk.3)
+    model.trunk.3.dropout:
+      type: uniform
+      low: 0.0
+      high: 0.4
+    
+    model.trunk.3.kernel_size:
+      type: categorical
+      choices: [3, 5, 7, 9]
+    
+    # Transformer (trunk.4)
+    model.trunk.4.dropout:
+      type: uniform
+      low: 0.0
+      high: 0.4
+    
+    model.trunk.4.num_heads:
+      type: categorical
+      choices: [4, 8]
+    
+    model.trunk.4.d_ff:
+      type: categorical
+      choices: [256, 512, 1024]
+    
+    # Final Pool (trunk.5)
+    model.trunk.5.dropout:
+      type: uniform
+      low: 0.0
+      high: 0.4
+    
+    # =====================================================
+    # Heads hyperparameters
+    # =====================================================
+    
+    model.heads.regression.0.hidden_features:
+      type: categorical
+      choices: [128, 256, 512]
+    
+    model.heads.regression.0.dropout:
+      type: uniform
+      low: 0.0
+      high: 0.5
+    
+    # =====================================================
+    # Regularization
+    # =====================================================
+    
+    model.l2_scale:
+      type: log_uniform
+      low: 1.0e-7
+      high: 1.0e-3
+
+train:
+  batch_size: 32
+  num_epochs: 300
+  learning_rate: 0.0001
+  weight_decay: 0.001
+  optimizer_type: adamw
+  loss_type: mse
+  normalize_regression: true
+  uncertainty_weighting: true
+  early_stopping_patience: 40
+  gradient_clip_norm: 1.0
+  scheduler_type: cosine_warmup
+  scheduler_params:
+    warmup_epochs: 10
+    warmup_start_factor: 0.01
+    min_lr: 1.0e-05
+  val_split: 0.1
+  test_split: 0.0
+  num_workers: 4
+
+model:
+  architecture_type: single
+  activation: gelu
+  dropout: 0.1
+  l2_scale: 1.0e-05
+  verbose: true
+  embedder:
+  - name: conv_block
+    in_channels: 8
+    out_channels: 256
+    kernel_size: 15
+    activation: gelu
+    norm_type: layer
+    residual: false
+  trunk:
+  - name: down_conv_tower
+    in_channels: 256
+    out_channels: 256
+    kernel_size: 5
+    padding: 2
+    activation: gelu
+    dropout: 0.1
+    norm_type: layer
+    order: nac
+    residual: true
+    seq_len_threshold: 1500
+  - name: transformer
+    d_model: 256
+    num_heads: 8
+    d_ff: 256
+    dropout: 0.1
+    activation: gelu
+  - name: multi_head_pool
+    d_model: 256
+    num_heads: 4
+    dropout: 0.1
+    pool_axis: 2
+
+  heads:
+    regression:
+    - name: regression_head
+      in_features: null
+      num_targets: 18
+      hidden_features: 256
+      dropout: 0.1
+      activation: gelu

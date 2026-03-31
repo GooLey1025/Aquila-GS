@@ -10,9 +10,9 @@ import re
 import glob
 
 # Paths
-TEMPLATE_FILE = "/data4/gulei/projects/Aquila-GS/benchmark/aquila/params/1171rice_conv_mha.aquila-snp.hpo.yaml"
-PHENOTYPES_DIR = "/data4/gulei/projects/Aquila-GS/benchmark/aquila/1171rice_phenotype_split"
-OUTPUT_DIR = "/data4/gulei/projects/Aquila-GS/benchmark/aquila/params"
+TEMPLATE_FILE = "/home/gulei/projects/Aquila-GS/benchmark/aquila/params/705rice_conv_mha.aquila-vars.hpo.yaml"
+PHENOTYPES_DIR = "/home/gulei/projects/Aquila-GS/benchmark/aquila/phenotypes"
+OUTPUT_DIR = "/home/gulei/projects/Aquila-GS/benchmark/aquila/params"
 
 # Extract template filename prefix (e.g., "705rice_conv_mha.aquila-vars" from "705rice_conv_mha.aquila-vars.hpo.yaml")
 template_basename = os.path.basename(TEMPLATE_FILE)
@@ -48,9 +48,10 @@ for pheno_file in phenotype_files:
     pheno_name = os.path.splitext(os.path.basename(pheno_file))[0]
     
     # Create new parameter content (replace original pheno_file with phenotype-specific one)
+    pheno_dir_name = os.path.basename(PHENOTYPES_DIR)
     new_content = template_content.replace(
         f"pheno_file: {original_pheno_file}",
-        f"pheno_file: phenotypes/{pheno_name}.tsv"
+        f"pheno_file: {pheno_dir_name}/{pheno_name}.tsv"
     )
     
     # Generate output filename using template prefix

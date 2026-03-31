@@ -73,6 +73,12 @@ nohup aquila_train_hpo.py --config params/$yaml -o ${yaml%.yaml} -dsf aquila_ben
 
 ```
 
+### [GP-WAITER](https://github.com/snowo-w/GP-WAITER/)
+```sh
+git clone https://github.com/snowo-w/GP-WAITER.git
+cd GP-WAITER
+```
+
 ### [CropARNet](https://github.com/Zhoushuchang-lab/CropARNet)
 
 Some scripts from CropARNet were copied or adapted into our project repository.

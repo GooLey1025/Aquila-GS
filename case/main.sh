@@ -8,7 +8,7 @@ aquila_train_hpo.py --config params/$yaml -o ${yaml%.yaml} -dsf $BEST_DS > ${yam
 
 BEST_TRIAL=$(awk -F': ' '/Best trial number/ {print $2}' ${yaml%.yaml}/optuna_summary.txt)
 
-cp -rf ${yaml%.yaml}/trial_$BEST_TRIAL ${yaml%.yaml}.best_model
+cp -rf ${yaml%.yaml}/trial_$BEST_TRIAL ${yaml%.hpo.yaml}.best_model
 aquila_predict.py --model-dir ${yaml%.yaml}.best_model --vcf user.vcf.gz --output user.preds.tsv
 
 

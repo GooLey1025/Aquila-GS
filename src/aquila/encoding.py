@@ -5,6 +5,7 @@ This module provides different encoding schemes for SNP genotype data:
 - Additive encoding: Maps genotypes to discrete tokens {0,1,2,3} for embedding
 - Diploid one-hot encoding: Maps genotypes to 8-dimensional one-hot vectors
 - Classic one-hot (onehot): Biallelic SNP as 3-class {REF/REF, het, ALT/ALT}
+- Genotype-class one-hot (4-way): INDEL/SV as 4-class {REF/REF, REF/ALT, ALT/REF, ALT/ALT}
 """
 
 import pandas as pd
@@ -228,14 +229,20 @@ def parse_genotype_vcf(
             'INDEL': (indel_matrix, sample_ids, indel_ids),
             'SV': (sv_matrix, sample_ids, sv_ids)
         }
-        Each matrix has shape (n_samples, n_variants, 8) with diploid one-hot encoding
 
-    Encoding scheme:
-    - 0|0 (REF/REF): [ref_onehot, ref_onehot]
-    - 0|1 (REF/ALT): [ref_onehot, alt_onehot]
-    - 1|0 (ALT/REF): [alt_onehot, ref_onehot]
-    - 1|1 (ALT/ALT): [alt_onehot, alt_onehot]
-    - .|. or ./. (missing): [0,0,0,0, 0,0,0,0]
+        SNP encoding (8-dimensional diploid nucleotide one-hot):
+        - 0|0 (REF/REF): [A/C/G/T one-hot for REF, A/C/G/T one-hot for REF]
+        - 0|1 (REF/ALT): [A/C/G/T one-hot for REF, A/C/G/T one-hot for ALT]
+        - 1|0 (ALT/REF): [A/C/G/T one-hot for ALT, A/C/G/T one-hot for REF]
+        - 1|1 (ALT/ALT): [A/C/G/T one-hot for ALT, A/C/G/T one-hot for ALT]
+        - .|. or ./. (missing): [0,0,0,0, 0,0,0,0]
+
+        INDEL/SV encoding (4-dimensional genotype-class one-hot):
+        - 0|0 or 0/0 (REF/REF): [1, 0, 0, 0]
+        - 0|1 or 0/1 (REF/ALT): [0, 1, 0, 0]  (phase preserved)
+        - 1|0 or 1/0 (ALT/REF): [0, 0, 1, 0]  (phase preserved, different from 0|1)
+        - 1|1 or 1/1 (ALT/ALT): [0, 0, 0, 1]
+        - .|. or ./. (missing): [0, 0, 0, 0]
     """
     print(f"Loading VCF file: {vcf_path}")
     if variant_types:
@@ -247,6 +254,15 @@ def parse_genotype_vcf(
         'C': [0, 1, 0, 0],
         'G': [0, 0, 1, 0],
         'T': [0, 0, 0, 1],
+    }
+
+    # Genotype-class one-hot mapping for INDEL/SV (4-way)
+    # Index: 0=REF/REF, 1=REF/ALT, 2=ALT/REF, 3=ALT/ALT
+    genotype_class_to_onehot = {
+        (0, 0): [1, 0, 0, 0],  # 0|0 or 0/0: Homozygous REF
+        (0, 1): [0, 1, 0, 0],  # 0|1 or 0/1: Heterozygous (REF first)
+        (1, 0): [0, 0, 1, 0],  # 1|0 or 1/0: Heterozygous (ALT first) - phase preserved
+        (1, 1): [0, 0, 0, 1],  # 1|1 or 1/1: Homozygous ALT
     }
 
     # Read VCF file (support both .vcf and .vcf.gz)
@@ -317,6 +333,10 @@ def parse_genotype_vcf(
                 'GT') if 'GT' in format_field else 0
 
             # Encode genotypes for this variant
+            # SNPs use 8-dim diploid nucleotide one-hot; INDEL/SV use 4-dim genotype-class one-hot
+            is_snp = variant_type == 'SNP'
+            encoding_dim = 8 if is_snp else 4
+
             variant_encodings = []
             for gt_field in genotypes:
                 gt = gt_field.split(':')[gt_idx]
@@ -330,7 +350,7 @@ def parse_genotype_vcf(
                     alleles = ['.', '.']
 
                 # Encode diploid genotype
-                encoding = np.zeros(8, dtype=np.float32)
+                encoding = np.zeros(encoding_dim, dtype=np.float32)
 
                 # Check for missing
                 if alleles[0] == '.' or alleles[1] == '.':
@@ -342,14 +362,25 @@ def parse_genotype_vcf(
                         allele1_idx = int(alleles[0])
                         allele2_idx = int(alleles[1])
 
-                        # Get nucleotides (0=REF, 1=ALT)
-                        allele1_nuc = ref if allele1_idx == 0 else alt
-                        allele2_nuc = ref if allele2_idx == 0 else alt
+                        if is_snp:
+                            # SNP: 8-dim diploid nucleotide one-hot encoding
+                            # Get nucleotides (0=REF, 1=ALT)
+                            allele1_nuc = ref if allele1_idx == 0 else alt
+                            allele2_nuc = ref if allele2_idx == 0 else alt
 
-                        # Encode if valid nucleotides
-                        if allele1_nuc in nucleotide_to_onehot and allele2_nuc in nucleotide_to_onehot:
-                            encoding[:4] = nucleotide_to_onehot[allele1_nuc]
-                            encoding[4:] = nucleotide_to_onehot[allele2_nuc]
+                            # Encode if both are single nucleotides
+                            if allele1_nuc in nucleotide_to_onehot and allele2_nuc in nucleotide_to_onehot:
+                                encoding[:4] = nucleotide_to_onehot[allele1_nuc]
+                                encoding[4:] = nucleotide_to_onehot[allele2_nuc]
+                        else:
+                            # INDEL/SV: 4-dim genotype-class one-hot encoding
+                            # Preserve phase: 0|1 (REF/ALT) vs 1|0 (ALT/REF) are different
+                            genotype_class = (allele1_idx, allele2_idx)
+                            if genotype_class in genotype_class_to_onehot:
+                                encoding = np.array(
+                                    genotype_class_to_onehot[genotype_class],
+                                    dtype=np.float32
+                                )
                     except (ValueError, IndexError):
                         # Invalid genotype, leave as zeros
                         pass
@@ -359,7 +390,7 @@ def parse_genotype_vcf(
             # Store variant data
             variants_by_type[variant_type].append({
                 'id': variant_id,
-                # Shape: (n_samples, 8)
+                # Shape: (n_samples, encoding_dim) - varies by variant type
                 'encodings': np.array(variant_encodings)
             })
 
@@ -377,16 +408,35 @@ def parse_genotype_vcf(
         n_variants = len(variants)
         n_samples = len(sample_ids)
 
-        # Create matrix: (n_samples, n_variants, 8)
-        matrix = np.zeros((n_samples, n_variants, 8), dtype=np.float32)
+        # Determine encoding dimension based on variant type
+        # SNP: 8-dim diploid nucleotide one-hot; INDEL/SV: 4-dim genotype-class one-hot
+        if vtype == 'SNP':
+            encoding_dim = 8
+        else:
+            encoding_dim = 4
+
+        # Create matrix: (n_samples, n_variants, encoding_dim)
+        matrix = np.zeros((n_samples, n_variants, encoding_dim), dtype=np.float32)
         variant_ids = []
 
         for i, variant in enumerate(variants):
-            matrix[:, i, :] = variant['encodings']
+            variant_enc = variant['encodings']
+            # Handle case where encoding_dim might differ from stored (shouldn't happen but safety check)
+            if variant_enc.shape[1] != encoding_dim:
+                # Resize if necessary (take first encoding_dim columns)
+                if variant_enc.shape[1] > encoding_dim:
+                    variant_enc = variant_enc[:, :encoding_dim]
+                else:
+                    # Pad with zeros if smaller
+                    temp = np.zeros((variant_enc.shape[0], encoding_dim), dtype=np.float32)
+                    temp[:, :variant_enc.shape[1]] = variant_enc
+                    variant_enc = temp
+            matrix[:, i, :] = variant_enc
             variant_ids.append(variant['id'])
 
         result[vtype] = (matrix, sample_ids, variant_ids)
-        print(f"  {vtype}: {n_variants} variants × {n_samples} samples")
+        encoding_name = 'diploid_onehot (8-dim)' if vtype == 'SNP' else 'genotype_class (4-dim)'
+        print(f"  {vtype}: {n_variants} variants × {n_samples} samples [{encoding_name}]")
 
     return result
 

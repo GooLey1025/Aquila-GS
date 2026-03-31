@@ -207,7 +207,7 @@ train:
     indel:
       embedder:
       - name: conv_block
-        in_channels: 8
+        in_channels: 4
         out_channels: 256
         kernel_size: 15
         activation: gelu
@@ -240,7 +240,7 @@ train:
     sv:
       embedder:
       - name: conv_block
-        in_channels: 8
+        in_channels: 4
         out_channels: 256
         kernel_size: 15
         activation: gelu

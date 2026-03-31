@@ -135,6 +135,12 @@ class AlleleSwap:
     This is essentially "free" augmentation when phase information is unreliable
     (common in most genomic selection studies). Only affects heterozygous sites.
 
+    Supports two encoding schemes:
+    1. Diploid nucleotide one-hot (8-dim): First 4 dims = allele 1, last 4 dims = allele 2
+       - Heterozygous: first 4 dims != last 4 dims (both non-zero)
+    2. Genotype-class one-hot (4-dim): INDEL/SV encoding
+       - Heterozygous: [0,1,0,0] or [0,0,1,0] (index 1 or 2)
+
     Two modes:
     1. Per-site swap: Each heterozygous site has swap_prob chance to swap
     2. Whole-sample swap: With swap_prob chance, swap ALL heterozygous sites
@@ -151,31 +157,58 @@ class AlleleSwap:
 
     def _is_heterozygous(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Detect heterozygous sites by comparing first 4 dims vs last 4 dims.
+        Detect heterozygous sites based on encoding type.
+
+        For 8-dim diploid nucleotide one-hot (SNP):
+            Heterozygous if first 4 dims != last 4 dims (both non-zero)
+
+        For 4-dim genotype-class one-hot (INDEL/SV):
+            Heterozygous if index 1 or 2 is active ([0,1,0,0] or [0,0,1,0])
 
         Args:
-            x: Genotype tensor of shape (n_snps, 8)
+            x: Genotype tensor of shape (n_variants, 8) or (n_variants, 4)
 
         Returns:
-            Boolean tensor of shape (n_snps,) indicating heterozygous sites
+            Boolean tensor of shape (n_variants,) indicating heterozygous sites
         """
-        # Extract allele 1 (first 4 dims) and allele 2 (last 4 dims)
-        allele1 = x[:, :4]
-        allele2 = x[:, 4:]
+        if x.shape[-1] == 8:
+            # SNP: 8-dim diploid nucleotide one-hot
+            allele1 = x[:, :4]
+            allele2 = x[:, 4:]
 
-        # Heterozygous if alleles differ (and not missing)
-        # Check if any position differs AND both alleles are non-zero
-        is_valid = (allele1.sum(dim=1) > 0) & (allele2.sum(dim=1) > 0)
-        is_different = (allele1 != allele2).any(dim=1)
+            # Heterozygous if alleles differ (and not missing)
+            # Check if any position differs AND both alleles are non-zero
+            is_valid = (allele1.sum(dim=1) > 0) & (allele2.sum(dim=1) > 0)
+            is_different = (allele1 != allele2).any(dim=1)
 
-        return is_valid & is_different
+            return is_valid & is_different
+
+        elif x.shape[-1] == 4:
+            # INDEL/SV: 4-dim genotype-class one-hot
+            # Heterozygous if index 1 ([0,1,0,0]) or index 2 ([0,0,1,0]) is active
+            # This is equivalent to: sum > 0 AND sum < 1 (not REF/REF and not ALT/ALT)
+            # REF/REF: [1,0,0,0] -> sum=1
+            # REF/ALT: [0,1,0,0] -> sum=1
+            # ALT/REF: [0,0,1,0] -> sum=1
+            # ALT/ALT: [0,0,0,1] -> sum=1
+            # Missing: [0,0,0,0] -> sum=0
+            # All non-missing have sum=1, so we check: is index 1 or 2 active?
+            is_index1 = x[:, 1] == 1  # REF/ALT (0|1)
+            is_index2 = x[:, 2] == 1  # ALT/REF (1|0)
+            is_missing = x.sum(dim=1) == 0
+
+            return (is_index1 | is_index2) & ~is_missing
+
+        else:
+            # Unknown encoding, assume no heterozygous sites
+            return torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """
         Apply allele swapping for heterozygous sites.
 
         Args:
-            x: Genotype tensor of shape (n_snps, 8)
+            x: Genotype tensor of shape (n_variants, 8) or (n_variants, 4)
 
         Returns:
             Augmented tensor with swapped alleles at heterozygous sites
@@ -192,24 +225,42 @@ class AlleleSwap:
         if not het_mask.any():
             return x
 
-        if self.whole_sample:
-            # Swap all heterozygous sites together with swap_prob
-            if torch.rand(1).item() < self.swap_prob:
-                # Swap allele1 and allele2 for all het sites
+        if x.shape[-1] == 8:
+            # SNP: swap first 4 dims with last 4 dims
+            if self.whole_sample:
+                if torch.rand(1).item() < self.swap_prob:
+                    het_indices = het_mask.nonzero(as_tuple=True)[0]
+                    temp = x[het_indices, :4].clone()
+                    x[het_indices, :4] = x[het_indices, 4:]
+                    x[het_indices, 4:] = temp
+            else:
                 het_indices = het_mask.nonzero(as_tuple=True)[0]
-                temp = x[het_indices, :4].clone()
-                x[het_indices, :4] = x[het_indices, 4:]
-                x[het_indices, 4:] = temp
-        else:
-            # Per-site swap with swap_prob
-            het_indices = het_mask.nonzero(as_tuple=True)[0]
-            swap_decisions = torch.rand(len(het_indices)) < self.swap_prob
-            sites_to_swap = het_indices[swap_decisions]
+                swap_decisions = torch.rand(len(het_indices)) < self.swap_prob
+                sites_to_swap = het_indices[swap_decisions]
 
-            if len(sites_to_swap) > 0:
-                temp = x[sites_to_swap, :4].clone()
-                x[sites_to_swap, :4] = x[sites_to_swap, 4:]
-                x[sites_to_swap, 4:] = temp
+                if len(sites_to_swap) > 0:
+                    temp = x[sites_to_swap, :4].clone()
+                    x[sites_to_swap, :4] = x[sites_to_swap, 4:]
+                    x[sites_to_swap, 4:] = temp
+
+        elif x.shape[-1] == 4:
+            # INDEL/SV: swap REF/ALT (index 1) with ALT/REF (index 2)
+            if self.whole_sample:
+                if torch.rand(1).item() < self.swap_prob:
+                    het_indices = het_mask.nonzero(as_tuple=True)[0]
+                    # Swap index 1 <-> index 2
+                    temp = x[het_indices, 1].clone()
+                    x[het_indices, 1] = x[het_indices, 2]
+                    x[het_indices, 2] = temp
+            else:
+                het_indices = het_mask.nonzero(as_tuple=True)[0]
+                swap_decisions = torch.rand(len(het_indices)) < self.swap_prob
+                sites_to_swap = het_indices[swap_decisions]
+
+                if len(sites_to_swap) > 0:
+                    temp = x[sites_to_swap, 1].clone()
+                    x[sites_to_swap, 1] = x[sites_to_swap, 2]
+                    x[sites_to_swap, 2] = temp
 
         return x
 

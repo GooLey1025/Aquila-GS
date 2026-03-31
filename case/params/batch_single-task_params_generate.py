@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Batch generate parameter files for each phenotype.
-Template: 705rice_conv_mha.aquila-vars.hpo.yaml
-Output: 705rice_conv_mha.aquila-vars.{Pheno}.hpo.yaml
+Template: 3605rice_conv_mha.aquila-vars.hpo.yaml
+Output: 3605rice_conv_mha.aquila-vars.{Pheno}.hpo.yaml
 """
 
 import os
@@ -10,11 +10,11 @@ import re
 import glob
 
 # Paths
-TEMPLATE_FILE = "/data4/gulei/projects/Aquila-GS/case/params/1171rice_conv_mha.aquila-vars.hpo.yaml"
-PHENOTYPES_DIR = "/data4/gulei/projects/Aquila-GS/case/1171rice_phenotype_split"
-OUTPUT_DIR = "/data4/gulei/projects/Aquila-GS/case/params"
+TEMPLATE_FILE = "/home/gulei/projects/Aquila-GS/case/params/705rice_conv_mha.aquila-vars.hpo.yaml"
+PHENOTYPES_DIR = "/home/gulei/projects/Aquila-GS/case/phenotypes"
+OUTPUT_DIR = "/home/gulei/projects/Aquila-GS/case/params"
 
-# Extract template filename prefix (e.g., "705rice_conv_mha.aquila-vars" from "705rice_conv_mha.aquila-vars.hpo.yaml")
+# Extract template filename prefix (e.g., "3605rice_conv_mha.aquila-vars" from "3605rice_conv_mha.aquila-vars.hpo.yaml")
 template_basename = os.path.basename(TEMPLATE_FILE)
 template_prefix = re.sub(r'\.hpo\.yaml$', '', template_basename)
 
@@ -48,9 +48,10 @@ for pheno_file in phenotype_files:
     pheno_name = os.path.splitext(os.path.basename(pheno_file))[0]
     
     # Create new parameter content (replace original pheno_file with phenotype-specific one)
+    pheno_dir_name = os.path.basename(PHENOTYPES_DIR)
     new_content = template_content.replace(
         f"pheno_file: {original_pheno_file}",
-        f"pheno_file: phenotypes/{pheno_name}.tsv"
+        f"pheno_file: {pheno_dir_name}/{pheno_name}.tsv"
     )
     
     # Generate output filename using template prefix
