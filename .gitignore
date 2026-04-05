@@ -1,3 +1,10 @@
 snp_train
 src/aquila.egg-info
 src/aquila/__pycache__/
+*best_model/
+*.hpo/
+*.ig/
+*.position_importance/
+*.log
+*.pkl
+data_cache/

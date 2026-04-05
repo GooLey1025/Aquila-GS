@@ -31,6 +31,26 @@ from aquila.utils import load_config
 from aquila.encoding import parse_genotype_file
 
 
+import re
+
+def sanitize_hdf5_key(key: str) -> str:
+    """Sanitize a string to be a valid HDF5 group/dataset name.
+
+    HDF5 names cannot contain: / \\ : * ? " < > #
+    Also cannot start with . or be empty.
+    Replace all invalid chars with underscore.
+    """
+    if not key:
+        return "_"
+    # Replace any invalid HDF5 characters with underscore
+    key = re.sub(r'[/\\:*?"<>#,]', '_', key)
+    # Replace leading/trailing spaces, dots
+    key = key.strip().lstrip('.')
+    if not key:
+        return "_"
+    return key
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -682,7 +702,8 @@ def compute_ig_streaming(model, data_dict, sample_ids, snp_ids,
                 task_name = task_names[task_idx]
                 
                 # Save immediately to HDF5
-                sample_group = f'sample_{sample_idx}'
+                safe_id = sanitize_hdf5_key(sample_id)
+                sample_group = safe_id
                 task_group = f'{sample_group}/{task_name}'
                 
                 for vtype, scores in ig_scores.items():
@@ -759,19 +780,22 @@ def save_results_h5(results, sample_ids, snp_ids, task_info, args, output_dir):
 
     task_type = task_info['task_type']
     task_names = task_info['task_names']
+    task_indices = task_info['task_indices']
+    # Only save the tasks that were actually computed (may be a subset of all task_names)
+    computed_task_names = [task_names[idx] for idx in task_indices]
 
     with h5py.File(h5_path, 'w') as f:
         # Save metadata
         f.attrs['num_samples'] = len(sample_ids)
-        f.attrs['num_tasks'] = len(task_names)
+        f.attrs['num_tasks'] = len(computed_task_names)
         f.attrs['num_steps'] = args.num_steps
         f.attrs['task_type'] = task_type
         
         # Save sample IDs
         f.create_dataset('sample_ids', data=np.array(sample_ids, dtype='S'))
         
-        # Save task names
-        task_names_bytes = [t.encode('utf-8') for t in task_names]
+        # Save task names (only computed tasks)
+        task_names_bytes = [t.encode('utf-8') for t in computed_task_names]
         f.create_dataset('task_names', data=np.array(task_names_bytes, dtype='S'))
         
         # Save variant IDs
@@ -784,13 +808,13 @@ def save_results_h5(results, sample_ids, snp_ids, task_info, args, output_dir):
         for sample_idx, sample_id in enumerate(sample_ids):
             if sample_idx % 50 == 0:
                 print(f"  Saving sample {sample_idx + 1}/{len(sample_ids)}...")
-            
+
             sample_results = results[sample_id]
-            
-            for task_name in task_names:
+
+            for task_name in computed_task_names:
                 ig_scores = sample_results[task_name]
-                
-                sample_group = f'sample_{sample_idx}'
+                safe_id = sanitize_hdf5_key(sample_id)
+                sample_group = safe_id
                 task_group = f'{sample_group}/{task_name}'
                 
                 for vtype, scores in ig_scores.items():
@@ -803,8 +827,8 @@ def save_results_h5(results, sample_ids, snp_ids, task_info, args, output_dir):
     summary = {
         'num_samples': len(sample_ids),
         'sample_ids': sample_ids,
-        'num_tasks': len(task_names),
-        'task_names': task_names,
+        'num_tasks': len(computed_task_names),
+        'task_names': computed_task_names,
         'task_type': task_type,
         'variant_types': list(snp_ids.keys()),
         'num_variants': {vtype: len(ids) for vtype, ids in snp_ids.items()},

@@ -8,6 +8,7 @@ Outputs ranked locus importance scores for each task.
 Usage:
     python aquila_ig_interpretation.py -i ig_results.h5 -o output_dir
     python aquila_ig_interpretation.py -i ig_results.h5 -o output_dir --tasks GYP_BLUP,GW_BLUP --top-k 50
+    python aquila_ig_interpretation.py -i ig_results.h5 -o output_dir --sample-list samples.txt
 """
 
 import argparse
@@ -75,7 +76,14 @@ def parse_args():
         choices=['mean', 'max', 'sum'],
         help='Method to aggregate across samples (default: mean)'
     )
-    
+
+    parser.add_argument(
+        '--sample-list',
+        type=str,
+        default=None,
+        help='Path to text file with one sample ID per line. Only these samples will be analyzed.'
+    )
+
     return parser.parse_args()
 
 
@@ -109,57 +117,85 @@ def analyze_locus_importance(
     tasks: List[str],
     variant_type: str,
     agg_method: str,
-    sample_mode: str
+    sample_mode: str,
+    selected_samples: Optional[List[str]] = None
 ) -> Dict[str, Dict]:
     """
     Analyze locus importance from IG results.
-    
+
     Args:
         h5_path: Path to HDF5 file
         tasks: List of task names to analyze
         variant_type: Variant type (e.g., 'snp')
         agg_method: Method to aggregate 8D to 1D
         sample_mode: Method to aggregate across samples
-    
+        selected_samples: If provided, only analyze these sample IDs (from sample_ids dataset)
+
     Returns:
         Dictionary mapping task_name to importance data
     """
     results = {}
-    
+
     with h5py.File(h5_path, 'r') as f:
         # Get metadata
         num_samples = f.attrs['num_samples']
         sample_ids = [s.decode('utf-8') for s in f['sample_ids'][:]]
-        
+
+        # Build index mapping: sample_id -> hdf5_group_name
+        # Groups may use sanitized names (e.g., spaces replaced with _)
+        # Try exact match first, then sanitized match
+        def find_group_name(f, sample_id):
+            if sample_id in f:
+                return sample_id
+            # Fallback: try sanitized version (spaces -> _)
+            safe = sample_id.replace(' ', '_')
+            if safe in f:
+                return safe
+            return None
+
+        # Filter samples
+        if selected_samples:
+            sample_ids_to_use = [s for s in selected_samples if s in sample_ids]
+            missing = [s for s in selected_samples if s not in sample_ids]
+            if missing:
+                print(f"  Warning: {len(missing)} sample(s) not found in HDF5: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+            print(f"  Using {len(sample_ids_to_use)} of {len(selected_samples)} requested samples")
+            sample_id_set = set(sample_ids_to_use)
+        else:
+            sample_ids_to_use = sample_ids
+            sample_id_set = set(sample_ids)
+
         # Get variant IDs
         variant_ids = None
         if f'variant_ids/{variant_type}' in f:
             variant_ids = [v.decode('utf-8') for v in f[f'variant_ids/{variant_type}'][:]]
-        
+
         # Process each task
         for task_name in tasks:
             print(f"  Processing task: {task_name}")
-            
-            # Collect IG scores for this task across all samples
+
+            # Collect IG scores for selected samples
             task_scores = []
-            for sample_idx in range(num_samples):
-                sample_key = f'sample_{sample_idx}'
-                data_key = f'{sample_key}/{task_name}/{variant_type}'
-                
+            found_samples = []
+            for sample_id in sample_ids_to_use:
+                group_name = find_group_name(f, sample_id)
+                if group_name is None:
+                    continue
+                data_key = f'{group_name}/{task_name}/{variant_type}'
+
                 if data_key in f:
                     ig_scores = f[data_key][:]  # shape: (num_variants, 8)
-                    
-                    # Aggregate 8D -> 1D
                     agg_scores = aggregate_ig_scores(ig_scores, agg_method)
                     task_scores.append(agg_scores)
-            
+                    found_samples.append(sample_id)
+
             if not task_scores:
                 print(f"    Warning: No data found for task {task_name}")
                 continue
-            
+
             # Stack and aggregate across samples
-            all_scores = np.stack(task_scores, axis=0)  # shape: (num_samples, num_variants)
-            
+            all_scores = np.stack(task_scores, axis=0)  # shape: (num_selected, num_variants)
+
             if sample_mode == 'mean':
                 importance = all_scores.mean(axis=0)
             elif sample_mode == 'max':
@@ -168,19 +204,19 @@ def analyze_locus_importance(
                 importance = all_scores.sum(axis=0)
             else:
                 importance = all_scores.mean(axis=0)
-            
+
             # Get ranking
             ranking_indices = np.argsort(importance)[::-1]  # Descending order
-            
+
             results[task_name] = {
                 'importance': importance,
                 'ranking_indices': ranking_indices,
                 'variant_ids': variant_ids,
                 'num_variants': len(importance),
-                'num_samples': num_samples,
-                'sample_ids': sample_ids,
+                'num_samples': len(found_samples),
+                'sample_ids': found_samples,
             }
-    
+
     return results
 
 
@@ -335,6 +371,16 @@ def main():
     
     print(f"\nInput: {args.input}")
     print(f"Output: {args.output_dir}")
+
+    # Load sample list if provided
+    selected_samples = None
+    if args.sample_list:
+        sample_list_path = Path(args.sample_list)
+        if not sample_list_path.exists():
+            raise FileNotFoundError(f"Sample list file not found: {args.sample_list}")
+        with open(sample_list_path, 'r') as fh:
+            selected_samples = [line.strip() for line in fh if line.strip()]
+        print(f"Sample list: {len(selected_samples)} samples from {args.sample_list}")
     
     # Get available tasks from HDF5
     with h5py.File(args.input, 'r') as f:
@@ -367,7 +413,8 @@ def main():
         tasks_to_analyze,
         args.variant_type,
         args.aggregation,
-        args.sample_mode
+        args.sample_mode,
+        selected_samples
     )
     
     # Save results

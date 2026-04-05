@@ -1278,6 +1278,7 @@ class ConvBlockNAC(nn.Module):
         self.stride = stride
 
         # Normalization (applied to input channels)
+        self.norm_type = norm_type  # always save for lazy init
         if in_channels is not None:
             if norm_type == 'layer':
                 self.norm = nn.GroupNorm(1, in_channels)  # Layer norm for conv
@@ -1294,6 +1295,7 @@ class ConvBlockNAC(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         # Convolution
+        self._in_channels_fixed = in_channels
         if in_channels is None:
             self.conv = nn.LazyConv1d(
                 out_channels, kernel_size, stride, padding)
@@ -1342,8 +1344,9 @@ class ConvBlockNAC(nn.Module):
             if identity is not None:
                 identity = identity.float()
 
-        # Lazy initialization of norm if needed
-        if self.norm is None:
+        # Lazy initialization of norm if needed (also re-init if channel size changed)
+        norm_channels = self.norm.weight.numel() if not isinstance(self.norm, nn.Identity) else None
+        if self.norm is None or (norm_channels is not None and x.size(1) != norm_channels):
             in_channels_actual = x.size(1)
             if self.norm_type == 'layer':
                 self.norm = nn.GroupNorm(1, in_channels_actual).to(x.device)
@@ -1352,17 +1355,48 @@ class ConvBlockNAC(nn.Module):
             else:
                 self.norm = nn.Identity()
 
-        # Lazy initialization of residual_proj if needed
-        if self.residual and self.in_channels is None and self.residual_proj is None:
-            in_channels = x.size(1)
-            out_channels = self.out_channels
-            stride = self.stride
-            if in_channels != out_channels or stride > 1:
-                self.residual_proj = nn.Conv1d(
-                    in_channels, out_channels, 1, stride, 0).to(x.device)
+        # Lazy initialization of residual_proj if needed (also re-init if channel size changed)
+        if self.residual:
+            needs_reinit = False
+            if self._in_channels_fixed is None and self.residual_proj is None:
+                needs_reinit = True
+            elif self._in_channels_fixed is not None and self.residual_proj is not None:
+                # Re-init if input channels changed from what conv was built with
+                conv_in_channels = self.conv.in_channels
+                if x.size(1) != conv_in_channels:
+                    needs_reinit = True
+            elif self._in_channels_fixed is None and self.residual_proj is not None:
+                # LazyConv1d resolved: re-init if channels changed
+                conv_in_channels = self.conv.in_channels
+                if x.size(1) != conv_in_channels:
+                    needs_reinit = True
+
+            if needs_reinit:
+                in_channels_actual = x.size(1)
+                out_channels_actual = self.out_channels
+                stride_actual = self.stride
+                if in_channels_actual != out_channels_actual or stride_actual > 1:
+                    self.residual_proj = nn.Conv1d(
+                        in_channels_actual, out_channels_actual, 1, stride_actual, 0).to(x.device)
+                else:
+                    self.residual_proj = None
 
         # NAC order: Norm -> Activation -> Conv
         x = self.norm(x)
+
+        # Re-init conv if LazyConv1d resolved to wrong channels, or fixed conv mismatches
+        if self._in_channels_fixed is None:
+            conv_in_channels = self.conv.in_channels
+        else:
+            conv_in_channels = self.conv.in_channels
+        if x.size(1) != conv_in_channels:
+            in_channels_actual = x.size(1)
+            self.conv = nn.Conv1d(
+                in_channels_actual, self.out_channels,
+                self.conv.kernel_size, self.conv.stride, self.conv.padding).to(x.device)
+            if self.residual and self.residual_proj is not None:
+                self.residual_proj = nn.Conv1d(
+                    in_channels_actual, self.out_channels, 1, self.stride, 0).to(x.device)
         # Back to (batch, seq_len, channels) for activation
         x = x.transpose(1, 2)
         x = layers.activate(x, self.activation)

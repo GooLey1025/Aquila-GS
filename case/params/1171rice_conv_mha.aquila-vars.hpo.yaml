@@ -6,7 +6,6 @@ data:
   variant_type: snp_indel_sv
   classification_tasks: null
 
-
 hpo:
   enabled: true
   n_trials: 500
@@ -27,10 +26,6 @@ hpo:
       type: log_uniform
       low: 1.0e-6
       high: 1.0e-2
-
-    train.batch_size:
-      type: categorical
-      choices: [16, 32]
 
     train.gradient_clip_norm:
       type: categorical
@@ -150,7 +145,7 @@ model:
   verbose: true
   
 train:
-  batch_size: 32
+  batch_size: 16
   num_epochs: 300
   learning_rate: 0.0001
   weight_decay: 0.001
