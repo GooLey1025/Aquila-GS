@@ -24,5 +24,5 @@ pip3 install -e .
 ## Data Preprocess
 ## Contact
 
-For questions or issues, please open an issue on GitHub or contact us at aquila@example.com.
+For questions or issues, please open an issue on GitHub or contact us at goley04@foxmail.com (Lei Gu) or qiujie@shnu.edu.cn (Jie Qiu).
 
