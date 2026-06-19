@@ -9,3 +9,9 @@ src/aquila/__pycache__/
 *.pkl
 data_cache/
 RiceAtlas_MP2025/rename6048.ped
+
+*.pt
+*.pth
+*.ckpt
+
+checkpoints/
