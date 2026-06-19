@@ -1,0 +1,3 @@
+Rscript rrBLUP_train_case.r
+Rscript rrBLUP_predict_case.r
+python3 correlation_analysis.py
