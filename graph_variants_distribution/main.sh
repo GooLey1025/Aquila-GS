@@ -1,3 +1,4 @@
+# Nip_42_rice.vcf.gz is output of Minigraph-Cactus.
 vcfwave Nip_42_rice.vcf.gz -t 24 > Nip_42_rice.vcfwave.vcf
 
 mkdir -p vcf_split
