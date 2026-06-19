@@ -1,0 +1,75 @@
+output_dir: 705rice_conv_mha_train_out
+data:
+  geno_file: 705rice_0.03.full.all.impute.biallelic.vcf.gz #705rice_0.005.snp.indel.sv.vcf.gz # beagle_impute/705rice_0.005.full.snp.impute.biallelic.vcf.gz
+  pheno_file: GSTP008.pheno.tsv #705rice_data/705Rice.phenos.completed.tsv
+  encoding_type: diploid_onehot
+  variant_type: snp
+  classification_tasks: null
+
+
+train:
+  batch_size: 32
+  num_epochs: 300
+  learning_rate: 0.0001
+  weight_decay: 0.001
+  optimizer_type: adamw
+  loss_type: mse
+  normalize_regression: true
+  uncertainty_weighting: true
+  early_stopping_patience: 40
+  gradient_clip_norm: 1.0
+  scheduler_type: cosine_warmup
+  scheduler_params:
+    warmup_epochs: 10
+    warmup_start_factor: 0.01
+    min_lr: 1.0e-05
+  val_split: 0.1
+  test_split: 0.0
+  num_workers: 4
+
+model:
+  architecture_type: single
+  activation: gelu
+  dropout: 0.1
+  l2_scale: 1.0e-05
+  verbose: true
+  embedder:
+  - name: conv_block
+    in_channels: 8
+    out_channels: 256
+    kernel_size: 15
+    activation: gelu
+    norm_type: layer
+    residual: false
+  trunk:
+  - name: down_conv_tower
+    in_channels: 256
+    out_channels: 256
+    kernel_size: 5
+    padding: 2
+    activation: gelu
+    dropout: 0.1
+    norm_type: layer
+    order: nac
+    residual: true
+    seq_len_threshold: 1500
+  - name: transformer
+    d_model: 256
+    num_heads: 8
+    d_ff: 256
+    dropout: 0.1
+    activation: gelu
+  - name: global_pool
+    d_model: 256
+    dropout: 0.1
+    pool_type: max
+    pool_axis: 2
+
+  heads:
+    regression:
+    - name: regression_head
+      in_features: null
+      num_targets: 18
+      hidden_features: 256
+      dropout: 0.1
+      activation: gelu
