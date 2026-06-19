@@ -84,6 +84,15 @@ def parse_args():
         help='Path to phenotype file (optional, for computing metrics if available)'
     )
 
+    parser.add_argument(
+        '--minimize-pheno',
+        type=str,
+        default=None,
+        help='Path to a one-per-line file listing traits to MINIMIZE in the selection index. '
+             'All other regression traits are maximized. '
+             'If omitted, all traits are maximized with equal weight.'
+    )
+
     # Output options
     parser.add_argument(
         '-o',
@@ -271,24 +280,37 @@ def load_vcf_data(vcf_path: str, encoding_type: str, config: dict) -> Tuple[dict
     if is_multi_branch:
         # Multi-branch: returns dict
         variant_data = parse_genotype_file(vcf_path, encoding_type, variant_type)
-        
+
         # Extract sample IDs from first variant type
         first_variant_type = list(variant_data.keys())[0]
-        sample_ids = variant_data[first_variant_type][1]
-        
+        sample_ids = variant_data[first_variant_type]['sample_ids']
+
         # seq_length as dict
-        seq_length = {vtype: data[0].shape[1] for vtype, data in variant_data.items()}
-        
+        seq_length = {vtype: data['matrix'].shape[1] for vtype, data in variant_data.items()}
+
         # Convert to tensor dict
-        variant_tensors = {vtype: torch.from_numpy(data[0]).long() 
-                         for vtype, data in variant_data.items()}
+        variant_tensors = {}
+        for vtype, data in variant_data.items():
+            arr = data['matrix']
+            if arr.dtype == np.float32 or arr.dtype == np.float64:
+                variant_tensors[vtype] = torch.from_numpy(arr).float()
+            else:
+                variant_tensors[vtype] = torch.from_numpy(arr).long()
     else:
         # Single-branch
         result = parse_genotype_file(vcf_path, encoding_type, variant_type)
-        snp_matrix, sample_ids, _ = result
-        
+        # Handle both new dict format and old tuple format for backward compat
+        if isinstance(result, dict):
+            snp_matrix = result['matrix']
+            sample_ids = result['sample_ids']
+        else:
+            snp_matrix, sample_ids, _ = result
+
         # Convert to tensor
-        variant_tensors = torch.from_numpy(snp_matrix).long()
+        if snp_matrix.dtype == np.float32 or snp_matrix.dtype == np.float64:
+            variant_tensors = torch.from_numpy(snp_matrix).float()
+        else:
+            variant_tensors = torch.from_numpy(snp_matrix).long()
         seq_length = snp_matrix.shape[1]
     
     print(f"  Loaded {len(sample_ids)} samples")
@@ -621,7 +643,47 @@ def main():
         is_classification=is_classification,
         classification_tasks=classification_tasks
     )
-    
+
+    # Print selection index for each sample (all regression tasks, equal weight)
+    if 'regression' in predictions and norm_stats:
+        regression_tasks = norm_stats.get('regression_tasks', [])
+
+        # Load minimize traits if provided
+        minimize_traits = set()
+        if args.minimize_pheno:
+            minimize_path = Path(args.minimize_pheno)
+            if minimize_path.exists():
+                with open(minimize_path) as f:
+                    for line in f:
+                        t = line.strip()
+                        if t:
+                            minimize_traits.add(t)
+            invalid = minimize_traits - set(regression_tasks)
+            if invalid:
+                print(f"\nWarning: traits in --minimize-pheno not found in model: {invalid}")
+
+        preds_norm = predictions['regression']  # (N_samples, n_tasks), Z-score space
+        weights = np.array([(-1.0 if t in minimize_traits else 1.0) for t in regression_tasks])
+
+        # SI = Σ(weight_i * z_i) for each sample, relative to z-score origin
+        si_values = (preds_norm * weights).sum(axis=1)  # (N_samples,)
+
+        print("\n" + "=" * 80)
+        print(f"Selection Index (equal weights, normalized space, n_tasks={len(regression_tasks)})")
+        print("=" * 80)
+        if minimize_traits:
+            print(f"  Maximize traits ({len(regression_tasks) - len(minimize_traits)}): "
+                  f"{[t for t in regression_tasks if t not in minimize_traits]}")
+            print(f"  Minimize traits ({len(minimize_traits)}): {sorted(minimize_traits)}")
+        else:
+            print(f"  All {len(regression_tasks)} traits maximized with equal weight")
+        print()
+        print(f"  {'Sample_ID':<30} {'SI':>10}")
+        print(f"  {'-'*30} {'-'*10}")
+        for i, sid in enumerate(sample_ids):
+            print(f"  {sid:<30} {si_values[i]:>10.4f}")
+        print(f"\n  SI mean: {si_values.mean():.4f}  |  std: {si_values.std():.4f}  |  min: {si_values.min():.4f}  |  max: {si_values.max():.4f}")
+
     # Compute metrics if phenotype file provided
     if args.pheno and norm_stats:
         print("\n" + "=" * 80)

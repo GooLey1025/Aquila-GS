@@ -341,28 +341,26 @@ def load_model_and_data(args):
             print(f"Loading multi-branch genotype data from: {geno_file}")
             result = parse_genotype_file(geno_file, encoding_type=encoding_type, variant_type=variant_type)
 
-            # result is a dict: {'snp': (matrix, samples, ids), 'indel': ..., 'sv': ...}
+            # result is a dict: {'snp': {'matrix': ..., 'sample_ids': ..., 'variant_ids': ...}, ...}
             data_dict = {}
             sample_ids = []
             snp_ids = {}
 
             if 'snp' in result:
-                snp_matrix, sample_ids, snp_id_list = result['snp']
-                data_dict['snp'] = snp_matrix
-                snp_ids['snp'] = snp_id_list
-                print(f"  Loaded {len(snp_id_list)} SNPs for {len(sample_ids)} samples")
+                data_dict['snp'] = result['snp']['matrix']
+                sample_ids = result['snp']['sample_ids']
+                snp_ids['snp'] = result['snp']['variant_ids']
+                print(f"  Loaded {len(snp_ids['snp'])} SNPs for {len(sample_ids)} samples")
 
             if 'indel' in result:
-                indel_matrix, _, indel_id_list = result['indel']
-                data_dict['indel'] = indel_matrix
-                snp_ids['indel'] = indel_id_list
-                print(f"  Loaded {len(indel_id_list)} INDELs")
+                data_dict['indel'] = result['indel']['matrix']
+                snp_ids['indel'] = result['indel']['variant_ids']
+                print(f"  Loaded {len(snp_ids['indel'])} INDELs")
 
             if 'sv' in result:
-                sv_matrix, _, sv_id_list = result['sv']
-                data_dict['sv'] = sv_matrix
-                snp_ids['sv'] = sv_id_list
-                print(f"  Loaded {len(sv_id_list)} SVs")
+                data_dict['sv'] = result['sv']['matrix']
+                snp_ids['sv'] = result['sv']['variant_ids']
+                print(f"  Loaded {len(snp_ids['sv'])} SVs")
         else:
             # Single branch
             data_config = config.get('data', {})
@@ -378,9 +376,15 @@ def load_model_and_data(args):
                     raise ValueError("No VCF file specified. Please provide --vcf or set geno_file in config.")
 
             print("Loading genotype data...")
-            snp_matrix, sample_ids, snp_id_list = parse_genotype_file(
+            result = parse_genotype_file(
                 vcf_file, encoding_type=encoding_type, variant_type=variant_type
             )
+            if isinstance(result, dict):
+                snp_matrix = result['matrix']
+                sample_ids = result['sample_ids']
+                snp_id_list = result['variant_ids']
+            else:
+                snp_matrix, sample_ids, snp_id_list = result
             data_dict = {'snp': snp_matrix}
             snp_ids = {'snp': snp_id_list}
             print(f"Loaded {len(snp_id_list)} variants for {len(sample_ids)} samples")

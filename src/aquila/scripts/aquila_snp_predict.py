@@ -82,7 +82,13 @@ def main():
     
     # Load genotype data
     print(f"\nLoading genotype data: {args.geno}")
-    snp_matrix, sample_ids, snp_ids = parse_genotype_file(args.geno)
+    result = parse_genotype_file(args.geno)
+    if isinstance(result, dict):
+        snp_matrix = result['matrix']
+        sample_ids = result['sample_ids']
+        snp_ids = result['variant_ids']
+    else:
+        snp_matrix, sample_ids, snp_ids = result
     seq_length = snp_matrix.shape[1]
     
     print(f"Found {len(sample_ids)} samples with {seq_length} SNPs")
