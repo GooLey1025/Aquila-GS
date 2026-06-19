@@ -1,0 +1,5 @@
+Sample_ID,Heading_date_Pred,Plant_height_Pred,Leaf_length_Pred,Leaf_width_Pred,Tiller_angle_Pred,Full_grain_number_per_plant_Pred,Valid_panicle_number_Pred,Full_grain_number_per_panicle_Pred,Kilo-grain_weight_Pred,Seed_setting_rate_Pred,Yield_per_plant_Pred,Amylose_content_Pred,Gel_consistency_Pred,Chalkiness_Pred,Chalky_grain_percentage_Pred,Grain_shape(Length_to_width_ratio_of_polished_grain)_Pred,Grain_translucency_level_Pred
+Teqing_predict,85.051285,120.042488,42.541859,1.887409,83.408562,1499.312744,6.889800,219.633224,23.558270,0.820968,32.728615,21.132406,51.800201,7.453208,34.844257,2.485773,2.433542
+Huanghuazhan_predict,82.538666,109.575165,45.070667,1.784979,82.797813,1557.266113,8.359166,179.904526,22.159008,0.790503,31.216024,18.101330,76.968636,2.905197,11.099930,3.275457,1.910957
+Teqing_2015_PBJ,120.5,87.9,24.0,NA,NA,NA,5.3,216,26,NA,7.8,27.1,44.0,NA,NA,2.40,3.0
+Huanghuazhan_2015_PBJ,117.1,83.9,26.2,NA,NA,NA,6.0,173,23.8,NA,6.8,16.6,75.8,NA,NA,3.95,2.0

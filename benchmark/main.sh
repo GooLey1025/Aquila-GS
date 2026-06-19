@@ -1,0 +1,4 @@
+python3 summary_result.py
+
+python3 specific_phenotypes_summary.py
+python3 specific_phenotypes_plot.py

@@ -1,4 +1,4 @@
-## Case1
+## Case1: Teqing-to-HHZ
 DIRECTION_FILE=teqing_to_hhz.evolve_direction_2.tsv
 aquila_evolve.py --model-dir 1171rice_conv_mha.aquila-snp.best_model \
   --vcf Teqing__SAMN04505840.1171rice.snp.impute.biallelic.vcf.gz  \
@@ -6,10 +6,7 @@ aquila_evolve.py --model-dir 1171rice_conv_mha.aquila-snp.best_model \
   --seed 42 \
   --sites-to-evolve ricenavi_gatk3_gatk4_snp_indel_id.list  \
   --output-dir 1171rice_SI_screening_evolve --strategy screening --save-all-rounds --homozygous
-python plot_evolution_trait_heatmap.py \
-  --pred 1171rice_SI_screening_evolve/round_predictions.tsv \
-  --direction $DIRECTION_FILE --round-step 1\
-  --out 1171rice_SI_screening_teqing_to_hhz_trait_evolution_heatmap
+
 python3 plot_screening_gain_QTN.py  \
   --screening-file 1171rice_SI_screening_evolve/screening_si_per_round.tsv \
   --ricenavi-file ricenavi_319site_evaluation.csv  \
@@ -31,39 +28,7 @@ python plot_qtn_gain_seed_mean_panel.py \
   --hhz-vcf Huanghuazhan.1171rice.snp.impute.biallelic.vcf.gz \
   --out-prefix 1171rice_seed_mean_QTN_gain
 
-# Case2 Failed.
-DIRECTION_FILE=hhz_as_base.evolve_direction.tsv
-aquila_evolve.py --model-dir 1171rice_conv_mha.aquila-snp.best_model \
-  --vcf Huanghuazhan.1171rice.snp.impute.biallelic.vcf.gz  \
-  --direction-file $DIRECTION_FILE  \
-  --seed 42 \
-  --sites-to-evolve ricenavi_gatk3_gatk4_snp_indel_id.list  \
-  --output-dir 1171rice_HHZ_SI_screening_evolve --strategy screening --save-all-rounds --homozygous
-python plot_evolution_trait_heatmap.py \
-  --pred 1171rice_HHZ_SI_screening_evolve/round_predictions.tsv \
-  --direction $DIRECTION_FILE --round-step 1\
-  --out 1171rice_HHZ_SI_screening_teqing_to_hhz_trait_evolution_heatmap
-python3 plot_screening_gain_QTN.py  \
-  --screening-file 1171rice_HHZ_SI_screening_evolve/screening_si_per_round.tsv \
-  --ricenavi-file ricenavi_319site_evaluation.csv  \
-  --teqing-vcf Teqing__SAMN04505840.1171rice.snp.impute.biallelic.vcf.gz \
-  --hhz-vcf Huanghuazhan.1171rice.snp.impute.biallelic.vcf.gz \
-  --evolved-vcf 1171rice_SI_screening_evolve/Teqing__SAMN04505840.1171rice.snp.impute.biallelic_evolve.vcf.gz   --out-prefix QTN_gain_contribution   --top-n 20
-
-bash run_n_aquila_evolve.sh 100 $DIRECTION_FILE Huanghuazhan.1171rice.snp.impute.biallelic.vcf.gz 1171rice_HHZ_SI_screening_evolve 1171rice_conv_mha.aquila-snp.best_model
-python plot_all_seed_round_predictions.py \
-  --evolve-dir 1171rice_HHZ_SI_screening_evolve \
-  --out 1171rice_HHZ_SI_all_traits_round_predictions
-python plot_trait_change_summary.py   --evolve-dir 1171rice_HHZ_SI_screening_evolve   --direction $DIRECTION_FILE   --out 1171rice_HHZ_SI_trait_change_summary
-python plot_qtn_gain_seed_mean_panel_for_web.py \
-  --evolve-dir 1171rice_HHZ_SI_screening_evolve \
-  --screening-name screening_si_per_round.tsv \
-  --evolved-vcf-name Huanghuazhan.1171rice.snp.impute.biallelic_evolve.vcf.gz \
-  --ricenavi-file ricenavi_319site_evaluation.csv \
-  --base-vcf Huanghuazhan.1171rice.snp.impute.biallelic.vcf.gz \
-  --out-prefix 1171rice_seed_mean_QTN_gain_HHZ-base
-
-# Case3
+## Case2: HHZ-base
 DIRECTION_FILE=hhz_base_705rice.directions.tsv
 LABEL=maximize-minimize
 aquila_evolve.py --model-dir 705rice_conv_mha.aquila-snp.best_model \
@@ -73,9 +38,7 @@ aquila_evolve.py --model-dir 705rice_conv_mha.aquila-snp.best_model \
   --sites-to-evolve ricenavi_gatk3_gatk4_snp_indel_id.exclude_sterility.list  \
   --output-dir 705rice_HHZ_${LABEL}_SI_screening_evolve --strategy screening --save-all-rounds --homozygous
 bash run_n_aquila_evolve.sh 100 $DIRECTION_FILE huanghuazhan.705rice.snp.vcf.gz 705rice_HHZ_${LABEL}_SI_screening_evolve 705rice_conv_mha.aquila-snp.best_model True
-python plot_all_seed_round_predictions.py \
-  --evolve-dir 705rice_HHZ_${LABEL}_SI_screening_evolve \
-  --out 705rice_HHZ_${LABEL}_SI_all_traits_round_predictions
+
 python plot_trait_change_summary.py   --task-mapping 705rice_conv_mha.aquila-snp.best_model/task_mapping.tsv --evolve-dir 705rice_HHZ_${LABEL}_SI_screening_evolve   --direction $DIRECTION_FILE   --out 705rice_HHZ_${LABEL}_SI_trait_change_summary
 python plot_qtn_gain_seed_mean_panel_for_web.py \
   --evolve-dir 705rice_HHZ_${LABEL}_SI_screening_evolve \
@@ -85,41 +48,7 @@ python plot_qtn_gain_seed_mean_panel_for_web.py \
   --base-vcf huanghuazhan.705rice.snp.vcf.gz \
   --out-prefix 705rice_${LABEL}_seed_mean_QTN_gain_HHZ-base
 
-# Case4; for genome wide
-DIRECTION_FILE=hhz_base_705rice.directions.tsv
-
-aquila_evolve.py --model-dir 705rice_conv_mha.aquila-snp.best_model \
-  --vcf Huanghuazhan.705rice.snp.impute.biallelic.vcf.gz  \
-  --direction-file $DIRECTION_FILE  \
-  --seed 42 \
-  --sites-to-evolve ricenavi_gatk3_gatk4_snp_indel_id.list  \
-  --output-dir 705rice_HHZ_SI_screening_evolve --strategy screening --save-all-rounds --homozygous
-bash run_n_aquila_evolve.sh 10 $DIRECTION_FILE huanghuazhan.705rice.snp.vcf.gz 705rice_HHZ_GW_SI_screening_evolve 705rice_conv_mha.aquila-snp.best_model False
-python plot_all_seed_round_predictions.py \
-  --evolve-dir 705rice_HHZ_GW_SI_screening_evolve \
-  --out 705rice_HHZ_GW_SI_all_traits_round_predictions
-python plot_trait_change_summary.py   --task-mapping 705rice_conv_mha.aquila-snp.best_model/task_mapping.tsv --evolve-dir 705rice_HHZ_GW_SI_screening_evolve   --direction $DIRECTION_FILE   --out 705rice_HHZ_GW_SI_trait_change_summary
-python plot_qtn_gain_seed_mean_panel_for_web.py \
-  --evolve-dir 705rice_HHZ_GW_SI_screening_evolve \
-  --screening-name screening_si_per_round.tsv \
-  --evolved-vcf-name huanghuazhan.705rice.snp_evolve.vcf.gz \
-  --ricenavi-file ricenavi_319site_evaluation.csv \
-  --base-vcf huanghuazhan.705rice.snp.vcf.gz \
-  --out-prefix 705rice_seed_mean_QTN_gain_HHZ-base-GW --all-sites
-
-python3 calc_round_ibs.py -r 1171rice_SI_screening_evolve/round_vcf --target-vcf Huanghuazhan.1171rice.snp.impute.biallelic.vcf.gz -o Teqing.screening.evolve.1171rice.round_IBS_convergence.tsv
-python plot_ibs_convergence.py \
-    -i Teqing.screening.evolve.1171rice.round_IBS_convergence.tsv \
-    -o Teqing_screening_to_HHZ_IBS
-
-python plot_genomic_allele_shift.py \
-  --teqing-vcf Teqing__SAMN04505840.1171rice.snp.impute.biallelic.vcf.gz \
-  --hhz-vcf Huanghuazhan.1171rice.snp.impute.biallelic.vcf.gz \
-  --evolved-vcf 1171rice_SI_screening_evolve/Teqing__SAMN04505840.1171rice.snp.impute.biallelic_evolve.vcf.gz \
-  --karyotype karyotype.txt \
-  --qtn ricenavi_319site_evaluation.csv \
-  -o Teqing_Evolved_HHZ_genomic_shift
-
+# Other
 python3 plot_si_gain_vs_gwas_diff.py \
   --si-gain 705rice_seed_mean_QTN_gain_HHZ-base-GW.all_sites_gain.tsv \
   --gwas-ling 705rice_gwas_results/GYP_LingS15/gemma_lmm.assoc.txt \
