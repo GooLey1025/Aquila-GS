@@ -330,7 +330,16 @@ def parse_args():
         '-dr',
         '--data-restart',
         action='store_true',
-        help='Ignore data cache and re-process data from scratch'
+        help='Ignore data cache and re-process data from scratch (useful when cache is stale)'
+    )
+
+    parser.add_argument(
+        '--save-cache',
+        action='store_true',
+        help='Save processed data to disk cache for faster subsequent runs. '
+             'Useful during debugging when you want to reuse the same data splits '
+             'and preprocessing repeatedly. Without this flag, data is re-processed '
+             'from raw input files each run.'
     )
 
     parser.add_argument(
@@ -572,7 +581,7 @@ def main():
         normalize_regression=train_config.get('normalize_regression', True),
         encoding_type=encoding_type,
         variant_type=config.get('data', {}).get('variant_type'),
-        cache_dir=output_dir,
+        cache_dir=output_dir if args.save_cache else None,
         data_restart=args.data_restart,
         skew_threshold=args.skew_threshold,
         rank=rank,

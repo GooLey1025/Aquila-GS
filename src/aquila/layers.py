@@ -525,8 +525,8 @@ class MultiHeadPooling(nn.Module):
         if pool_axis == 1:
             # Pool over sequence dimension
             self.attention_pool = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.Tanh(),
+                # nn.Linear(d_model, d_model),
+                # nn.Tanh(),
                 nn.Linear(d_model, 1)
             )
         else:

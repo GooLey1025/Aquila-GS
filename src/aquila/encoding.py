@@ -12,8 +12,11 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Tuple, List
+import os
 import gzip
+import subprocess
+import tempfile
+from typing import Tuple, List
 
 
 ###############################################################################
@@ -91,7 +94,15 @@ def parse_genotype_token(geno_path: str) -> Tuple[np.ndarray, List[str], List[st
                     f"at SNP {snp_idx}, sample {sample_idx}"
                 )
 
-    return snp_matrix, sample_ids, snp_ids
+    return {
+        'matrix': snp_matrix,
+        'sample_ids': sample_ids,
+        'variant_ids': snp_ids,
+        'refs': [row['REF'] for _, row in df.iterrows()],
+        'alts': [row['ALT'] for _, row in df.iterrows()],
+        'chroms': [row['#CHROM'] for _, row in df.iterrows()],
+        'positions': [row['POS'] for _, row in df.iterrows()],
+    }
 
 
 ###############################################################################
@@ -195,7 +206,15 @@ def parse_genotype_diploid_onehot(geno_path: str) -> Tuple[np.ndarray, List[str]
                     f"at SNP {snp_idx}, sample {sample_idx}"
                 )
 
-    return snp_matrix, sample_ids, snp_ids
+    return {
+        'matrix': snp_matrix,
+        'sample_ids': sample_ids,
+        'variant_ids': snp_ids,
+        'refs': [row['REF'] for _, row in df.iterrows()],
+        'alts': [row['ALT'] for _, row in df.iterrows()],
+        'chroms': [row['#CHROM'] for _, row in df.iterrows()],
+        'positions': [row['POS'] for _, row in df.iterrows()],
+    }
 
 
 ###############################################################################
@@ -390,6 +409,10 @@ def parse_genotype_vcf(
             # Store variant data
             variants_by_type[variant_type].append({
                 'id': variant_id,
+                'chrom': chrom,
+                'pos': pos,
+                'ref': ref,
+                'alt': alt,
                 # Shape: (n_samples, encoding_dim) - varies by variant type
                 'encodings': np.array(variant_encodings)
             })
@@ -403,6 +426,9 @@ def parse_genotype_vcf(
     for vtype, variants in variants_by_type.items():
         if len(variants) == 0:
             print(f"Warning: No {vtype} variants found")
+            # Still include empty entry so callers can distinguish "type not requested"
+            # from "type requested but none found"
+            result[vtype] = None
             continue
 
         n_variants = len(variants)
@@ -418,6 +444,10 @@ def parse_genotype_vcf(
         # Create matrix: (n_samples, n_variants, encoding_dim)
         matrix = np.zeros((n_samples, n_variants, encoding_dim), dtype=np.float32)
         variant_ids = []
+        variant_refs = []
+        variant_alts = []
+        variant_chroms = []
+        variant_positions = []
 
         for i, variant in enumerate(variants):
             variant_enc = variant['encodings']
@@ -433,25 +463,35 @@ def parse_genotype_vcf(
                     variant_enc = temp
             matrix[:, i, :] = variant_enc
             variant_ids.append(variant['id'])
+            variant_refs.append(variant['ref'])
+            variant_alts.append(variant['alt'])
+            variant_chroms.append(variant['chrom'])
+            variant_positions.append(variant['pos'])
 
-        result[vtype] = (matrix, sample_ids, variant_ids)
+        result[vtype] = {
+            'matrix': matrix,
+            'sample_ids': sample_ids,
+            'variant_ids': variant_ids,
+            'refs': variant_refs,
+            'alts': variant_alts,
+            'chroms': variant_chroms,
+            'positions': variant_positions,
+        }
         encoding_name = 'diploid_onehot (8-dim)' if vtype == 'SNP' else 'genotype_class (4-dim)'
         print(f"  {vtype}: {n_variants} variants × {n_samples} samples [{encoding_name}]")
 
     return result
 
 
-def parse_genotype_snp_vcf(vcf_path: str) -> Tuple[np.ndarray, List[str], List[str]]:
+def parse_genotype_snp_vcf(vcf_path: str):
     """
     Parse VCF file extracting only SNP variants.
 
     Returns:
-        snp_matrix: (n_samples, n_snps, 8) array
-        sample_ids: List of sample IDs
-        snp_ids: List of SNP IDs
+        Dict with keys: matrix, sample_ids, variant_ids, refs, alts, chroms, positions.
     """
     result = parse_genotype_vcf(vcf_path, variant_types=['SNP'])
-    if 'SNP' not in result:
+    if 'SNP' not in result or result['SNP'] is None:
         raise ValueError("No SNP variants found in VCF file")
     return result['SNP']
 
@@ -544,6 +584,8 @@ def parse_genotype_snp_vcf_onehot(vcf_path: str) -> Tuple[np.ndarray, List[str],
                 continue
 
             fields = line.split('\t')
+            chrom = fields[0]
+            pos = fields[1]
             variant_id = fields[2]
             ref = fields[3]
             alt = fields[4]
@@ -564,6 +606,10 @@ def parse_genotype_snp_vcf_onehot(vcf_path: str) -> Tuple[np.ndarray, List[str],
 
             variants_by_type[variant_type].append({
                 'id': variant_id,
+                'chrom': chrom,
+                'pos': pos,
+                'ref': ref,
+                'alt': alt,
                 'encodings': np.array(variant_encodings),
             })
 
@@ -580,41 +626,53 @@ def parse_genotype_snp_vcf_onehot(vcf_path: str) -> Tuple[np.ndarray, List[str],
     n_samples = len(sample_ids)
     matrix = np.zeros((n_samples, n_variants, 3), dtype=np.float32)
     snp_ids = []
+    refs = []
+    alts = []
+    chroms = []
+    positions = []
 
     for i, variant in enumerate(variants):
         matrix[:, i, :] = variant['encodings']
         snp_ids.append(variant['id'])
+        refs.append(variant['ref'])
+        alts.append(variant['alt'])
+        chroms.append(variant['chrom'])
+        positions.append(variant['pos'])
 
     print(f"  SNP: {n_variants} variants × {n_samples} samples")
-    return matrix, sample_ids, snp_ids
+    return {
+        'matrix': matrix,
+        'sample_ids': sample_ids,
+        'variant_ids': snp_ids,
+        'refs': refs,
+        'alts': alts,
+        'chroms': chroms,
+        'positions': positions,
+    }
 
 
-def parse_genotype_indel_vcf(vcf_path: str) -> Tuple[np.ndarray, List[str], List[str]]:
+def parse_genotype_indel_vcf(vcf_path: str):
     """
     Parse VCF file extracting only INDEL variants.
 
     Returns:
-        indel_matrix: (n_samples, n_indels, 8) array
-        sample_ids: List of sample IDs
-        indel_ids: List of INDEL IDs
+        Dict with keys: matrix, sample_ids, variant_ids, refs, alts, chroms, positions.
     """
     result = parse_genotype_vcf(vcf_path, variant_types=['INDEL'])
-    if 'INDEL' not in result:
+    if 'INDEL' not in result or result['INDEL'] is None:
         raise ValueError("No INDEL variants found in VCF file")
     return result['INDEL']
 
 
-def parse_genotype_sv_vcf(vcf_path: str) -> Tuple[np.ndarray, List[str], List[str]]:
+def parse_genotype_sv_vcf(vcf_path: str):
     """
     Parse VCF file extracting only SV (structural variant) variants.
 
     Returns:
-        sv_matrix: (n_samples, n_svs, 8) array
-        sample_ids: List of sample IDs
-        sv_ids: List of SV IDs
+        Dict with keys: matrix, sample_ids, variant_ids, refs, alts, chroms, positions.
     """
     result = parse_genotype_vcf(vcf_path, variant_types=['SV'])
-    if 'SV' not in result:
+    if 'SV' not in result or result['SV'] is None:
         raise ValueError("No SV variants found in VCF file")
     return result['SV']
 
@@ -716,3 +774,345 @@ def parse_genotype_file(geno_path: str, encoding_type: str = 'token', variant_ty
 
     # Fallback (should not reach here)
     raise ValueError(f"Unknown variant_type: {variant_type}")
+
+
+###############################################################################
+# VCF Writing Utilities (for directed evolution output)
+###############################################################################
+
+def onehot_to_gt_diploid(
+    encoding: np.ndarray, ref_allele: str, alt_allele: str
+) -> Tuple[int, int]:
+    """
+    Convert 8-dimensional diploid nucleotide one-hot encoding back to VCF GT allele indices.
+
+    Args:
+        encoding: (8,) array where [:4] is allele1 A/C/G/T, [4:] is allele2 A/C/G/T.
+        ref_allele: The REF allele nucleotide (e.g. 'A', 'T').
+        alt_allele: The ALT allele nucleotide (e.g. 'T', 'G').
+
+    Returns:
+        Tuple of (allele1_idx, allele2_idx) where 0=REF, 1=ALT in VCF terms,
+        or (-1, -1) if the encoding is all-zeros (missing).
+
+    Encoding map (alphabetical order A,C,G,T -> indices 0,1,2,3):
+        Position 0=A, 1=C, 2=G, 3=T
+        First 4 positions: haplotype 1
+        Last 4 positions: haplotype 2
+
+    Example (REF=A, ALT=T):
+        - [0,0,0,1, 1,0,0,0] → haplotype1=T(ALT), haplotype2=A(REF) → (1, 0) → "1|0"
+        - [1,0,0,0, 0,0,0,1] → haplotype1=A(REF), haplotype2=T(ALT) → (0, 1) → "0|1"
+    """
+    if encoding.sum() == 0:
+        return (-1, -1)  # Missing
+
+    nuc_to_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+    ref_idx = nuc_to_idx.get(ref_allele.upper(), 0)
+    alt_idx = nuc_to_idx.get(alt_allele.upper(), 1)
+
+    hap1_nuc_idx = int(np.argmax(encoding[:4]))
+    hap2_nuc_idx = int(np.argmax(encoding[4:]))
+
+    allele1 = 0 if hap1_nuc_idx == ref_idx else (1 if hap1_nuc_idx == alt_idx else 0)
+    allele2 = 0 if hap2_nuc_idx == ref_idx else (1 if hap2_nuc_idx == alt_idx else 0)
+
+    return (allele1, allele2)
+
+
+def onehot_to_gt_genotype_class(encoding: np.ndarray) -> Tuple[int, int]:
+    """
+    Convert 4-dimensional genotype-class one-hot encoding back to GT allele indices.
+
+    Args:
+        encoding: (4,) array: [REF/REF, REF/ALT, ALT/REF, ALT/ALT].
+
+    Returns:
+        Tuple of (allele1_idx, allele2_idx) where 0=REF, 1=ALT, or (-1,-1) if missing.
+    """
+    if encoding.sum() == 0:
+        return (-1, -1)  # Missing
+
+    idx = np.argmax(encoding)
+    # Map: 0->(0,0), 1->(0,1), 2->(1,0), 3->(1,1)
+    return [(0, 0), (0, 1), (1, 0), (1, 1)][idx]
+
+
+def onehot_to_classic_3way(encoding: np.ndarray) -> int:
+    """
+    Convert 3-dimensional classic REF/HET/ALT one-hot encoding back to class index.
+
+    Args:
+        encoding: (3,) array: [REF/REF, HET, ALT/ALT].
+
+    Returns:
+        0 for REF/REF, 1 for HET, 2 for ALT/ALT, -1 for missing.
+    """
+    if encoding.sum() == 0:
+        return -1  # Missing
+    return int(np.argmax(encoding))
+
+
+def token_to_gt(token: int) -> Tuple[int, int]:
+    """
+    Convert token encoding {0,1,2,3} to GT allele indices.
+
+    Token encoding:
+        0: Homozygous alternate (ALT/ALT) -> (1, 1)
+        1: Homozygous reference (REF/REF) -> (0, 0)
+        2: Heterozygous (REF/ALT) -> (0, 1)
+        3: Missing -> (-1, -1)
+
+    Returns:
+        Tuple of (allele1_idx, allele2_idx) where 0=REF, 1=ALT.
+    """
+    return [(1, 1), (0, 0), (0, 1), (-1, -1)][token]
+
+
+def build_vcf_header_lines(vcf_path: str) -> List[str]:
+    """
+    Extract all header lines from a VCF file (everything before the first non-comment line).
+
+    Args:
+        vcf_path: Path to the input VCF file.
+
+    Returns:
+        List of header lines (including the #CHROM line).
+    """
+    is_gzipped = vcf_path.endswith('.gz')
+    open_func = gzip.open if is_gzipped else open
+    open_mode = 'rt' if is_gzipped else 'r'
+
+    header_lines = []
+    with open_func(vcf_path, open_mode) as f:
+        for line in f:
+            line = line.rstrip('\n')
+            if line.startswith('#'):
+                header_lines.append(line)
+            else:
+                break
+
+    return header_lines
+
+
+def parse_vcf_variant_rows(vcf_path: str) -> Tuple[List[dict], List[str]]:
+    """
+    Parse all variant rows from a VCF file, extracting metadata needed for writing.
+
+    Args:
+        vcf_path: Path to the input VCF file.
+
+    Returns:
+        Tuple of (variant_rows, header_lines) where variant_rows is a list of dicts:
+        {
+            'chrom': str,
+            'pos': str,
+            'id': str,
+            'ref': str,
+            'alt': str,
+            'qual': str,
+            'filter': str,
+            'info': str,
+            'format': str,
+            'genotypes': list of str,  # raw GT fields per sample
+        }
+        and header_lines are all lines starting with '#'.
+    """
+    is_gzipped = vcf_path.endswith('.gz')
+    open_func = gzip.open if is_gzipped else open
+    open_mode = 'rt' if is_gzipped else 'r'
+
+    variant_rows = []
+    header_lines = []
+
+    with open_func(vcf_path, open_mode) as f:
+        for line in f:
+            line = line.rstrip('\n')
+            if line.startswith('#'):
+                header_lines.append(line)
+            else:
+                fields = line.split('\t')
+                if len(fields) < 10:
+                    continue
+                variant_rows.append({
+                    'chrom': fields[0],
+                    'pos': fields[1],
+                    'id': fields[2],
+                    'ref': fields[3],
+                    'alt': fields[4],
+                    'qual': fields[5],
+                    'filter': fields[6],
+                    'info': fields[7],
+                    'format': fields[8],
+                    'genotypes': fields[9:],
+                })
+
+    return variant_rows, header_lines
+
+
+def write_evolved_vcf(
+    original_vcf_path: str,
+    output_vcf_path: str,
+    evolved_genotypes: dict,
+    evolved_sample_name: str,
+    phased: bool = True,
+    verbose: bool = False,
+) -> None:
+    """
+    Write an evolved VCF file by replacing the genotype of the original sample.
+
+    This reverses the VCF parsing: takes the evolved genotype matrices and writes them
+    back to VCF format with a new sample name.
+
+    Args:
+        original_vcf_path: Path to the original input VCF file.
+        output_vcf_path: Path to write the evolved VCF.
+        evolved_genotypes: Dict mapping variant_type to evolved genotype array:
+            - For SNP (8-dim one-hot): (n_snps, 8) array with 8-dim vectors per SNP
+            - For INDEL/SV (4-dim class one-hot): (n_variants, 4) array
+            - For token (1-dim): (n_snps,) array with token values {0,1,2,3}
+            Keys should be lowercase ('snp', 'indel', 'sv').
+        evolved_sample_name: New sample name (e.g. "Teqing__SAMN04505840__evolve").
+        phased: If True, use '|' (phased, default); if False, use '/' (unphased).
+    """
+    variant_rows, header_lines = parse_vcf_variant_rows(original_vcf_path)
+
+    # Build lookup dict: vid -> (vtype, encoding_row)
+    # Flatten all variant type arrays into a single lookup by variant ID
+    vid_to_info = {}  # vid -> {'vtype': str, 'encoding': array, 'idx': int}
+
+    for vtype, arr in evolved_genotypes.items():
+        for idx in range(arr.shape[0]):
+            # Try to get variant ID from the VCF rows by matching position/chrom if available
+            # Since we don't have a direct VID->encoding mapping, we use row-by-row lookup
+            pass  # Will do per-row lookup below
+
+    # Determine GT separator
+    sep = '|' if phased else '/'
+
+    # Build variant-type -> index tracker (for sequential matching)
+    vtype_idx = {vtype: 0 for vtype in evolved_genotypes}
+
+    # Build encoding dim lookup
+    vtype_dims = {}
+    for vtype, arr in evolved_genotypes.items():
+        vtype_dims[vtype] = arr.shape[-1] if arr.ndim > 1 else 1
+
+    # Write to a plain-text VCF first, then convert to proper BGZF via bcftools.
+    # Writing with Python gzip produces non-BGZF deflate blocks that pysam cannot seek.
+    if output_vcf_path.endswith('.gz'):
+        fd, tmp_path = tempfile.mkstemp(suffix='.vcf', dir=os.path.dirname(output_vcf_path) or '.')
+        os.close(fd)
+        out_handle = open(tmp_path, 'w')
+    else:
+        tmp_path = None
+        out_handle = open(output_vcf_path, 'w')
+
+    with out_handle as f:
+        # Write updated header
+        for hl in header_lines:
+            if hl.startswith('#CHROM'):
+                # Update sample name in header
+                fields = hl.split('\t')
+                if len(fields) > 9:
+                    fields[9] = evolved_sample_name
+                    f.write('\t'.join(fields) + '\n')
+                else:
+                    f.write(hl + '\n')
+            elif hl.startswith('##'):
+                f.write(hl + '\n')
+            else:
+                f.write(hl + '\n')
+
+        # Write variant rows with evolved genotypes
+        for row in variant_rows:
+            vid = row['id']
+            orig_genotypes = row['genotypes']
+            original_sample_gt = orig_genotypes[0] if orig_genotypes else '.'
+
+            # Determine variant type from ID (case-insensitive check)
+            vtype = None
+            for key in evolved_genotypes:
+                if key.upper() in vid.upper():
+                    vtype = key
+                    break
+            if vtype is None:
+                # Default to 'snp' for unknown types
+                vtype = 'snp'
+
+            # Get evolved genotype using sequential index for this vtype
+            gt_str = original_sample_gt  # Default to original
+
+            if vtype in evolved_genotypes:
+                arr = evolved_genotypes[vtype]
+                dim = vtype_dims.get(vtype, 1)
+
+                # Check if we have this variant in our evolved genotypes
+                idx = vtype_idx[vtype]
+                if idx < arr.shape[0]:
+                    encoding = arr[idx]
+                    vtype_idx[vtype] += 1  # Advance index
+
+                    if dim == 1:
+                        token = int(encoding)
+                        allele1, allele2 = token_to_gt(token)
+                    elif dim == 8:
+                        allele1, allele2 = onehot_to_gt_diploid(encoding, row['ref'], row['alt'])
+                    elif dim == 4:
+                        allele1, allele2 = onehot_to_gt_genotype_class(encoding)
+                    elif dim == 3:
+                        cls = onehot_to_classic_3way(encoding)
+                        if cls == -1:
+                            allele1, allele2 = -1, -1
+                        elif cls == 0:
+                            allele1, allele2 = 0, 0
+                        elif cls == 1:
+                            allele1, allele2 = 0, 1
+                        else:
+                            allele1, allele2 = 1, 1
+                    else:
+                        allele1, allele2 = -1, -1
+
+                    if allele1 == -1 or allele2 == -1:
+                        gt_str = '.'
+                    else:
+                        gt_str = f'{allele1}{sep}{allele2}'
+
+            # Write the row with evolved genotype
+            new_genotypes = [gt_str] + list(orig_genotypes[1:])
+            new_line = '\t'.join([
+                row['chrom'], row['pos'], row['id'], row['ref'], row['alt'],
+                row['qual'], row['filter'], row['info'], row['format'],
+            ] + new_genotypes) + '\n'
+            f.write(new_line)
+
+    # Convert plain VCF to BGZF-compressed VCF via bcftools (indexable by pysam).
+    if tmp_path is not None:
+        bgzf_tmp = tmp_path + '.bgzf.vcf.gz'
+        try:
+            subprocess.run(
+                ['bcftools', 'view', '--output-type', 'z',
+                 '--output', bgzf_tmp, tmp_path],
+                check=True, capture_output=True, text=True
+            )
+            os.replace(bgzf_tmp, output_vcf_path)
+            if verbose:
+                print(f"  Evolved VCF (BGZF) written to: {output_vcf_path}")
+
+            # Build CSI index so downstream tools (bcftools, sliding_divergence.py) work.
+            subprocess.run(
+                ['bcftools', 'index', '-f', output_vcf_path],
+                check=True, capture_output=True, text=True
+            )
+            if verbose:
+                print(f"  CSI index built for: {output_vcf_path}")
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"bcftools BGZF conversion failed.\nStdout: {e.stdout}\nStderr: {e.stderr}"
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    else:
+        if verbose:
+            print(f"  Evolved VCF written to: {output_vcf_path}")

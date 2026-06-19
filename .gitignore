@@ -8,3 +8,5 @@ src/aquila/__pycache__/
 *.log
 *.pkl
 data_cache/
+graph_variants_distribution/
+RiceAtlas_MP2025/rename6048.ped

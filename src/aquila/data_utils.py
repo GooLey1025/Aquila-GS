@@ -730,15 +730,20 @@ def create_data_loaders(
         variant_data = parse_geno_with_encoding(geno_path, encoding_type, variant_type_from_param)
         # Extract sample IDs from first variant type
         first_variant_type = list(variant_data.keys())[0]
-        _, sample_ids, _ = variant_data[first_variant_type]
+        sample_ids = variant_data[first_variant_type]['sample_ids']
 
         # Create dict of matrices (n_samples, n_variants, 8) per branch
-        snp_matrix = {vtype: data[0] for vtype, data in variant_data.items()}
+        snp_matrix = {vtype: data['matrix'] for vtype, data in variant_data.items()}
     else:
-        # Single-branch: returns tuple (matrix, sample_ids, variant_ids)
+        # Single-branch: returns dict (new format) or tuple (old format)
         # Supports: token, diploid_onehot, snp_vcf, indel_vcf, sv_vcf
         result = parse_geno_with_encoding(geno_path, encoding_type, variant_type_from_param)
-        snp_matrix, sample_ids, snp_ids = result
+        if isinstance(result, dict):
+            snp_matrix = result['matrix']
+            sample_ids = result['sample_ids']
+            snp_ids = result.get('variant_ids', [])
+        else:
+            snp_matrix, sample_ids, snp_ids = result
 
     pheno_df, regression_cols, classification_cols = parse_phenotype_file(
         pheno_path, classification_tasks
