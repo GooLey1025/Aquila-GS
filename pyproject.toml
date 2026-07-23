@@ -58,6 +58,10 @@ dependencies = [
 [project.scripts]
 aquila-train = "aquila.scripts.aquila_snp_train:main"
 aquila-predict = "aquila.scripts.aquila_snp_predict:main"
+aquila-cv = "aquila.scripts.aquila_cv:main"
+aquila-data-cv = "aquila.scripts.aquila_data_cv:main"
+aquila-train-cv = "aquila.scripts.aquila_train_cv:main"
+aquila-predict-cv = "aquila.scripts.aquila_predict:main"
 
 [project.urls]
 Homepage = "https://github.com/GooLey1025/aquila"

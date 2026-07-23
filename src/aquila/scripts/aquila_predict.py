@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# Author: Lei Gu
+# Contact: goley04@foxmail.com
+
 """
 Aquila VCF Prediction Script
 
@@ -24,7 +28,7 @@ import pandas as pd
 from pathlib import Path
 import pickle
 import json
-from typing import Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 
 from aquila.varnn import create_model_from_config
 from aquila.encoding import parse_genotype_file
@@ -59,6 +63,13 @@ def parse_args():
         type=str,
         default=None,
         help='Path to configuration YAML file (params.yaml)'
+    )
+
+    parser.add_argument(
+        '--data-metadata',
+        type=str,
+        default=None,
+        help='Optional JSON or PyTorch metadata file for a nested-CV checkpoint'
     )
 
     # Option 3: Output directory (deprecated, kept for backwards compatibility)
@@ -151,7 +162,35 @@ def find_file_in_dir(directory: Path, filename_pattern: str) -> Optional[Path]:
     return matches[0] if matches else None
 
 
-def load_model_and_config(args) -> Tuple[dict, Path, Path]:
+def _load_checkpoint_payload(checkpoint_path: Path, device: str = 'cpu') -> Dict[str, Any]:
+    """Load and validate a checkpoint mapping."""
+    checkpoint = torch.load(
+        checkpoint_path, map_location=device, weights_only=False
+    )
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Checkpoint must contain a dictionary")
+    return checkpoint
+
+
+def _load_data_metadata(path: Optional[str]) -> Dict[str, Any]:
+    """Load optional checkpoint metadata from JSON or a PyTorch file."""
+    if not path:
+        return {}
+    metadata_path = Path(path)
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Data metadata file not found: {metadata_path}")
+    if metadata_path.suffix.lower() == '.json':
+        with metadata_path.open(encoding='utf-8') as handle:
+            values = json.load(handle)
+    else:
+        values = torch.load(metadata_path, map_location='cpu', weights_only=False)
+    if not isinstance(values, dict):
+        raise ValueError("Data metadata must contain a dictionary")
+    nested_metadata = values.get('metadata')
+    return nested_metadata if isinstance(nested_metadata, dict) else values
+
+
+def load_model_and_config(args) -> Tuple[dict, Path, Optional[Path], Optional[Path]]:
     """
     Load model checkpoint and config based on args.
 
@@ -246,17 +285,31 @@ def load_model_and_config(args) -> Tuple[dict, Path, Path]:
     if not checkpoint_path:
         raise ValueError("Checkpoint not found. Provide --model-dir (with checkpoint in checkpoints/ or trial_*/checkpoints/), "
                         "--output-dir with checkpoint, or --checkpoint.")
-    if not config_path:
-        raise ValueError("Config not found. Provide --model-dir (with params.yaml in root or trial_*/), "
-                        "--output-dir with params.yaml, or --config.")
+    checkpoint = _load_checkpoint_payload(checkpoint_path)
+    args._checkpoint_payload = checkpoint
 
-    # Load config
-    config = load_config(str(config_path))
+    # Explicit and model-directory configs retain priority over embedded configs.
+    if config_path:
+        config = load_config(str(config_path))
+    else:
+        config = checkpoint.get('config')
+        if not isinstance(config, dict):
+            raise ValueError(
+                "Config not found. Provide --model-dir (with params.yaml in root "
+                "or trial_*/), --output-dir with params.yaml, --config, or a "
+                "checkpoint containing config."
+            )
+        print("\nUsing configuration embedded in checkpoint")
 
     return config, checkpoint_path, norm_stats_path, output_dir
 
 
-def load_vcf_data(vcf_path: str, encoding_type: str, config: dict) -> Tuple[dict, List[str], Dict]:
+def load_vcf_data(
+    vcf_path: str,
+    encoding_type: str,
+    config: dict,
+    include_marker_ids: bool = False
+) -> Tuple:
     """
     Load and encode VCF data.
     
@@ -264,6 +317,7 @@ def load_vcf_data(vcf_path: str, encoding_type: str, config: dict) -> Tuple[dict
         variant_data: Dict of encoded variant tensors (for multi-branch) or single tensor
         sample_ids: List of sample IDs
         seq_length: int or dict of sequence lengths
+        marker_ids: Marker IDs in parser order when include_marker_ids is true
     """
     # Determine variant type from config
     variant_type = config.get('data', {}).get('variant_type')
@@ -287,6 +341,10 @@ def load_vcf_data(vcf_path: str, encoding_type: str, config: dict) -> Tuple[dict
 
         # seq_length as dict
         seq_length = {vtype: data['matrix'].shape[1] for vtype, data in variant_data.items()}
+        marker_ids = {
+            vtype: data.get('variant_ids', data.get('marker_ids'))
+            for vtype, data in variant_data.items()
+        }
 
         # Convert to tensor dict
         variant_tensors = {}
@@ -303,8 +361,9 @@ def load_vcf_data(vcf_path: str, encoding_type: str, config: dict) -> Tuple[dict
         if isinstance(result, dict):
             snp_matrix = result['matrix']
             sample_ids = result['sample_ids']
+            marker_ids = result.get('variant_ids', result.get('marker_ids'))
         else:
-            snp_matrix, sample_ids, _ = result
+            snp_matrix, sample_ids, marker_ids = result
 
         # Convert to tensor
         if snp_matrix.dtype == np.float32 or snp_matrix.dtype == np.float64:
@@ -319,13 +378,116 @@ def load_vcf_data(vcf_path: str, encoding_type: str, config: dict) -> Tuple[dict
     else:
         print(f"  Sequence length: {seq_length}")
     
+    if include_marker_ids:
+        return variant_tensors, sample_ids, seq_length, marker_ids
     return variant_tensors, sample_ids, seq_length
 
 
-def load_normalization_stats(norm_stats_path: Optional[Path]) -> Optional[Dict]:
+def _metadata_value(metadata: Dict[str, Any], *names: str) -> Any:
+    """Read a metadata value, including common nested metadata containers."""
+    containers = [metadata]
+    for key in ('data', 'sample_metadata'):
+        value = metadata.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+    for container in containers:
+        for name in names:
+            if container.get(name) is not None:
+                return container[name]
+    return None
+
+
+def _branch_value(values: Dict[str, Any], branch: str) -> Any:
+    """Look up a branch key without imposing a key-case convention."""
+    if branch in values:
+        return values[branch]
+    matches = [value for key, value in values.items()
+               if str(key).lower() == str(branch).lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def validate_genotype_metadata(
+    seq_length: Any,
+    marker_ids: Any,
+    metadata: Dict[str, Any]
+) -> None:
+    """Validate prediction variants against checkpoint training metadata."""
+    expected_lengths = _metadata_value(
+        metadata, 'sequence_lengths', 'seq_lengths', 'sequence_length', 'seq_length'
+    )
+    expected_ids = _metadata_value(metadata, 'marker_ids', 'variant_ids')
+
+    if expected_lengths is not None:
+        if isinstance(seq_length, dict):
+            if not isinstance(expected_lengths, dict):
+                raise ValueError(
+                    "Checkpoint sequence lengths are not branch-specific"
+                )
+            for branch, actual in seq_length.items():
+                expected = _branch_value(expected_lengths, branch)
+                if expected is None:
+                    raise ValueError(
+                        f"Checkpoint has no sequence length for branch {branch!r}"
+                    )
+                if int(expected) != int(actual):
+                    raise ValueError(
+                        f"Sequence length mismatch for branch {branch!r}: "
+                        f"checkpoint expects {expected}, input has {actual}"
+                    )
+        else:
+            if isinstance(expected_lengths, dict):
+                expected = _branch_value(expected_lengths, 'snp')
+                if expected is None and len(expected_lengths) == 1:
+                    expected = next(iter(expected_lengths.values()))
+            else:
+                expected = expected_lengths
+            if expected is None or int(expected) != int(seq_length):
+                raise ValueError(
+                    f"Sequence length mismatch: checkpoint expects "
+                    f"{expected_lengths}, input has {seq_length}"
+                )
+
+    if expected_ids is None:
+        return
+    if marker_ids is None:
+        raise ValueError("Input parser did not return marker IDs for validation")
+
+    if isinstance(marker_ids, dict):
+        if not isinstance(expected_ids, dict):
+            raise ValueError("Checkpoint marker IDs are not branch-specific")
+        for branch, actual in marker_ids.items():
+            expected = _branch_value(expected_ids, branch)
+            if expected is None:
+                raise ValueError(
+                    f"Checkpoint has no marker IDs for branch {branch!r}"
+                )
+            if list(expected) != list(actual):
+                raise ValueError(
+                    f"Marker IDs or order mismatch for branch {branch!r}"
+                )
+    elif isinstance(expected_ids, dict):
+        expected = _branch_value(expected_ids, 'snp')
+        if expected is None and len(expected_ids) == 1:
+            expected = next(iter(expected_ids.values()))
+        if expected is None or list(expected) != list(marker_ids):
+            raise ValueError("Marker IDs or order mismatch")
+    elif list(expected_ids) != list(marker_ids):
+        raise ValueError("Marker IDs or order mismatch")
+
+    print("  Marker IDs and order match checkpoint metadata")
+
+
+def load_normalization_stats(
+    norm_stats_path: Optional[Path],
+    warn_if_missing: bool = True
+) -> Optional[Dict]:
     """Load normalization statistics for denormalization."""
     if norm_stats_path is None or not norm_stats_path.exists():
-        print("\nWarning: Normalization stats not found. Predictions will be in normalized scale.")
+        if warn_if_missing:
+            print(
+                "\nWarning: Normalization stats not found. Predictions will be "
+                "in normalized scale."
+            )
         return None
     
     print(f"\nLoading normalization stats: {norm_stats_path}")
@@ -343,7 +505,66 @@ def load_normalization_stats(norm_stats_path: Optional[Path]) -> Optional[Dict]:
     return norm_stats
 
 
-def create_model(config: dict, seq_length, device: str, norm_stats: Optional[Dict] = None):
+def load_embedded_preprocessor(values: Any) -> Any:
+    """Restore a serialized fold-local phenotype preprocessor."""
+    if values is None:
+        return None
+    if not isinstance(values, dict):
+        return values
+    for key in ('preprocessor', 'phenotype_preprocessor'):
+        nested = values.get(key)
+        if isinstance(nested, dict):
+            values = nested
+            break
+
+    try:
+        from aquila.data.preprocessing import PhenotypePreprocessor
+    except ImportError:
+        PhenotypePreprocessor = None
+    if PhenotypePreprocessor is not None:
+        return PhenotypePreprocessor.from_dict(values)
+
+    from aquila.data.preprocessing import PerTraitPreprocessor
+    return PerTraitPreprocessor.from_dict(values)
+
+
+def _preprocessor_tasks(preprocessor: Any, task: str) -> List[str]:
+    """Get ordered trait names for one task from a fitted preprocessor."""
+    traits = getattr(preprocessor, 'traits', None)
+    if not traits:
+        return []
+    return [
+        str(getattr(trait, 'name'))
+        for trait in traits
+        if getattr(trait, 'task', 'regression') == task
+    ]
+
+
+def _metadata_tasks(metadata: Dict[str, Any], task: str) -> Optional[List[str]]:
+    """Get task names from nested-checkpoint metadata."""
+    explicit = _metadata_value(metadata, f'{task}_tasks')
+    if explicit is not None:
+        return list(explicit)
+    trait_names = _metadata_value(metadata, 'trait_names')
+    trait_tasks = _metadata_value(metadata, 'trait_tasks')
+    if trait_names is None:
+        return None
+    if trait_tasks is None:
+        return list(trait_names) if task == 'regression' else None
+    return [
+        str(name) for name, trait_task in zip(trait_names, trait_tasks)
+        if trait_task == task
+    ]
+
+
+def create_model(
+    config: dict,
+    seq_length,
+    device: str,
+    norm_stats: Optional[Dict] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    preprocessor: Any = None
+):
     """Create model from config."""
     # Get task names from config or norm_stats
     model_config = config.get('model', {})
@@ -369,6 +590,14 @@ def create_model(config: dict, seq_length, device: str, norm_stats: Optional[Dic
         regression_tasks = norm_stats.get('regression_tasks', None)
     if classification_tasks is None and norm_stats is not None:
         classification_tasks = norm_stats.get('classification_tasks', None)
+    if regression_tasks is None and metadata:
+        regression_tasks = _metadata_tasks(metadata, 'regression')
+    if classification_tasks is None and metadata:
+        classification_tasks = _metadata_tasks(metadata, 'classification')
+    if regression_tasks is None and preprocessor is not None:
+        regression_tasks = _preprocessor_tasks(preprocessor, 'regression')
+    if classification_tasks is None and preprocessor is not None:
+        classification_tasks = _preprocessor_tasks(preprocessor, 'classification')
     
     print("\nCreating model...")
     print(f"  Regression tasks: {regression_tasks}")
@@ -387,23 +616,38 @@ def create_model(config: dict, seq_length, device: str, norm_stats: Optional[Dic
     return model
 
 
-def load_checkpoint(model, checkpoint_path: Path, device: str, is_distributed: bool = False):
+def load_checkpoint(
+    model,
+    checkpoint_path: Path,
+    device: str,
+    is_distributed: bool = False,
+    checkpoint: Optional[Dict[str, Any]] = None
+):
     """Load model checkpoint."""
     print(f"\nLoading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if checkpoint is None:
+        checkpoint = _load_checkpoint_payload(checkpoint_path, device)
     
     # Handle DDP wrapper
     state_dict = checkpoint['model_state_dict']
     if is_distributed:
         model.module.load_state_dict(state_dict)
     else:
-        # Use strict=False to allow loading checkpoints with slightly different architecture
-        # (e.g., extra branch_projections layers that may exist in training but not in inference)
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-        if missing_keys:
-            print(f"  Warning: Missing keys in state_dict: {missing_keys}")
-        if unexpected_keys:
-            print(f"  Warning: Unexpected keys in state_dict (ignored): {unexpected_keys}")
+        try:
+            model.load_state_dict(state_dict, strict=True)
+            print("  State dictionary loaded strictly")
+        except RuntimeError as strict_error:
+            print(f"  Warning: Strict state dictionary loading failed: {strict_error}")
+            missing_keys, unexpected_keys = model.load_state_dict(
+                state_dict, strict=False
+            )
+            if missing_keys:
+                print(f"  Warning: Missing keys in state_dict: {missing_keys}")
+            if unexpected_keys:
+                print(
+                    "  Warning: Unexpected keys in state_dict "
+                    f"(ignored): {unexpected_keys}"
+                )
     
     # Print epoch info
     if 'epoch' in checkpoint:
@@ -492,17 +736,72 @@ def denormalize_predictions(predictions: np.ndarray, norm_stats: Dict,
     return predictions_log_scale, predictions_original
 
 
+def inverse_preprocessor_predictions(
+    predictions: np.ndarray,
+    preprocessor: Any
+) -> np.ndarray:
+    """Invert fold-local preprocessing for regression model outputs."""
+    traits = getattr(preprocessor, 'traits', None)
+    if traits and len(traits) != predictions.shape[1]:
+        regression_indices = [
+            index for index, trait in enumerate(traits)
+            if getattr(trait, 'task', 'regression') == 'regression'
+        ]
+        if len(regression_indices) != predictions.shape[1]:
+            raise ValueError(
+                "Checkpoint preprocessor traits do not match regression outputs"
+            )
+        combined = np.zeros((len(predictions), len(traits)), dtype=predictions.dtype)
+        mask = np.zeros_like(combined, dtype=bool)
+        combined[:, regression_indices] = predictions
+        mask[:, regression_indices] = True
+        inverse_input = combined
+    else:
+        regression_indices = None
+        inverse_input = predictions
+        mask = np.ones_like(predictions, dtype=bool)
+
+    if hasattr(preprocessor, 'inverse_transform'):
+        try:
+            original = preprocessor.inverse_transform(inverse_input, mask)
+        except TypeError:
+            original = preprocessor.inverse_transform(inverse_input)
+    elif hasattr(preprocessor, 'inverse'):
+        original = preprocessor.inverse(inverse_input, mask)
+    else:
+        raise TypeError(
+            "Embedded preprocessor has no inverse or inverse_transform method"
+        )
+    original = np.asarray(original)
+    if regression_indices is not None:
+        original = original[:, regression_indices]
+    return original
+
+
 def save_predictions(sample_ids: List[str], predictions_dict: Dict, predictions_original: np.ndarray, predictions_log_scale: np.ndarray,
                    norm_stats: Optional[Dict], output_path: Path, is_classification: bool = False,
-                   classification_tasks: List[str] = None):
+                   classification_tasks: List[str] = None,
+                   regression_tasks: List[str] = None):
     """Save predictions to file."""
     print(f"\nSaving predictions to: {output_path}")
     
     # Get task names
     if norm_stats:
         regression_tasks = norm_stats.get('regression_tasks', [])
-    else:
+    elif not regression_tasks:
         regression_tasks = [f"regression_task_{i}" for i in range(predictions_original.shape[1])]
+    if 'regression' in predictions_dict and len(regression_tasks) != predictions_dict['regression'].shape[1]:
+        raise ValueError(
+            "Regression task names do not match prediction columns"
+        )
+    if (
+        is_classification
+        and classification_tasks
+        and len(classification_tasks) != predictions_dict['classification'].shape[1]
+    ):
+        raise ValueError(
+            "Classification task names do not match prediction columns"
+        )
     
     # Build results DataFrame
     results = {'Sample_ID': sample_ids}
@@ -549,9 +848,27 @@ def main():
     
     # Load model, config, and normalization stats
     config, checkpoint_path, norm_stats_path, output_dir = load_model_and_config(args)
+    checkpoint = args._checkpoint_payload
+    sidecar_metadata = _load_data_metadata(args.data_metadata)
+    checkpoint_metadata = checkpoint.get('metadata', {})
+    if checkpoint_metadata is None:
+        checkpoint_metadata = {}
+    if not isinstance(checkpoint_metadata, dict):
+        raise ValueError("Checkpoint metadata must contain a dictionary")
+    metadata = {**sidecar_metadata, **checkpoint_metadata}
+
+    serialized_preprocessing = checkpoint.get('preprocessing')
+    preprocessor = load_embedded_preprocessor(serialized_preprocessing)
+    is_nested_checkpoint = any(
+        key in checkpoint for key in ('config', 'metadata', 'preprocessing')
+    )
     
     # Load normalization stats
-    norm_stats = load_normalization_stats(norm_stats_path)
+    norm_stats = load_normalization_stats(
+        norm_stats_path, warn_if_missing=preprocessor is None
+    )
+    if preprocessor is not None:
+        print("\nUsing fold-local preprocessing embedded in checkpoint")
     
     # Determine VCF file path (command line args override config)
     vcf_path = args.vcf
@@ -564,23 +881,43 @@ def main():
             raise ValueError("No VCF file specified. Provide --vcf or ensure geno_file is in config.")
     
     # Determine encoding type (command line args override config)
-    encoding_type = args.encoding_type
-    if encoding_type is None:
-        # Read from config file
-        encoding_type = config.get('data', {}).get('encoding_type', 'diploid_onehot')
+    checkpoint_encoding = _metadata_value(metadata, 'encoding_type')
+    if checkpoint_encoding is not None:
+        if args.encoding_type and args.encoding_type != checkpoint_encoding:
+            raise ValueError(
+                f"--encoding-type {args.encoding_type!r} does not match checkpoint "
+                f"encoding {checkpoint_encoding!r}"
+            )
+        encoding_type = checkpoint_encoding
+    else:
+        encoding_type = args.encoding_type
+        if encoding_type is None:
+            # Read from config file
+            encoding_type = config.get('data', {}).get(
+                'encoding_type', 'diploid_onehot'
+            )
     
     # Check if multi-branch
-    variant_type = config.get('data', {}).get('variant_type')
+    variant_type = _metadata_value(metadata, 'variant_type')
+    if variant_type is None:
+        variant_type = config.get('data', {}).get('variant_type')
+    else:
+        config = dict(config)
+        config['data'] = dict(config.get('data', {}))
+        config['data']['variant_type'] = variant_type
     is_multi_branch = encoding_type in ['snp_indel_vcf', 'snp_indel_sv_vcf'] or variant_type in ['snp_indel', 'snp_indel_sv']
     
     # Load VCF data
-    variant_data, sample_ids, seq_length = load_vcf_data(
-        vcf_path, encoding_type, config
+    variant_data, sample_ids, seq_length, marker_ids = load_vcf_data(
+        vcf_path, encoding_type, config, include_marker_ids=True
     )
+    validate_genotype_metadata(seq_length, marker_ids, metadata)
     
     # Create model
     device = args.device
-    model = create_model(config, seq_length, device, norm_stats)
+    model = create_model(
+        config, seq_length, device, norm_stats, metadata, preprocessor
+    )
     
     # Initialize model with a dummy forward pass to build dynamic layers (e.g., branch_projections)
     # This ensures the model structure matches the checkpoint exactly
@@ -607,7 +944,9 @@ def main():
     print("  Model initialized.")
     
     # Load checkpoint
-    model = load_checkpoint(model, checkpoint_path, device)
+    model = load_checkpoint(
+        model, checkpoint_path, device, checkpoint=checkpoint
+    )
     
     # Run prediction
     predictions = predict(model, variant_data, sample_ids, device, args.batch_size, is_multi_branch)
@@ -616,18 +955,42 @@ def main():
     is_classification = 'classification' in predictions
     classification_tasks = config.get('model', {}).get('classification_tasks', 
                       config.get('data', {}).get('classification_tasks', None))
+    if classification_tasks is None:
+        classification_tasks = (
+            _metadata_tasks(metadata, 'classification')
+            or _preprocessor_tasks(preprocessor, 'classification')
+        )
+    regression_tasks = None
+    if norm_stats:
+        regression_tasks = norm_stats.get('regression_tasks', [])
+    if not regression_tasks:
+        regression_tasks = (
+            _metadata_tasks(metadata, 'regression')
+            or _preprocessor_tasks(preprocessor, 'regression')
+        )
     
     # Denormalize if normalization stats available
     predictions_log_scale = None
     predictions_original = None
     
-    if norm_stats and 'regression' in predictions:
+    if preprocessor is not None and 'regression' in predictions:
+        predictions_original = inverse_preprocessor_predictions(
+            predictions['regression'], preprocessor
+        )
+        predictions_log_scale = predictions['regression']
+        print("\nPredictions inverse-transformed to original scale")
+    elif norm_stats and 'regression' in predictions:
         predictions_log_scale, predictions_original = denormalize_predictions(
             predictions['regression'], 
             norm_stats,
             norm_stats.get('regression_tasks', [])
         )
         print("\nPredictions denormalized to original scale")
+    elif is_nested_checkpoint and 'regression' in predictions:
+        raise ValueError(
+            "Nested-CV regression checkpoint has no embedded preprocessing or "
+            "legacy normalization statistics; original-scale output is impossible"
+        )
     else:
         predictions_original = predictions.get('regression', predictions.get('classification'))
     
@@ -641,12 +1004,12 @@ def main():
         norm_stats=norm_stats,
         output_path=output_path,
         is_classification=is_classification,
-        classification_tasks=classification_tasks
+        classification_tasks=classification_tasks,
+        regression_tasks=regression_tasks
     )
 
     # Print selection index for each sample (all regression tasks, equal weight)
-    if 'regression' in predictions and norm_stats:
-        regression_tasks = norm_stats.get('regression_tasks', [])
+    if 'regression' in predictions and regression_tasks:
 
         # Load minimize traits if provided
         minimize_traits = set()

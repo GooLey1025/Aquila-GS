@@ -3885,3 +3885,7 @@ name_func = {
 
     'linear_block': linear_block,
 }
+
+# Merge v2 explore blocks (dilated/SE/ConvNeXt/dual-axis/local-global/gated-mixer).
+from . import blocks_v2  # noqa: E402
+name_func.update(blocks_v2.name_func)

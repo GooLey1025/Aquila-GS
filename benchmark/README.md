@@ -1,21 +1,60 @@
-# Benchmarking
+# Benchmark
 
-All benchmarks were conducted using the versions of the compared methods that were available at the time (2025-12) of our experiments.For transparency and reproducibility, we report the exact commit hashes used in our experiments.
+All benchmarks were conducted using the versions of the compared methods that were available at the time (2026-07) of our experiments. For transparency and reproducibility, we report the exact commit hashes used in our experiments.
 
 Note that for benchmarking purposes, it is not necessary to clone all original repositories, as the required scripts have been integrated or adapted into this project.
+
+Environment: NVIDIA-GPU-4090 x3
 
 
 ## Data Prepare
 
-To ensure a fair comparison among models with different requirements for handling missing values, phenotype imputation was performed prior to model benchmarking. Missing values were imputed using PIXANT with default parameter settings, where the initial imputation strategy was set to random (`initialImputeType = "random"`).
-For phenotypes with a very small number of missing observations (fewer than five), a minimal random masking strategy was applied to maintain numerical stability during imputation. Specifically, a small subset of observed values was temporarily masked and included as missing inputs for the imputation procedure, and the original values were subsequently restored after imputation. This approach prevented instability caused by extremely sparse missingness while preserving the original data distribution and integrity.
+To ensure a fair comparison, we first generated a fixed nested cross-validation scheme and applied exactly the same sample partitions to all methods. The outer folds were used for final model evaluation, while the inner folds were used for hyperparameter optimization and model selection. All models were therefore evaluated on identical training, validation, and testing sets.
+
+For Aquila, missing phenotypic observations are handled natively through a masked multi-task learning strategy. Specifically, missing trait values are excluded from the loss calculation while the remaining observed traits continue to contribute to model optimization, allowing the model to exploit correlations among multiple traits without requiring phenotype imputation. For other methods that do not support missing phenotypes, missing observations were handled according to their model assumptions. Single-trait models were trained using only individuals with available phenotypic records for the target trait. Importantly, these models still followed the same predefined cross-validation partitions as Aquila, ensuring that differences in performance reflect model behavior rather than differences in data splitting. Prediction accuracy was calculated using only individuals with available phenotypic records in the test sets. For each trait, test samples with missing phenotype values were excluded from the accuracy calculation, and the same evaluation criteria were applied consistently to all models. This evaluation framework assesses genomic prediction performance under realistic incomplete phenotype conditions encountered in practical breeding programs.
+
+### Generate fold mapping:
+```sh
+# GSTP008.pheno downloaded from CropGS-hub (https://iagr.genomics.cn/CropGS/#/Datasets)
+wget https://iagr.genomics.cn/static/gstool/data/GSTP008/population/GSTP008.pheno
+aquila_cv.py --phenotype GSTP008.pheno -o 705rice_fold_mapping.txt --folds 5 --seed 42
+```
+The predefined fold mapping `705rice_fold_mapping.txt` was used throughout the pipeline, including [GWAS lead-variant selection](to_be_add), to avoid information leakage. Specifically, GWAS discovery and lead-variant selection were performed using only the training samples within each fold, while test samples were completely excluded from this process.
+
+### Generate 5-fold training and testing sets:
+When having done the GWAS lead variant selection, we can use the following command to generate the training and testing sets:
 
 ```sh
-wget https://iagr.genomics.cn/static/gstool/data/GSTP008/population/GSTP008.pheno
-Rscript pixant_impute/phenotype_pixant_impute.R GSTP008.pheno 705Rice.pheno.imputed.tsv logs_dir
+aquila_data_cv.py --vcf ../case/705rice_0.03.full.all.impute.biallelic.vcf.gz --phenotype GSTP008.pheno --encoding-type diploid_onehot --variant-type snp --fold-mapping 705rice_fold_mapping.txt -o test  --overwrite
 ```
 
-`705Rice.pheno.imputed.tsv` was used as the phenotype file for subsequent benchmarking.
+The preparation stage also caches fold-local phenotype targets. Each inner
+fold contains `Y_train_processed.pt`, `Y_valid_processed.pt`, and
+`preprocessing.json`; each outer fold contains corresponding `final`
+training/test targets. `aquila_train_cv.py` reads these files directly, so
+phenotype preprocessing is not repeated for every HPO trial.
+
+```txt
+每个 inner fold
+    ├── 只使用 inner_train 的有效表型计算 skewness
+    ├── 如果 abs(skewness) > 2
+    │      └── 对该 trait 做 log1p
+    ├── 计算 mean/std
+    ├── 对该 trait 做 Z-score
+    ├── 保存 Y_train_processed.pt
+    ├── 使用同一组参数处理 inner_valid
+    └── 保存 Y_valid_processed.pt
+
+完整 outer_train
+    ├── 重新计算 skewness、log 参数、mean、std
+    ├── 保存 preprocessing.json
+    ├── 处理 outer_train
+    └── 使用相同参数处理 outer_test完整 outer_train
+    ├── 重新计算 skewness、log 参数、mean、std
+    ├── 保存 preprocessing.json
+    ├── 处理 outer_train
+    └── 使用相同参数处理 outer_test
+```
 
 
 ## Prerequisites
@@ -72,7 +111,6 @@ rm -rf ${yaml%.yaml}
 nohup aquila_train_hpo.py --config params/$yaml -o ${yaml%.yaml} -dsf aquila_benchmark/data_split.tsv > ${yaml%.yaml}.log 2>&1 &
 
 ```
-
 ### [CropARNet](https://github.com/Zhoushuchang-lab/CropARNet)
 
 Some scripts from CropARNet were copied or adapted into our project repository.
@@ -205,3 +243,23 @@ git rev-parse HEAD
 # (Optional) To reproduce the exact version:
 git checkout 3bbac096969fb2b46958a672d342297cb4457116
 ```
+
+### [CLCNet](https://github.com/SuppurNewer/CLCNet)
+```sh
+conda create -n CLCNet python=3.10.13
+conda activate CLCNet
+
+git clone https://github.com/SuppurNewer/CLCNet.git
+cd CLCNet
+
+# Dependency conflicts, manually replace.
+sed -i 's/pandas==1\.5\.3/pandas>=2.2,<3.0/' requirements.txt
+sed -i 's/\r$//' requirements.txt
+sed -i 's/^tqdm==4\.65\.0$/tqdm>=4.66,<5.0/' requirements.txt
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu113
+
+```
+python ChromosomeAwareProcessor.py \
+  --gstp_name example \
+  --data_dir example \
+  --traits Trait1 Trait2

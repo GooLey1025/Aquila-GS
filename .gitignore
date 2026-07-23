@@ -1,7 +1,9 @@
 snp_train
 src/aquila.egg-info
 src/aquila/__pycache__/
+src/aquila/scripts/__pycache__/
 *best_model/
+
 *.hpo/
 *.ig/
 *.position_importance/

@@ -701,7 +701,7 @@ def parse_genotype_snp_indel_sv_vcf(vcf_path: str) -> dict:
 # Factory Function
 ###############################################################################
 
-def parse_genotype_file(geno_path: str, encoding_type: str = 'token', variant_type: str = None) -> Tuple[np.ndarray, List[str], List[str]]:
+def parse_genotype_file(geno_path: str, encoding_type: str = 'diploid_onehot', variant_type: str = None) -> Tuple[np.ndarray, List[str], List[str]]:
     """
     Parse genotype file using specified encoding strategy.
 
@@ -727,19 +727,6 @@ def parse_genotype_file(geno_path: str, encoding_type: str = 'token', variant_ty
     Raises:
         ValueError: If encoding_type or variant_type is not recognized
     """
-    # Handle backward compatibility: if old-style encoding_type is used, extract variant info
-    if encoding_type in ['snp_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf']:
-        # Map old-style to new-style
-        if variant_type is None:
-            if encoding_type == 'snp_vcf':
-                variant_type = 'snp'
-            elif encoding_type == 'snp_indel_vcf':
-                variant_type = 'snp_indel'
-            elif encoding_type == 'snp_indel_sv_vcf':
-                variant_type = 'snp_indel_sv'
-        # Set encoding to diploid_onehot for VCF files
-        encoding_type = 'diploid_onehot'
-
     # Validate inputs
     if encoding_type not in ['token', 'diploid_onehot', 'onehot']:
         raise ValueError(

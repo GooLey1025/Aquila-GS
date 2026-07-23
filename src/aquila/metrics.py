@@ -1,3 +1,7 @@
+# -*- coding: utf-8 -*-
+# Author: Lei Gu
+# Contact: goley04@foxmail.com
+
 """
 Metrics for evaluating genomic prediction models.
 Includes both regression and classification metrics with support for missing labels.
@@ -154,8 +158,9 @@ class MultiTaskLoss(nn.Module):
         self,
         predictions: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor],
-        masks: Dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        masks: Dict[str, torch.Tensor],
+        return_details: bool = True,
+    ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute multi-task loss.
 
@@ -169,65 +174,87 @@ class MultiTaskLoss(nn.Module):
             loss_dict: Dictionary with individual task losses
         """
         loss_dict = {}
-        total_loss = torch.tensor(0.0, dtype=torch.float32)
+        prediction_tensor = next(iter(predictions.values()), None)
+        device = (
+            prediction_tensor.device
+            if isinstance(prediction_tensor, torch.Tensor)
+            else next(self.parameters(), torch.empty(0)).device
+        )
+        total_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
 
         # Regression tasks
         if 'regression' in predictions and self.num_regression_tasks > 0:
             reg_pred = predictions['regression']
             reg_target = targets['regression']
             reg_mask = masks['regression']
+            reg_mask_float = reg_mask.to(reg_pred.dtype)
+            valid_counts = reg_mask_float.sum(dim=0)
+            denominator = valid_counts.clamp_min(1.0)
+            error = reg_pred - reg_target
+            if self.loss_type == 'mse':
+                element_loss = error.square()
+            elif self.loss_type == 'huber':
+                abs_error = error.abs()
+                quadratic = torch.clamp(abs_error, max=self.huber_delta)
+                linear = abs_error - quadratic
+                element_loss = (
+                    0.5 * quadratic.square() + self.huber_delta * linear
+                )
+            else:
+                element_loss = error.abs()
+            per_task_loss = (
+                element_loss * reg_mask_float
+            ).sum(dim=0) / denominator
 
-            for i in range(self.num_regression_tasks):
-                pred_i = reg_pred[:, i]
-                target_i = reg_target[:, i]
-                mask_i = reg_mask[:, i]
+            if return_details:
+                for i, loss_i in enumerate(per_task_loss):
+                    loss_dict[f'regression_{i}'] = loss_i.item()
 
-                if self.loss_type == 'mse':
-                    loss_i = masked_mse_loss(pred_i, target_i, mask_i)
-                elif self.loss_type == 'huber':
-                    loss_i = masked_huber_loss(
-                        pred_i, target_i, mask_i, delta=self.huber_delta)
-                else:  # mae
-                    loss_i = masked_mae_loss(pred_i, target_i, mask_i)
-
-                loss_dict[f'regression_{i}'] = loss_i.item()
-
-                if self.uncertainty_weighting:
-                    # Uncertainty weighting: L = (1/2σ²)L_i + log(σ)
-                    precision = torch.exp(-self.log_vars_reg[i])
-                    weighted_loss = 0.5 * precision * \
-                        loss_i + 0.5 * self.log_vars_reg[i]
-                else:
-                    weighted_loss = loss_i
-
-                total_loss = total_loss + weighted_loss
+            if self.uncertainty_weighting:
+                precision = torch.exp(-self.log_vars_reg)
+                weighted_loss = (
+                    0.5 * precision * per_task_loss
+                    + 0.5 * self.log_vars_reg
+                )
+            else:
+                weighted_loss = per_task_loss
+            total_loss = total_loss + weighted_loss.sum()
 
         # Classification tasks
         if 'classification' in predictions and self.num_classification_tasks > 0:
             cls_logits = predictions['classification']
             cls_target = targets['classification']
             cls_mask = masks['classification']
+            cls_mask_float = cls_mask.to(cls_logits.dtype)
+            valid_counts = cls_mask_float.sum(dim=0)
+            denominator = valid_counts.clamp_min(1.0)
+            element_loss = nn.functional.binary_cross_entropy_with_logits(
+                cls_logits,
+                cls_target,
+                reduction='none',
+            )
+            per_task_loss = (
+                element_loss * cls_mask_float
+            ).sum(dim=0) / denominator
 
-            for i in range(self.num_classification_tasks):
-                logits_i = cls_logits[:, i]
-                target_i = cls_target[:, i]
-                mask_i = cls_mask[:, i]
+            if return_details:
+                for i, loss_i in enumerate(per_task_loss):
+                    loss_dict[f'classification_{i}'] = loss_i.item()
 
-                loss_i = masked_bce_loss(logits_i, target_i, mask_i)
-                loss_dict[f'classification_{i}'] = loss_i.item()
+            if self.uncertainty_weighting:
+                precision = torch.exp(-self.log_vars_cls)
+                weighted_loss = (
+                    0.5 * precision * per_task_loss
+                    + 0.5 * self.log_vars_cls
+                )
+            else:
+                weighted_loss = per_task_loss
+            total_loss = total_loss + weighted_loss.sum()
 
-                if self.uncertainty_weighting:
-                    precision = torch.exp(-self.log_vars_cls[i])
-                    weighted_loss = 0.5 * precision * \
-                        loss_i + 0.5 * self.log_vars_cls[i]
-                else:
-                    weighted_loss = loss_i
+        if not return_details:
+            return total_loss
 
-                total_loss = total_loss + weighted_loss
-
-        loss_dict['total'] = total_loss.item() if isinstance(
-            total_loss, torch.Tensor) else total_loss
-
+        loss_dict['total'] = total_loss.item()
         return total_loss, loss_dict
 
 
