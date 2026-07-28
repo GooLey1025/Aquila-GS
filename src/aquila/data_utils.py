@@ -631,10 +631,12 @@ def create_data_loaders(
                 # Recreate loaders with proper samplers for distributed training
                 if use_distributed_sampler:
                     train_sampler = DistributedSampler(
-                        train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
+                        train_dataset, num_replicas=world_size, rank=rank,
+                        shuffle=True, drop_last=True
                     )
                     train_loader = DataLoader(
                         train_dataset, batch_size=batch_size, sampler=train_sampler,
+                        drop_last=True,
                         num_workers=num_workers, pin_memory=True,
                         persistent_workers=True if num_workers > 0 else False,
                         worker_init_fn=_worker_init_fn if num_workers > 0 else None
@@ -645,6 +647,7 @@ def create_data_loaders(
                 else:
                     train_loader = DataLoader(
                         train_dataset, batch_size=batch_size, shuffle=True,
+                        drop_last=True,
                         num_workers=num_workers, pin_memory=True,
                         persistent_workers=True if num_workers > 0 else False,
                         worker_init_fn=_worker_init_fn if num_workers > 0 else None
@@ -913,7 +916,7 @@ def create_data_loaders(
             num_replicas=world_size,
             rank=rank,
             shuffle=True,
-            drop_last=False
+            drop_last=True
         )
         print(f"\n[Rank {rank}] Using DistributedSampler:")
         print(f"  Total samples: {len(train_subset)}")
@@ -924,6 +927,7 @@ def create_data_loaders(
             train_subset,
             batch_size=batch_size,
             sampler=train_sampler,
+            drop_last=True,
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=True if num_workers > 0 else False,
@@ -935,6 +939,7 @@ def create_data_loaders(
             train_subset,
             batch_size=batch_size,
             shuffle=True,
+            drop_last=True,
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=True if num_workers > 0 else False,
@@ -1176,6 +1181,7 @@ def create_kfold_data_loaders(
         train_loader = DataLoader(
             torch.utils.data.Subset(fold_dataset, train_indices),
             shuffle=True,
+            drop_last=True,
             **dataloader_kwargs
         )
 

@@ -1,0 +1,54 @@
+# MENET nested-CV benchmark configuration.
+
+data:
+  missing_genotype_value: 0.0
+
+encoder:
+  stride: 2
+  embedding_dim: 128
+  margin: 0.1
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 32
+  max_epochs: 30
+  patience: 8
+  min_delta: 0.0001
+
+model:
+  VE:
+    conv: [8, 11, 2]
+    res1: [16, 11, 2]
+    res2: [32, 11, 2]
+    adaptive: 4
+    embedding_dim: [1024, 256]
+  RepGeno:
+    embedding_dim: [1024, 256]
+  output:
+    VE_and_RepGeno_embedding_dim: 256
+    embedding_dim: 256
+
+train:
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 8
+  dropout: 0.3
+  max_epochs: 100
+  patience: 20
+  min_delta: 0.0001
+
+hpo:
+  enabled: true
+  method: grid_search
+  metric: avg_pearson
+  direction: maximize
+  parameters:
+    encoder.learning_rate:
+      values: [0.001, 0.01]
+    encoder.embedding_dim:
+      values: [64, 128]
+    train.learning_rate:
+      values: [0.001, 0.01]
+    train.batch_size:
+      values: [8, 32]
+    train.dropout:
+      values: [0.3, 0.6]

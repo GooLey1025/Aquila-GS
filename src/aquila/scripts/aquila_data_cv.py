@@ -6,6 +6,8 @@
 """Prepare aligned Aquila tensors and deterministic nested CV folds."""
 
 import argparse
+from contextlib import ExitStack
+import gzip
 import hashlib
 import json
 import math
@@ -47,6 +49,7 @@ class PreparationConfig:
     inner_folds: int = 4
     seed: int = 42
     fold_mapping: Path | None = None
+    save_raw_genotype: bool = False
     min_observed_per_fold: int = 10
     skew_threshold: float = 2.0
     preprocessing_epsilon: float = 1e-8
@@ -72,6 +75,7 @@ class NestedCVDataPreparer:
         "Y_mask.pt",
         "metadata.json",
         "sample_fold_mapping.txt",
+        "raw_genotype",
         "cv",
     )
 
@@ -99,13 +103,7 @@ class NestedCVDataPreparer:
                 seed=self.config.seed,
             )
         else:
-            assignments = self._load_outer_fold_mapping(aligned["sample_ids"])
-            folds = generate_nested_folds_from_assignments(
-                assignments,
-                outer_folds=self.config.outer_folds,
-                inner_folds=self.config.inner_folds,
-                seed=self.config.seed,
-            )
+            folds = self._load_fold_mapping(aligned["sample_ids"])
         observed_counts = validate_outer_fold_observations(
             aligned["target_mask"].numpy(),
             folds,
@@ -113,6 +111,10 @@ class NestedCVDataPreparer:
             min_observed=self.config.min_observed_per_fold,
         )
         metadata = self._build_metadata(genotypes, phenotype, aligned)
+        metadata["outer_folds"] = len(folds)
+        metadata["inner_folds"] = (
+            len(folds[0]["inner"]) if folds else 0
+        )
         metadata["fold_mapping_file"] = (
             str(self.config.fold_mapping.resolve())
             if self.config.fold_mapping is not None
@@ -128,6 +130,8 @@ class NestedCVDataPreparer:
             "fit_scope": "inner_train_and_outer_train_only",
         }
         self._save_artifacts(aligned, metadata, folds)
+        if self.config.save_raw_genotype:
+            self._save_raw_genotype_subsets(aligned["sample_ids"], folds)
         return metadata
 
     def _validate_inputs(self) -> None:
@@ -154,6 +158,15 @@ class NestedCVDataPreparer:
             raise FileNotFoundError(
                 f"Fold mapping file not found: {self.config.fold_mapping}"
             )
+        if self.config.save_raw_genotype:
+            lower_name = self.config.genotype_file.name.lower()
+            if not (
+                lower_name.endswith(".vcf")
+                or lower_name.endswith(".vcf.gz")
+            ):
+                raise ValueError(
+                    "--save-raw-genotype requires a .vcf or .vcf.gz input"
+                )
 
     def _prepare_output_directory(self) -> None:
         output = self.config.output_directory
@@ -413,13 +426,39 @@ class NestedCVDataPreparer:
             "trait_tasks": phenotype["trait_tasks"],
         }
 
-    def _load_outer_fold_mapping(
+    def _load_fold_mapping(
         self,
         aligned_sample_ids: Sequence[str],
-    ) -> np.ndarray:
+    ) -> List[Dict[str, object]]:
         mapping_path = self.config.fold_mapping
         if mapping_path is None:
             raise RuntimeError("Fold mapping path is not configured")
+        with mapping_path.open("r", encoding="utf-8") as handle:
+            first_character = next(
+                (character for character in handle.read(4096) if not character.isspace()),
+                "",
+            )
+        if first_character == "{":
+            return self._load_nested_fold_mapping(
+                mapping_path,
+                aligned_sample_ids,
+            )
+        assignments = self._load_outer_fold_assignments(
+            mapping_path,
+            aligned_sample_ids,
+        )
+        return generate_nested_folds_from_assignments(
+            assignments,
+            outer_folds=self.config.outer_folds,
+            inner_folds=self.config.inner_folds,
+            seed=self.config.seed,
+        )
+
+    def _load_outer_fold_assignments(
+        self,
+        mapping_path: Path,
+        aligned_sample_ids: Sequence[str],
+    ) -> np.ndarray:
         frame = pd.read_csv(mapping_path, sep=None, engine="python", dtype=str)
         required = {"SampleID", "OuterFold"}
         missing = required - set(frame.columns)
@@ -471,6 +510,122 @@ class NestedCVDataPreparer:
             )
         return selected
 
+    def _load_nested_fold_mapping(
+        self,
+        mapping_path: Path,
+        aligned_sample_ids: Sequence[str],
+    ) -> List[Dict[str, object]]:
+        with mapping_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("schema") != "aquila_nested_cv":
+            raise ValueError("Unsupported nested-CV mapping schema")
+        outer_count = int(payload.get("outer_folds", -1))
+        inner_count = int(payload.get("inner_folds", -1))
+        if outer_count < 2:
+            raise ValueError("Nested-CV mapping must contain at least two outer folds")
+        if inner_count < 2:
+            raise ValueError("Nested-CV mapping must contain at least two inner folds")
+
+        positions = {
+            sample_id: index
+            for index, sample_id in enumerate(aligned_sample_ids)
+        }
+        aligned_set = set(positions)
+        mapped_samples = {str(value) for value in payload.get("sample_ids", [])}
+        missing = sorted(aligned_set - mapped_samples)
+        if missing:
+            raise ValueError(
+                "Aligned samples missing from fold mapping: "
+                + ", ".join(missing[:10])
+            )
+
+        def indices(sample_ids: Sequence[object]) -> np.ndarray:
+            return np.asarray(
+                [
+                    positions[str(sample_id)]
+                    for sample_id in sample_ids
+                    if str(sample_id) in positions
+                ],
+                dtype=np.int64,
+            )
+
+        folds: List[Dict[str, object]] = []
+        for outer in payload.get("folds", []):
+            outer_train = indices(outer.get("train", []))
+            outer_test = indices(outer.get("test", []))
+            inner_splits = [
+                {
+                    "fold": int(inner["fold"]),
+                    "train": indices(inner.get("train", [])),
+                    "valid": indices(inner.get("valid", [])),
+                }
+                for inner in outer.get("inner", [])
+            ]
+            folds.append(
+                {
+                    "fold": int(outer["fold"]),
+                    "train": outer_train,
+                    "test": outer_test,
+                    "inner": inner_splits,
+                }
+            )
+        self._validate_nested_mapping(
+            folds,
+            len(aligned_sample_ids),
+            outer_count,
+            inner_count,
+        )
+        return sorted(folds, key=lambda fold: int(fold["fold"]))
+
+    def _validate_nested_mapping(
+        self,
+        folds: Sequence[Dict[str, object]],
+        sample_count: int,
+        outer_count: int,
+        inner_count: int,
+    ) -> None:
+        if {int(fold["fold"]) for fold in folds} != set(
+            range(outer_count)
+        ):
+            raise ValueError("Nested-CV mapping has invalid outer fold identifiers")
+        all_indices = set(range(sample_count))
+        observed_test: set[int] = set()
+        for outer in folds:
+            outer_id = int(outer["fold"])
+            train = set(np.asarray(outer["train"], dtype=np.int64).tolist())
+            test = set(np.asarray(outer["test"], dtype=np.int64).tolist())
+            if train & test or train | test != all_indices:
+                raise ValueError(
+                    f"Outer fold {outer_id} is not a complete disjoint partition"
+                )
+            if observed_test & test:
+                raise ValueError("Outer test folds overlap")
+            observed_test.update(test)
+            inner_splits = outer["inner"]
+            if {int(inner["fold"]) for inner in inner_splits} != set(
+                range(inner_count)
+            ):
+                raise ValueError(
+                    f"Outer fold {outer_id} has invalid inner fold identifiers"
+                )
+            for inner in inner_splits:
+                inner_train = set(
+                    np.asarray(inner["train"], dtype=np.int64).tolist()
+                )
+                inner_valid = set(
+                    np.asarray(inner["valid"], dtype=np.int64).tolist()
+                )
+                if (
+                    inner_train & inner_valid
+                    or inner_train | inner_valid != train
+                ):
+                    raise ValueError(
+                        f"Inner fold {outer_id}/{inner['fold']} is not a "
+                        "complete disjoint partition of outer training samples"
+                    )
+        if observed_test != all_indices:
+            raise ValueError("Outer test folds do not cover all aligned samples")
+
     def _build_metadata(
         self,
         genotypes: EncodedGenotypes,
@@ -511,6 +666,7 @@ class NestedCVDataPreparer:
             "outer_folds": self.config.outer_folds,
             "inner_folds": self.config.inner_folds,
             "seed": self.config.seed,
+            "raw_genotype_saved": self.config.save_raw_genotype,
             "source_checksums": {
                 "genotype_sha256": self._sha256(self.config.genotype_file),
                 "phenotype_sha256": self._sha256(self.config.phenotype_file),
@@ -648,6 +804,101 @@ class NestedCVDataPreparer:
             trait_tasks=trait_tasks,
         )
 
+    def _save_raw_genotype_subsets(
+        self,
+        sample_ids: Sequence[str],
+        folds: Sequence[Dict[str, object]],
+    ) -> None:
+        source = self.config.genotype_file
+        if source.suffix.lower() == ".bcf":
+            raise ValueError(
+                "--save-raw-genotype currently supports VCF and VCF.GZ inputs, "
+                "not BCF"
+            )
+        raw_directory = self.config.output_directory / "raw_genotype"
+        raw_directory.mkdir(parents=True, exist_ok=True)
+        split_samples: Dict[Path, set[str]] = {}
+
+        def add_split(path: Path, values: Sequence[int]) -> None:
+            split_samples[path] = {
+                sample_ids[index]
+                for index in np.asarray(values, dtype=np.int64)
+            }
+
+        for outer in folds:
+            outer_id = int(outer["fold"])
+            outer_path = raw_directory / f"outer_fold_{outer_id}"
+            add_split(outer_path / "train.vcf.gz", outer["train"])
+            add_split(outer_path / "test.vcf.gz", outer["test"])
+            for inner in outer["inner"]:
+                inner_id = int(inner["fold"])
+                inner_path = outer_path / f"inner_fold_{inner_id}"
+                add_split(inner_path / "train.vcf.gz", inner["train"])
+                add_split(inner_path / "valid.vcf.gz", inner["valid"])
+
+        opener = gzip.open if source.suffix.lower() == ".gz" else open
+        with opener(source, "rt", encoding="utf-8") as source_handle:
+            with ExitStack() as stack:
+                outputs = {}
+                for output_path in split_samples:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    outputs[output_path] = stack.enter_context(
+                        gzip.open(output_path, "wt", encoding="utf-8")
+                    )
+
+                sample_columns: Dict[Path, List[int]] | None = None
+                for line in source_handle:
+                    if line.startswith("##"):
+                        for handle in outputs.values():
+                            handle.write(line)
+                        continue
+                    if line.startswith("#CHROM"):
+                        columns = line.rstrip("\n").split("\t")
+                        if len(columns) < 9:
+                            raise ValueError("VCF header has fewer than nine columns")
+                        vcf_samples = columns[9:]
+                        if len(set(vcf_samples)) != len(vcf_samples):
+                            raise ValueError("VCF sample IDs must be unique")
+                        missing = sorted(set(sample_ids) - set(vcf_samples))
+                        if missing:
+                            raise ValueError(
+                                "Aligned samples missing from VCF header: "
+                                + ", ".join(missing[:10])
+                            )
+                        sample_columns = {}
+                        for output_path, selected in split_samples.items():
+                            selected_columns = [
+                                index
+                                for index, sample_id in enumerate(vcf_samples)
+                                if sample_id in selected
+                            ]
+                            sample_columns[output_path] = selected_columns
+                            header = columns[:9] + [
+                                vcf_samples[index] for index in selected_columns
+                            ]
+                            outputs[output_path].write("\t".join(header) + "\n")
+                        continue
+                    if line.startswith("#"):
+                        for handle in outputs.values():
+                            handle.write(line)
+                        continue
+                    if sample_columns is None:
+                        raise ValueError("VCF does not contain a #CHROM header")
+                    columns = line.rstrip("\n").split("\t")
+                    if len(columns) < 9:
+                        raise ValueError("VCF record has fewer than nine columns")
+                    fixed = columns[:9]
+                    genotypes = columns[9:]
+                    if len(genotypes) != len(vcf_samples):
+                        raise ValueError(
+                            "VCF record sample count differs from its header"
+                        )
+                    for output_path, selected_columns in sample_columns.items():
+                        record = fixed + [
+                            genotypes[index] for index in selected_columns
+                        ]
+                        outputs[output_path].write("\t".join(record) + "\n")
+
     @staticmethod
     def _save_fold_mapping(
         path: Path,
@@ -738,20 +989,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--outer-folds",
         type=int,
-        default=5,
+        default=None,
         help=(
-            "Number of outer folds. Without --fold-mapping, folds are generated "
-            "here; with --fold-mapping, this must match the mapping's fold count "
-            "and does not repartition samples."
+            "Number of outer folds generated when --fold-mapping is omitted. "
+            "Defaults to 5."
         ),
     )
     parser.add_argument(
         "--inner-folds",
         type=int,
-        default=4,
+        default=None,
         help=(
-            "Number of inner folds. Inner folds are always generated by this "
-            "command from each outer-training partition."
+            "Number of inner folds generated when --fold-mapping is omitted. "
+            "Defaults to 4."
         ),
     )
     parser.add_argument(
@@ -764,10 +1014,10 @@ def parse_args() -> argparse.Namespace:
         "--fold-mapping",
         default=None,
         help=(
-            "Predefined outer-fold mapping created by aquila_cv.py. When "
-            "provided, outer sample assignments come exclusively from this "
-            "file; --outer-folds only validates its fold count, while "
-            "--inner-folds controls newly generated inner folds."
+            "Predefined nested-CV JSON mapping created by aquila_cv.py. Legacy "
+            "outer-only text mappings remain supported and have inner folds "
+            "generated deterministically. Cannot be combined with "
+            "--outer-folds or --inner-folds."
         ),
     )
     parser.add_argument(
@@ -793,7 +1043,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Replace existing prepared artifacts in the output directory.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--save-raw-genotype",
+        action="store_true",
+        help=(
+            "Write sample-subset VCF.GZ files for every outer train/test and "
+            "inner train/validation split."
+        ),
+    )
+    args = parser.parse_args()
+    if args.fold_mapping and (
+        args.outer_folds is not None or args.inner_folds is not None
+    ):
+        parser.error(
+            "--fold-mapping cannot be combined with --outer-folds or "
+            "--inner-folds"
+        )
+    return args
 
 
 def main() -> None:
@@ -808,10 +1074,11 @@ def main() -> None:
         traits=args.traits,
         classification_tasks=args.classification_tasks,
         missing_sentinel=args.missing_sentinel,
-        outer_folds=args.outer_folds,
-        inner_folds=args.inner_folds,
+        outer_folds=args.outer_folds if args.outer_folds is not None else 5,
+        inner_folds=args.inner_folds if args.inner_folds is not None else 4,
         seed=args.seed,
         fold_mapping=Path(args.fold_mapping) if args.fold_mapping else None,
+        save_raw_genotype=args.save_raw_genotype,
         min_observed_per_fold=args.min_observed_per_fold,
         skew_threshold=args.skew_threshold,
         preprocessing_epsilon=args.preprocessing_epsilon,

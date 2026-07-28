@@ -455,6 +455,7 @@ def _train_inner_fold(
         np.arange(len(split["train"])),
         batch_size=batch_size,
         shuffle=True,
+        drop_last=True,
         **effective_loader_options,
     )
     valid_loader = valid_data.loader(
@@ -914,6 +915,7 @@ def _finalize_outer_fold(
         np.arange(len(outer["train"])),
         batch_size=final_batch_size,
         shuffle=True,
+        drop_last=True,
         **final_loader_options,
     )
     outer_test_loader = final_test_data.loader(

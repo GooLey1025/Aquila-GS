@@ -3,23 +3,23 @@
 # Author: Lei Gu
 # Contact: goley04@foxmail.com
 
-"""Create reusable outer-fold sample mappings from a phenotype table."""
+"""Create reusable nested-CV sample mappings from a phenotype table."""
 
 import argparse
+import json
 import math
 from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold
 
-from aquila.data.cv import validate_outer_fold_observations
+from aquila.data.cv import generate_nested_folds, validate_outer_fold_observations
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create phenotype-aware outer CV sample mappings."
+        description="Create phenotype-aware nested CV sample mappings."
     )
     parser.add_argument(
         "--phenotype",
@@ -30,8 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-o",
         "--output",
-        default="sample_fold_mapping.txt",
-        help="Output sample-to-fold mapping.",
+        default="nested_cv_mapping.json",
+        help="Output nested-CV mapping in JSON format.",
     )
     parser.add_argument(
         "--sample-id-column",
@@ -44,9 +44,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Traits to validate; defaults to all non-ID columns.",
     )
-    parser.add_argument("--folds", "--n-folds", type=int, default=5)
+    parser.add_argument("--outer-folds", type=int, default=5)
+    parser.add_argument(
+        "--inner-folds",
+        type=int,
+        default=4,
+        help="Number of inner folds within every outer training partition.",
+    )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--missing-sentinel", type=float, default=-9)
+    parser.add_argument("--missing-sentinel", type=float, default=-999.0)
     parser.add_argument(
         "--min-observed",
         type=int,
@@ -116,54 +122,55 @@ def load_phenotype_mask(
     }
 
 
-def create_outer_folds(
-    sample_count: int,
-    fold_count: int,
-    seed: int,
-) -> tuple[np.ndarray, List[Dict[str, object]]]:
-    """Return zero-based outer test assignments and fold index dictionaries."""
-    if not 2 <= fold_count <= sample_count:
-        raise ValueError(
-            f"folds must be between 2 and {sample_count}, got {fold_count}"
-        )
-    indices = np.arange(sample_count, dtype=np.int64)
-    assignments = np.full(sample_count, -1, dtype=np.int64)
-    folds: List[Dict[str, object]] = []
-    splitter = KFold(n_splits=fold_count, shuffle=True, random_state=seed)
-    for fold_id, (train_pos, test_pos) in enumerate(splitter.split(indices)):
-        train_indices = indices[train_pos]
-        test_indices = indices[test_pos]
-        assignments[test_indices] = fold_id
-        folds.append(
-            {
-                "fold": fold_id,
-                "train": train_indices,
-                "test": test_indices,
-                "inner": [],
-            }
-        )
-    if np.any(assignments < 0):
-        raise RuntimeError("Every sample must be assigned to one outer fold")
-    return assignments, folds
-
-
 def save_mapping(
     path: str | Path,
     sample_ids: List[str],
-    assignments: np.ndarray,
-    fold_count: int,
+    folds: List[Dict[str, object]],
+    seed: int,
 ) -> None:
-    """Save the expanded mapping format consumed by aquila_data_cv.py."""
+    """Save complete nested folds using sample IDs instead of row positions."""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": "aquila_nested_cv",
+        "version": 1,
+        "seed": seed,
+        "outer_folds": len(folds),
+        "inner_folds": len(folds[0]["inner"]) if folds else 0,
+        "sample_ids": sample_ids,
+        "folds": [],
+    }
+    for outer in folds:
+        payload["folds"].append(
+            {
+                "fold": int(outer["fold"]),
+                "train": [
+                    sample_ids[index]
+                    for index in np.asarray(outer["train"], dtype=np.int64)
+                ],
+                "test": [
+                    sample_ids[index]
+                    for index in np.asarray(outer["test"], dtype=np.int64)
+                ],
+                "inner": [
+                    {
+                        "fold": int(inner["fold"]),
+                        "train": [
+                            sample_ids[index]
+                            for index in np.asarray(inner["train"], dtype=np.int64)
+                        ],
+                        "valid": [
+                            sample_ids[index]
+                            for index in np.asarray(inner["valid"], dtype=np.int64)
+                        ],
+                    }
+                    for inner in outer["inner"]
+                ],
+            }
+        )
     with output_path.open("w", encoding="utf-8") as handle:
-        handle.write("SampleIndex\tSampleID\tOuterFold\tRole\n")
-        for fold_id in range(fold_count):
-            for sample_index, sample_id in enumerate(sample_ids):
-                role = "test" if assignments[sample_index] == fold_id else "train"
-                handle.write(
-                    f"{sample_index}\t{sample_id}\t{fold_id}\t{role}\n"
-                )
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
 
 
 def main() -> None:
@@ -176,10 +183,11 @@ def main() -> None:
         traits=args.traits,
         missing_sentinel=args.missing_sentinel,
     )
-    assignments, folds = create_outer_folds(
-        len(phenotype["sample_ids"]),
-        args.folds,
-        args.seed,
+    folds = generate_nested_folds(
+        n_samples=len(phenotype["sample_ids"]),
+        outer_folds=args.outer_folds,
+        inner_folds=args.inner_folds,
+        seed=args.seed,
     )
     validate_outer_fold_observations(
         phenotype["mask"],
@@ -190,11 +198,12 @@ def main() -> None:
     save_mapping(
         args.output,
         phenotype["sample_ids"],
-        assignments,
-        args.folds,
+        folds,
+        args.seed,
     )
     print(
-        f"Saved {args.folds}-fold mapping for "
+        f"Saved {args.outer_folds} outer folds and "
+        f"{args.inner_folds} inner folds for "
         f"{len(phenotype['sample_ids'])} samples to {args.output}"
     )
     print(

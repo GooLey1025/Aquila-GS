@@ -17,44 +17,66 @@ For Aquila, missing phenotypic observations are handled natively through a maske
 ```sh
 # GSTP008.pheno downloaded from CropGS-hub (https://iagr.genomics.cn/CropGS/#/Datasets)
 wget https://iagr.genomics.cn/static/gstool/data/GSTP008/population/GSTP008.pheno
-aquila_cv.py --phenotype GSTP008.pheno -o 705rice_fold_mapping.txt --folds 5 --seed 42
+aquila_cv.py --phenotype GSTP008.pheno -o 705rice_nested_cv.json --outer-folds 5 --inner-folds 4 --seed 42
 ```
-The predefined fold mapping `705rice_fold_mapping.txt` was used throughout the pipeline, including [GWAS lead-variant selection](to_be_add), to avoid information leakage. Specifically, GWAS discovery and lead-variant selection were performed using only the training samples within each fold, while test samples were completely excluded from this process.
+The JSON mapping fixes both outer and inner folds and was used throughout the
+pipeline, including [GWAS lead-variant selection](to_be_add), to avoid
+information leakage. Specifically, GWAS discovery and lead-variant selection
+were performed using only the training samples within each outer fold, while test
+samples were completely excluded from this process.
 
 ### Generate 5-fold training and testing sets:
 When having done the GWAS lead variant selection, we can use the following command to generate the training and testing sets:
 
 ```sh
-aquila_data_cv.py --vcf ../case/705rice_0.03.full.all.impute.biallelic.vcf.gz --phenotype GSTP008.pheno --encoding-type diploid_onehot --variant-type snp --fold-mapping 705rice_fold_mapping.txt -o test  --overwrite
+aquila_data_cv.py --vcf ../case/705rice_0.03.full.all.impute.biallelic.vcf.gz --phenotype GSTP008.pheno --encoding-type diploid_onehot --variant-type snp --fold-mapping 705rice_nested_cv.json -o test_v2 --save-raw-genotype --overwrite
 ```
 
-The preparation stage also caches fold-local phenotype targets. Each inner
-fold contains `Y_train_processed.pt`, `Y_valid_processed.pt`, and
-`preprocessing.json`; each outer fold contains corresponding `final`
-training/test targets. `aquila_train_cv.py` reads these files directly, so
-phenotype preprocessing is not repeated for every HPO trial.
+When `--save-raw-genotype` is enabled, sample-subset VCF files are written
+under `test/raw_genotype/`. Every outer fold contains `train.vcf.gz` and
+`test.vcf.gz`; every nested inner fold contains `train.vcf.gz` and
+`valid.vcf.gz`. These files preserve the source variants and genotype fields,
+but include only the samples assigned to that split. These raw fold-specific
+VCFs allow benchmark models to apply their own genotype encodings while using
+exactly the same samples as Aquila.
 
-```txt
-每个 inner fold
-    ├── 只使用 inner_train 的有效表型计算 skewness
-    ├── 如果 abs(skewness) > 2
-    │      └── 对该 trait 做 log1p
-    ├── 计算 mean/std
-    ├── 对该 trait 做 Z-score
-    ├── 保存 Y_train_processed.pt
-    ├── 使用同一组参数处理 inner_valid
-    └── 保存 Y_valid_processed.pt
+Phenotypes are preprocessed once during data preparation and the resulting
+fold-specific standardized targets are reused by all downstream benchmarks.
+This provides a consistent phenotype input and prevents each method from
+introducing differences through independent preprocessing.
 
-完整 outer_train
-    ├── 重新计算 skewness、log 参数、mean、std
-    ├── 保存 preprocessing.json
-    ├── 处理 outer_train
-    └── 使用相同参数处理 outer_test完整 outer_train
-    ├── 重新计算 skewness、log 参数、mean、std
-    ├── 保存 preprocessing.json
-    ├── 处理 outer_train
-    └── 使用相同参数处理 outer_test
-```
+To avoid information leakage, preprocessing parameters are always estimated
+from the corresponding training samples only:
+
+- For each inner fold, trait skewness is calculated using the observed
+  phenotypes in `inner_train`. A `log1p` transformation is applied when the
+  absolute skewness exceeds the configured threshold, after which the trait is
+  standardized using the training-set mean and standard deviation. The same
+  fitted transformation is then applied to `inner_valid`.
+- For final evaluation in each outer fold, preprocessing is fitted again using
+  the complete `outer_train` partition. The fitted transformation is applied
+  unchanged to both `outer_train` and `outer_test`.
+- Missing phenotype values are excluded when fitting preprocessing parameters
+  and remain masked in the prepared targets.
+
+Each inner-fold directory stores `Y_train_processed.pt`,
+`Y_valid_processed.pt`, and `preprocessing.json`. The `final` directory of
+each outer fold stores `Y_train_processed.pt`, `Y_test_processed.pt`, and its
+own `preprocessing.json`. Together with the predefined nested-CV mapping and
+fold-specific VCF files, these artifacts form the common data inputs used for
+all benchmark models.
+
+Single-trait benchmark models that do not natively support missing
+phenotypes, such as MENET, discard samples with an unobserved target separately
+within each training, validation, and test partition. The `-999` missing-value
+sentinel is never passed to their loss functions or evaluation metrics. The
+remaining samples retain the same predefined nested-CV assignments and
+fold-local phenotype transformations used by Aquila.
+
+For regression benchmarks, both Aquila-GS and the integrated comparison
+models report Pearson r, R², MSE, RMSE, and MAE on the available test
+observations. Fold outputs include metrics on both the standardized phenotype
+scale and the inverse-transformed original scale.
 
 
 ## Prerequisites
@@ -263,3 +285,87 @@ python ChromosomeAwareProcessor.py \
   --gstp_name example \
   --data_dir example \
   --traits Trait1 Trait2
+
+### [MeNet](https://github.com/ganlab/MENET)
+```sh
+conda create -n MeNet python=3.9.17
+conda activate MeNet
+conda install pytorch==2.0.0 torchvision==0.15.0 torchaudio==2.0.0 pytorch-cuda=11.8 -c pytorch -c nvidia
+git clone https://github.com/ganlab/MENET.git
+cd MENET
+pip install -r requirements.txt
+python src_benchmark/MENET_train_cv.py \
+  --data-dir ../test_v2 \
+  --config src_benchmark/configs/MeNet_nested_cv.yaml \
+  --traits GYP_BLUP \
+  --device cuda:0 \
+  -o results/menet_gyp
+```
+
+### [DEM](https://github.com/cma2015/DEM/)
+#### Install
+```sh
+conda create -n dem python=3.11
+conda activate dem
+
+# Install PyTorch with CUDA support
+conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia
+git clone https://github.com/cma2015/DEM.git
+cd DEM
+pip3 install -e .
+```
+
+#### Train
+```sh
+conda activate dem
+
+cd ~/projects/Aquila-GS
+python benchmark/DEM/DEM_train_benchmark.py \
+  --data-dir benchmark/test_v2 \
+  --config benchmark/DEM/configs/DEM_nested_cv.yaml \
+  --output-dir benchmark/DEM/dem_nested_cv_output \
+  --device cuda:0
+```
+
+The benchmark adapter uses all regression traits as one multi-output target.
+Because the original DEM loss has no phenotype mask, only individuals observed
+for every regression trait are retained separately within each prepared split.
+The predefined 5 outer and 4 inner folds are unchanged. Test metrics are
+calculated only after hyperparameter selection and final outer-training
+retraining.
+
+Raw fold-specific VCFs under `benchmark/test_v2/raw_genotype/` are encoded as
+0/1/2 alternate-allele dosage. For every inner fold and final outer fold, a
+multi-output random forest is fitted on training samples only and selects 1,000
+SNPs. The selected marker schema is then applied unchanged to validation or
+test samples.
+
+The HPO budget matches MENET's candidate-count convention: five binary DEM
+hyperparameters form a deterministic `2^5 = 32` grid. Each candidate is
+evaluated on all four inner folds, ranked by mean validation `avg_pearson`, and
+the selected candidate is retrained on the complete outer-training fold for
+the median selected epoch.
+
+Each `fold_<n>/` directory contains the final checkpoint, full HPO trace,
+selected variants, metrics on normalized and original phenotype scales,
+predictions, preprocessing metadata, and sample audit. The root `summary.json`
+reports per-fold results and the mean and standard deviation across the five
+outer test folds; `outer_fold_summary.primary.outer_fold_mean` is the primary
+five-fold mean test Pearson value.
+
+For a reduced integration check:
+
+```sh
+python benchmark/DEM/DEM_train_benchmark.py \
+  --data-dir benchmark/test_v2 \
+  --output-dir /tmp/dem_smoke \
+  --outer-folds 0 \
+  --max-inner-folds 1 \
+  --max-candidates 1 \
+  --device cpu \
+  --overwrite
+```
+
+The complete prepared directory must include `Y_raw.pt`, `Y_mask.pt`, fold
+indices, fold-local processed target tensors, preprocessing JSON files, and the
+raw VCF hierarchy described in the Data Prepare section.
