@@ -9,9 +9,9 @@ encoder:
   margin: 0.1
   learning_rate: 0.001
   weight_decay: 0.00001
-  batch_size: 32
+  batch_size: 64
   max_epochs: 30
-  patience: 8
+  patience: 40
   min_delta: 0.0001
 
 model:
@@ -33,7 +33,7 @@ train:
   batch_size: 8
   dropout: 0.3
   max_epochs: 100
-  patience: 20
+  patience: 40
   min_delta: 0.0001
 
 hpo:
@@ -49,6 +49,6 @@ hpo:
     train.learning_rate:
       values: [0.001, 0.01]
     train.batch_size:
-      values: [8, 32]
+      values: [16, 32]
     train.dropout:
-      values: [0.3, 0.6]
+      values: [0.1, 0.2]

@@ -32,8 +32,11 @@ from MENET_train_cv import (
     SplitData,
     _encode_gt,
     _inverse_trait,
+    _menet_loader,
     build_relatedness,
+    expand_gpu_workers,
     load_vcf_genotypes,
+    parse_args,
     validate_variant_schema,
 )
 from aquila.data.preprocessing import PerTraitPreprocessor, TraitPreprocessing
@@ -115,12 +118,27 @@ def test_training_only_relatedness() -> None:
 
 def test_grid_budget() -> None:
     config_path = (
-        Path(__file__).parent.parent / "configs" / "MeNet_nested_cv.yaml"
+        Path(__file__).parent.parent.parent / "configs" / "MeNet_nested_cv.yaml"
     )
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     candidates = generate_grid_candidates(config["hpo"]["parameters"])
     assert len(candidates) == 32
+
+
+def test_menet_training_loader_discards_incomplete_final_batch() -> None:
+    split = SplitData(
+        genotypes=torch.zeros(5, 4),
+        targets=torch.zeros(5),
+        sample_ids=tuple(f"S{index}" for index in range(5)),
+        discarded_sample_ids=(),
+        variants=(("1", "1", "v", "A", "G"),) * 4,
+    )
+    relatedness = torch.zeros(5, 5)
+    train_loader = _menet_loader(split, relatedness, batch_size=4, shuffle=True)
+    valid_loader = _menet_loader(split, relatedness, batch_size=4, shuffle=False)
+    assert sum(batch[0].shape[0] for batch in train_loader) == 4
+    assert sum(batch[0].shape[0] for batch in valid_loader) == 5
 
 
 def test_single_trait_inverse_transform() -> None:
@@ -155,3 +173,60 @@ def test_regression_metrics_include_mse() -> None:
     assert metrics["per_trait"]["trait"]["mse"] == 1.0
     assert metrics["avg_mse"] == 1.0
     assert metrics["avg_rmse"] == 1.0
+
+
+def test_gpu_cli_defaults_to_detection() -> None:
+    arguments = parse_args(
+        [
+            "--data-dir",
+            "data",
+            "--config",
+            "config",
+            "-o",
+            "output",
+        ]
+    )
+    assert arguments.gpus is None
+    assert arguments.jobs_per_gpu == 1
+    assert arguments.traits is None
+
+
+def test_gpu_cli_supports_selection_and_cpu_fallback() -> None:
+    selected = parse_args(
+        [
+            "--data-dir",
+            "data",
+            "--config",
+            "config",
+            "--traits",
+            "trait",
+            "-o",
+            "output",
+            "--gpus",
+            "0",
+            "2",
+            "--jobs-per-gpu",
+            "3",
+        ]
+    )
+    cpu = parse_args(
+        [
+            "--data-dir",
+            "data",
+            "--config",
+            "config",
+            "--traits",
+            "trait",
+            "-o",
+            "output",
+            "--gpus",
+        ]
+    )
+    assert selected.gpus == [0, 2]
+    assert selected.jobs_per_gpu == 3
+    assert cpu.gpus == []
+
+
+def test_gpu_worker_slots_allow_multiple_jobs_per_device() -> None:
+    assert expand_gpu_workers([0, 2], 3) == [0, 0, 0, 2, 2, 2]
+    assert expand_gpu_workers([], 4) == []

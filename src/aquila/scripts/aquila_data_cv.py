@@ -955,9 +955,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--variant-type",
-        choices=("snp", "snp_indel", "snp_indel_sv"),
+        choices=("snp", "indel", "sv"),
         default=None,
-        help="Optional variant selection passed to the genotype parser.",
+        help=(
+            "Optional explicit input type. Every VCF record is treated as the "
+            "selected SNP, INDEL, or SV type without requiring a type prefix "
+            "in the ID column. When omitted, variant types are detected "
+            "automatically."
+        ),
     )
     parser.add_argument(
         "--sample-id-column",

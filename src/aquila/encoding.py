@@ -227,7 +227,8 @@ def parse_genotype_diploid_onehot(geno_path: str) -> Tuple[np.ndarray, List[str]
 
 def parse_genotype_vcf(
     vcf_path: str,
-    variant_types: List[str] = None
+    variant_types: List[str] = None,
+    assume_variant_type: str = None,
 ) -> dict:
     """
     Parse VCF file with variant type filtering for multi-branch architectures.
@@ -238,8 +239,10 @@ def parse_genotype_vcf(
 
     Args:
         vcf_path: Path to VCF file
-        variant_types: List of variant types to extract (e.g., ["SNP", "INDEL", "SV"])
-                      If None, extract all variants
+        variant_types: Variant types to retain after automatic classification.
+            If None, retain every automatically classified type.
+        assume_variant_type: Assign every VCF record to this type without
+            inspecting the ID or alleles. Intended for explicitly typed inputs.
 
     Returns:
         Dictionary mapping variant_type to (matrix, sample_ids, variant_ids):
@@ -264,7 +267,14 @@ def parse_genotype_vcf(
         - .|. or ./. (missing): [0, 0, 0, 0]
     """
     print(f"Loading VCF file: {vcf_path}")
-    if variant_types:
+    if assume_variant_type is not None:
+        assume_variant_type = str(assume_variant_type).upper()
+        if assume_variant_type not in {"SNP", "INDEL", "SV"}:
+            raise ValueError(
+                "assume_variant_type must be SNP, INDEL, or SV"
+            )
+        print(f"Treating all VCF records as {assume_variant_type}")
+    elif variant_types:
         print(f"Filtering for variant types: {variant_types}")
 
     # Nucleotide to one-hot mapping (alphabetical order: A C G T)
@@ -285,7 +295,12 @@ def parse_genotype_vcf(
     }
 
     # Read VCF file (support both .vcf and .vcf.gz)
-    variants_by_type = {vtype: [] for vtype in (variant_types or [])}
+    initial_types = (
+        [assume_variant_type]
+        if assume_variant_type is not None
+        else (variant_types or [])
+    )
+    variants_by_type = {vtype: [] for vtype in initial_types}
     sample_ids = None
 
     # Detect if file is gzipped
@@ -323,9 +338,11 @@ def parse_genotype_vcf(
             format_field = fields[8]
             genotypes = fields[9:]
 
-            # Determine variant type from ID
-            variant_type = None
-            if variant_types:
+            # Explicitly typed inputs do not require an ID naming convention.
+            variant_type = assume_variant_type
+            if variant_type is not None:
+                pass
+            elif variant_types:
                 for vtype in variant_types:
                     if vtype in variant_id:
                         variant_type = vtype
@@ -334,15 +351,28 @@ def parse_genotype_vcf(
                 if variant_type is None:
                     continue
             else:
-                # If no filtering, determine type from ID
+                # Prefer the established ID convention, then infer from alleles.
                 if 'SNP' in variant_id:
                     variant_type = 'SNP'
                 elif 'INDEL' in variant_id:
                     variant_type = 'INDEL'
                 elif 'SV' in variant_id:
                     variant_type = 'SV'
+                elif (
+                    alt.startswith("<")
+                    or "[" in alt
+                    or "]" in alt
+                    or alt == "*"
+                ):
+                    variant_type = 'SV'
+                elif (
+                    len(ref) == 1
+                    and len(alt) == 1
+                    and "," not in alt
+                ):
+                    variant_type = 'SNP'
                 else:
-                    variant_type = 'OTHER'
+                    variant_type = 'INDEL'
 
                 if variant_type not in variants_by_type:
                     variants_by_type[variant_type] = []
@@ -483,14 +513,22 @@ def parse_genotype_vcf(
     return result
 
 
-def parse_genotype_snp_vcf(vcf_path: str):
+def parse_genotype_snp_vcf(
+    vcf_path: str,
+    *,
+    assume_all_variants: bool = False,
+):
     """
     Parse VCF file extracting only SNP variants.
 
     Returns:
         Dict with keys: matrix, sample_ids, variant_ids, refs, alts, chroms, positions.
     """
-    result = parse_genotype_vcf(vcf_path, variant_types=['SNP'])
+    result = parse_genotype_vcf(
+        vcf_path,
+        variant_types=None if assume_all_variants else ['SNP'],
+        assume_variant_type='SNP' if assume_all_variants else None,
+    )
     if 'SNP' not in result or result['SNP'] is None:
         raise ValueError("No SNP variants found in VCF file")
     return result['SNP']
@@ -546,7 +584,11 @@ def _gt_to_classic_snp_onehot(
     return enc
 
 
-def parse_genotype_snp_vcf_onehot(vcf_path: str) -> Tuple[np.ndarray, List[str], List[str]]:
+def parse_genotype_snp_vcf_onehot(
+    vcf_path: str,
+    *,
+    assume_all_variants: bool = False,
+) -> Tuple[np.ndarray, List[str], List[str]]:
     """
     Parse VCF file (SNP rows only) with classic 3-dimensional one-hot encoding.
 
@@ -558,7 +600,10 @@ def parse_genotype_snp_vcf_onehot(vcf_path: str) -> Tuple[np.ndarray, List[str],
         snp_ids: List of SNP IDs
     """
     print(f"Loading VCF file: {vcf_path}")
-    print(f"Filtering for variant types: ['SNP']")
+    if assume_all_variants:
+        print("Treating all VCF records as SNP")
+    else:
+        print("Filtering for variant types: ['SNP']")
     print(f"Using encoding: onehot (3-dimensional classic REF/HET/ALT)")
 
     variants_by_type: dict = {'SNP': []}
@@ -592,10 +637,8 @@ def parse_genotype_snp_vcf_onehot(vcf_path: str) -> Tuple[np.ndarray, List[str],
             format_field = fields[8]
             genotypes = fields[9:]
 
-            variant_type = None
-            if 'SNP' in variant_id:
-                variant_type = 'SNP'
-            else:
+            variant_type = 'SNP'
+            if not assume_all_variants and 'SNP' not in variant_id:
                 continue
 
             variant_encodings = []
@@ -651,27 +694,43 @@ def parse_genotype_snp_vcf_onehot(vcf_path: str) -> Tuple[np.ndarray, List[str],
     }
 
 
-def parse_genotype_indel_vcf(vcf_path: str):
+def parse_genotype_indel_vcf(
+    vcf_path: str,
+    *,
+    assume_all_variants: bool = False,
+):
     """
     Parse VCF file extracting only INDEL variants.
 
     Returns:
         Dict with keys: matrix, sample_ids, variant_ids, refs, alts, chroms, positions.
     """
-    result = parse_genotype_vcf(vcf_path, variant_types=['INDEL'])
+    result = parse_genotype_vcf(
+        vcf_path,
+        variant_types=None if assume_all_variants else ['INDEL'],
+        assume_variant_type='INDEL' if assume_all_variants else None,
+    )
     if 'INDEL' not in result or result['INDEL'] is None:
         raise ValueError("No INDEL variants found in VCF file")
     return result['INDEL']
 
 
-def parse_genotype_sv_vcf(vcf_path: str):
+def parse_genotype_sv_vcf(
+    vcf_path: str,
+    *,
+    assume_all_variants: bool = False,
+):
     """
     Parse VCF file extracting only SV (structural variant) variants.
 
     Returns:
         Dict with keys: matrix, sample_ids, variant_ids, refs, alts, chroms, positions.
     """
-    result = parse_genotype_vcf(vcf_path, variant_types=['SV'])
+    result = parse_genotype_vcf(
+        vcf_path,
+        variant_types=None if assume_all_variants else ['SV'],
+        assume_variant_type='SV' if assume_all_variants else None,
+    )
     if 'SV' not in result or result['SV'] is None:
         raise ValueError("No SV variants found in VCF file")
     return result['SV']
@@ -712,17 +771,17 @@ def parse_genotype_file(geno_path: str, encoding_type: str = 'diploid_onehot', v
             - 'diploid_onehot': Returns (n_samples, n_snps, 8) with one-hot encoded diploid genotypes
             - 'onehot': Returns (n_samples, n_snps, 3) classic REF/HET/ALT one-hot from VCF (biallelic SNPs)
         variant_type: Which variant types to extract (for VCF files)
-            - 'snp': Only SNPs
-            - 'snp_indel': SNPs and INDELs (returns dict)
-            - 'snp_indel_sv': SNPs, INDELs, and SVs (returns dict)
-            If None, will try to infer from encoding_type for backward compatibility.
+            - 'snp': Treat every input record as SNP
+            - 'indel': Treat every input record as INDEL
+            - 'sv': Treat every input record as SV
+            If None, variant types are detected automatically.
 
     Returns:
         snp_matrix: Encoded SNP matrix (shape depends on encoding type)
         sample_ids: List of sample IDs
         snp_ids: List of SNP IDs
 
-        For multi-branch types (snp_indel, snp_indel_sv), returns dict instead of tuple
+        Automatic detection returns one branch per detected type.
 
     Raises:
         ValueError: If encoding_type or variant_type is not recognized
@@ -733,9 +792,9 @@ def parse_genotype_file(geno_path: str, encoding_type: str = 'diploid_onehot', v
             f"encoding_type must be 'token', 'diploid_onehot', or 'onehot', got '{encoding_type}'"
         )
 
-    if variant_type is not None and variant_type not in ['snp', 'snp_indel', 'snp_indel_sv']:
+    if variant_type is not None and variant_type not in ['snp', 'indel', 'sv']:
         raise ValueError(
-            f"variant_type must be 'snp', 'snp_indel', or 'snp_indel_sv', got '{variant_type}'"
+            f"variant_type must be 'snp', 'indel', or 'sv', got '{variant_type}'"
         )
 
     if encoding_type == 'onehot' and variant_type not in (None, 'snp'):
@@ -745,20 +804,37 @@ def parse_genotype_file(geno_path: str, encoding_type: str = 'diploid_onehot', v
         )
 
     # Handle single-variant types (non-multi-branch)
-    if variant_type is None or variant_type == 'snp':
+    if variant_type is None:
         if encoding_type == 'token':
             return parse_genotype_token(geno_path)
         if encoding_type == 'onehot':
             return parse_genotype_snp_vcf_onehot(geno_path)
+        return parse_genotype_vcf(geno_path)
+
+    if variant_type == 'snp':
+        if encoding_type == 'token':
+            return parse_genotype_token(geno_path)
+        if encoding_type == 'onehot':
+            return parse_genotype_snp_vcf_onehot(
+                geno_path,
+                assume_all_variants=True,
+            )
         # diploid_onehot
-        return parse_genotype_snp_vcf(geno_path)
+        return parse_genotype_snp_vcf(
+            geno_path,
+            assume_all_variants=True,
+        )
 
-    # Handle multi-branch types
-    if variant_type == 'snp_indel':
-        return parse_genotype_snp_indel_vcf(geno_path)
-    elif variant_type == 'snp_indel_sv':
-        return parse_genotype_snp_indel_sv_vcf(geno_path)
-
+    if variant_type == 'indel':
+        return parse_genotype_indel_vcf(
+            geno_path,
+            assume_all_variants=True,
+        )
+    if variant_type == 'sv':
+        return parse_genotype_sv_vcf(
+            geno_path,
+            assume_all_variants=True,
+        )
     # Fallback (should not reach here)
     raise ValueError(f"Unknown variant_type: {variant_type}")
 

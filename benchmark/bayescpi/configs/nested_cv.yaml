@@ -1,0 +1,10 @@
+model: BayesCpi
+seed: 42
+parameters:
+  niter: 12000
+  nburn: 2000
+  thin: 5
+  printfreq: 100
+  threads: 1
+  verbose: false
+grid: {}

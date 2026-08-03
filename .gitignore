@@ -11,7 +11,7 @@ src/aquila/scripts/__pycache__/
 *.pkl
 data_cache/
 RiceAtlas_MP2025/rename6048.ped
-
+__pycache__/
 *.pt
 *.pth
 *.ckpt

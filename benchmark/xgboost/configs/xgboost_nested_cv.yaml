@@ -1,0 +1,34 @@
+# XGBoost leakage-safe nested-CV benchmark configuration.
+
+model:
+  objective: reg:squarederror
+  eval_metric: rmse
+  tree_method: hist
+  max_depth: 6
+  eta: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  min_child_weight: 1
+  gamma: 0.0
+  reg_alpha: 0.0
+  reg_lambda: 1.0
+
+train:
+  max_rounds: 1000
+  early_stopping_rounds: 40
+
+hpo:
+  method: grid
+  metric: avg_pearson
+  direction: maximize
+  parameters:
+    max_depth:
+      values: [3, 6]
+    eta:
+      values: [0.03, 0.1]
+    subsample:
+      values: [0.8, 1.0]
+    colsample_bytree:
+      values: [0.8, 1.0]
+    min_child_weight:
+      values: [1, 5]

@@ -1,0 +1,27 @@
+name: aquila
+
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+
+dependencies:
+  # Keep the existing Aquila Python and CUDA-enabled PyTorch installation.
+  - pip
+  - pytest
+
+  # R runtime and packages used by the nested-CV R workers.
+  - r-base=4.3
+  - r-jsonlite
+  - r-glmnet
+  - r-rrblup
+
+  # Install Python-only benchmark additions into the active Aquila environment.
+  # Using pip here avoids replacing Aquila's existing CUDA-enabled PyTorch.
+  - pip:
+      - xgboost
+      - pytorch-lightning
+      - einops
+      - entmax
+      - lightgbm>=3.3.5
+      - pytest

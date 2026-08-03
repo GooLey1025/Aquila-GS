@@ -1,0 +1,23 @@
+model:
+  weights_units: [64, 32]
+  regressor_units: [64, 32]
+  dropout: 0.3
+training:
+  learning_rate: 0.001
+  weight_decay: 0.1
+  batch_size: 64
+  max_epochs: 120
+  patience: 40
+hpo:
+  grid:
+    model.weights_units:
+      - [64, 32]
+      - [128, 64]
+    model.regressor_units:
+      - [64, 32]
+      - [128, 64]
+    model.dropout: [0.1, 0.2]
+    training.learning_rate: [0.0003, 0.001]
+    training.weight_decay: [0.01, 0.1]
+output:
+  directory: croparnet_nested_cv
