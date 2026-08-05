@@ -1,0 +1,41 @@
+# CLCNet nested-CV benchmark configuration.
+
+data:
+  missing_genotype_value: 3.0
+
+feature_selection:
+  missing_genotype_value: 3.0
+  num_boost_round: 100
+  num_threads: 1
+
+model:
+  shared_dimensions: [4096, 2048, 1024]
+
+train:
+  learning_rate: 0.0001
+  batch_size: 32
+  momentum: 0.9
+  contrastive_weight: 1.0
+  scheduler_factor: 0.8
+  scheduler_patience: 3
+  min_learning_rate: 0.000001
+  max_epochs: 100
+  patience: 40
+  min_delta: 0.0001
+
+hpo:
+  enabled: true
+  method: grid_search
+  metric: avg_pearson
+  direction: maximize
+  parameters:
+    train.learning_rate:
+      values: [0.0001, 0.001]
+    train.batch_size:
+      values: [16, 32]
+    train.momentum:
+      values: [0.9, 0.95]
+    train.contrastive_weight:
+      values: [0.5, 1.0]
+    train.scheduler_factor:
+      values: [0.5, 0.8]

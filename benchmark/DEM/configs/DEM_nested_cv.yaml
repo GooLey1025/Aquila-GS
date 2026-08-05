@@ -1,0 +1,43 @@
+# DEM multi-output nested-CV benchmark configuration.
+
+data:
+  missing_genotype_value: 1.0
+  selected_snps: 1000
+  rf_estimators: 500
+  rf_random_states: [45, 46, 47]
+  rf_n_jobs: -1
+  min_complete_cases: 3
+
+model:
+  n_heads: 1
+  n_encoders: 1
+  hidden_dim: 256
+  dropout: 0.2
+  single_hidden: [512, 128]
+  conc_hidden: [1536, 512]
+  integrated_hidden: [1024, 256, 128]
+
+train:
+  learning_rate: 0.001
+  weight_decay: 0.0
+  batch_size: 32
+  max_epochs: 200
+  patience: 40
+  min_delta: 0.0001
+
+hpo:
+  enabled: true
+  method: grid_search
+  metric: avg_pearson
+  direction: maximize
+  parameters:
+    model.dropout:
+      values: [0.1, 0.2]
+    model.hidden_dim:
+      values: [256, 512]
+    model.n_encoders:
+      values: [1, 2]
+    model.n_heads:
+      values: [1, 2]
+    train.learning_rate:
+      values: [0.001, 0.0001]
