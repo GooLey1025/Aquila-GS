@@ -1,0 +1,448 @@
+# -*- coding: utf-8 -*-
+# Author: Lei Gu
+# Contact: goley04@foxmail.com
+
+"""Load and index prepared nested cross-validation data."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Sequence
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+
+FeatureTensor = torch.Tensor | Dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class PreparedData:
+    """Validated tensors and metadata from a prepared-data directory."""
+
+    features: FeatureTensor
+    targets: torch.Tensor
+    target_mask: torch.Tensor
+    metadata: Dict[str, Any]
+    directory: Path
+
+    @property
+    def sample_count(self) -> int:
+        return int(self.targets.shape[0])
+
+    @property
+    def x(self) -> FeatureTensor:
+        return self.features
+
+    @property
+    def y_raw(self) -> torch.Tensor:
+        return self.targets
+
+    @property
+    def y_mask(self) -> torch.Tensor:
+        return self.target_mask
+
+    def dataset(
+        self,
+        indices: Sequence[int] | np.ndarray | torch.Tensor,
+    ) -> "MaskedTensorDataset":
+        return MaskedTensorDataset(self, indices)
+
+    def loader(
+        self,
+        indices: Sequence[int] | np.ndarray | torch.Tensor,
+        batch_size: int,
+        shuffle: bool = False,
+        drop_last: bool = False,
+        **loader_options: Any,
+    ) -> DataLoader | "GpuResidentLoader":
+        return create_masked_loader(
+            self,
+            indices,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            **loader_options,
+        )
+
+
+class MaskedTensorDataset(Dataset):
+    """A dataset view over selected absolute prepared-data indices."""
+
+    def __init__(
+        self,
+        prepared_data: PreparedData,
+        indices: Sequence[int] | np.ndarray | torch.Tensor,
+    ) -> None:
+        self.prepared_data = prepared_data
+        self.indices = _validate_indices(indices, prepared_data.sample_count)
+        self._regression_slice, self._classification_slice = _task_column_slices(
+            prepared_data.metadata
+        )
+
+    def __len__(self) -> int:
+        return int(self.indices.numel())
+
+    def __getitem__(self, position: int) -> Dict[str, Any]:
+        index = int(self.indices[position])
+        features = self.prepared_data.features
+        if isinstance(features, dict):
+            selected_features: FeatureTensor = {
+                name: tensor[index] for name, tensor in features.items()
+            }
+        else:
+            selected_features = features[index]
+        y_raw = self.prepared_data.targets[index]
+        y_mask = self.prepared_data.target_mask[index]
+        item: Dict[str, Any] = {
+            "x": selected_features,
+            "y_raw": y_raw,
+            "y_mask": y_mask,
+            "index": index,
+            "sample_id": self.prepared_data.metadata["sample_ids"][index],
+        }
+        regression_slice = getattr(self, "_regression_slice", None)
+        classification_slice = getattr(self, "_classification_slice", None)
+        if regression_slice is None and classification_slice is None:
+            regression_slice, classification_slice = _task_column_slices(
+                self.prepared_data.metadata
+            )
+            self._regression_slice = regression_slice
+            self._classification_slice = classification_slice
+        if regression_slice is not None:
+            item["regression_targets"] = y_raw[regression_slice]
+            item["regression_mask"] = y_mask[regression_slice]
+        if classification_slice is not None:
+            item["classification_targets"] = y_raw[classification_slice]
+            item["classification_mask"] = y_mask[classification_slice]
+        return item
+
+
+def load_prepared_data(directory: str | Path) -> PreparedData:
+    """Load prepared artifacts and validate their shared dimensions."""
+    data_path = Path(directory)
+    required = (
+        "X.pt",
+        "Y_raw.pt",
+        "Y_mask.pt",
+        "metadata.json",
+        "sample_fold_mapping.txt",
+    )
+    missing = [name for name in required if not (data_path / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing prepared-data artifacts in {data_path}: {', '.join(missing)}"
+        )
+
+    features = _torch_load(data_path / "X.pt")
+    targets = _torch_load(data_path / "Y_raw.pt")
+    target_mask = _torch_load(data_path / "Y_mask.pt")
+    with (data_path / "metadata.json").open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+
+    sample_count = _validate_features(features)
+    if not isinstance(targets, torch.Tensor) or targets.ndim != 2:
+        raise ValueError("Y_raw.pt must contain a two-dimensional tensor")
+    if targets.dtype != torch.float32:
+        raise ValueError("Y_raw.pt must contain a float32 tensor")
+    if not isinstance(target_mask, torch.Tensor) or target_mask.ndim != 2:
+        raise ValueError("Y_mask.pt must contain a two-dimensional tensor")
+    if target_mask.dtype != torch.bool:
+        raise ValueError("Y_mask.pt must contain a bool tensor")
+    if targets.shape != target_mask.shape:
+        raise ValueError("Y_raw.pt and Y_mask.pt must have identical shapes")
+    if sample_count != targets.shape[0]:
+        raise ValueError("Feature and target sample counts do not match")
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata.json must contain a JSON object")
+
+    sample_ids = metadata.get("sample_ids")
+    trait_names = metadata.get("trait_names")
+    if not isinstance(sample_ids, list) or len(sample_ids) != sample_count:
+        raise ValueError("metadata sample_ids do not match the prepared samples")
+    if len(set(sample_ids)) != len(sample_ids):
+        raise ValueError("metadata sample_ids must be unique")
+    if not isinstance(trait_names, list) or len(trait_names) != targets.shape[1]:
+        raise ValueError("metadata trait_names do not match target columns")
+    if metadata.get("n_samples", sample_count) != sample_count:
+        raise ValueError("metadata n_samples does not match tensor data")
+    if metadata.get("n_traits", targets.shape[1]) != targets.shape[1]:
+        raise ValueError("metadata n_traits does not match tensor data")
+    _validate_cv_artifacts(data_path, metadata, sample_count)
+
+    return PreparedData(
+        features=features,
+        targets=targets,
+        target_mask=target_mask,
+        metadata=metadata,
+        directory=data_path,
+    )
+
+
+def create_masked_loader(
+    prepared_data: PreparedData,
+    indices: Sequence[int] | np.ndarray | torch.Tensor,
+    batch_size: int,
+    shuffle: bool = False,
+    drop_last: bool = False,
+    **loader_options: Any,
+) -> DataLoader | "GpuResidentLoader":
+    """Create a loader for an explicit set of absolute sample indices."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    # Device-resident tensors: batch via advanced indexing to avoid per-sample
+    # DataLoader __getitem__ / host collation stalls that tank GPU util.
+    if _is_cuda_resident(prepared_data):
+        return GpuResidentLoader(
+            prepared_data,
+            indices,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+        )
+    options = dict(loader_options)
+    num_workers = int(options.get("num_workers", 0))
+    options.setdefault("pin_memory", True)
+    if num_workers > 0:
+        options.setdefault("persistent_workers", True)
+        options.setdefault("prefetch_factor", 4)
+    else:
+        options.pop("persistent_workers", None)
+        options.pop("prefetch_factor", None)
+    dataset = MaskedTensorDataset(prepared_data, indices)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        **options,
+    )
+
+
+class GpuResidentLoader:
+    """Yield GPU batches by advanced indexing (no host DataLoader path)."""
+
+    def __init__(
+        self,
+        prepared_data: PreparedData,
+        indices: Sequence[int] | np.ndarray | torch.Tensor,
+        batch_size: int,
+        shuffle: bool = False,
+        drop_last: bool = False,
+    ) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if not _is_cuda_resident(prepared_data):
+            raise ValueError("GpuResidentLoader requires CUDA-resident tensors")
+        self.features = prepared_data.features
+        self.targets = prepared_data.targets
+        self.target_mask = prepared_data.target_mask
+        self.device = self.targets.device
+        self.indices = _validate_indices(
+            indices, prepared_data.sample_count
+        ).to(self.device)
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self._regression_slice, self._classification_slice = _task_column_slices(
+            prepared_data.metadata
+        )
+
+    def __len__(self) -> int:
+        n = int(self.indices.numel())
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size if n else 0
+
+    def __iter__(self):
+        n = int(self.indices.numel())
+        if n == 0:
+            return
+        if self.shuffle:
+            order = torch.randperm(n, device=self.device)
+        else:
+            order = torch.arange(n, device=self.device)
+        sample_idx = self.indices.index_select(0, order)
+        stop = n - (n % self.batch_size) if self.drop_last else n
+        for start in range(0, stop, self.batch_size):
+            batch_idx = sample_idx[start : start + self.batch_size]
+            yield self._make_batch(batch_idx)
+
+    def _make_batch(self, batch_idx: torch.Tensor) -> Dict[str, Any]:
+        if isinstance(self.features, dict):
+            selected_features: FeatureTensor = {
+                name: tensor.index_select(0, batch_idx)
+                for name, tensor in self.features.items()
+            }
+        else:
+            selected_features = self.features.index_select(0, batch_idx)
+        y_raw = self.targets.index_select(0, batch_idx)
+        y_mask = self.target_mask.index_select(0, batch_idx)
+        item: Dict[str, Any] = {
+            "x": selected_features,
+            "y_raw": y_raw,
+            "y_mask": y_mask,
+        }
+        if self._regression_slice is not None:
+            item["regression_targets"] = y_raw[:, self._regression_slice]
+            item["regression_mask"] = y_mask[:, self._regression_slice]
+        if self._classification_slice is not None:
+            item["classification_targets"] = y_raw[:, self._classification_slice]
+            item["classification_mask"] = y_mask[:, self._classification_slice]
+        return item
+
+
+def _is_cuda_resident(prepared_data: PreparedData) -> bool:
+    features = prepared_data.features
+    if isinstance(features, dict):
+        if not features or not all(
+            isinstance(tensor, torch.Tensor) and tensor.is_cuda
+            for tensor in features.values()
+        ):
+            return False
+    elif not isinstance(features, torch.Tensor) or not features.is_cuda:
+        return False
+    return bool(prepared_data.targets.is_cuda and prepared_data.target_mask.is_cuda)
+
+
+def _task_column_slices(
+    metadata: Dict[str, Any],
+) -> tuple[slice | None, slice | None]:
+    """Return regression/classification column slices from prepared metadata."""
+    trait_names = metadata.get("trait_names")
+    if not isinstance(trait_names, list) or not trait_names:
+        return None, None
+    regression_tasks = metadata.get("regression_tasks")
+    classification_tasks = metadata.get("classification_tasks")
+    if not isinstance(regression_tasks, list):
+        regression_tasks = list(trait_names)
+    if not isinstance(classification_tasks, list):
+        classification_tasks = []
+    n_regression = len(regression_tasks)
+    n_classification = len(classification_tasks)
+    if n_regression + n_classification != len(trait_names):
+        return None, None
+    if trait_names[:n_regression] != regression_tasks:
+        return None, None
+    if trait_names[n_regression:] != classification_tasks:
+        return None, None
+    regression_slice = slice(0, n_regression) if n_regression else None
+    classification_slice = (
+        slice(n_regression, n_regression + n_classification)
+        if n_classification
+        else None
+    )
+    return regression_slice, classification_slice
+
+
+def _torch_load(path: Path) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _validate_features(features: Any) -> int:
+    if isinstance(features, torch.Tensor):
+        if features.ndim < 1:
+            raise ValueError("X.pt feature tensor must have a sample dimension")
+        return int(features.shape[0])
+    if isinstance(features, dict) and features:
+        sample_counts = set()
+        for name, tensor in features.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("X.pt feature dictionary keys must be nonempty strings")
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim < 1:
+                raise ValueError(
+                    f"X.pt feature branch {name!r} must be a tensor with samples"
+                )
+            sample_counts.add(int(tensor.shape[0]))
+        if len(sample_counts) != 1:
+            raise ValueError("All X.pt feature branches must have equal sample counts")
+        return sample_counts.pop()
+    raise ValueError("X.pt must contain a tensor or a nonempty dictionary of tensors")
+
+
+def _validate_indices(
+    indices: Sequence[int] | np.ndarray | torch.Tensor,
+    sample_count: int,
+) -> torch.Tensor:
+    index_tensor = torch.as_tensor(indices, dtype=torch.long)
+    if index_tensor.ndim != 1:
+        raise ValueError("indices must be one-dimensional")
+    if index_tensor.numel():
+        if int(index_tensor.min()) < 0 or int(index_tensor.max()) >= sample_count:
+            raise IndexError("indices contain out-of-range values")
+        if index_tensor.unique().numel() != index_tensor.numel():
+            raise ValueError("indices must not contain duplicates")
+    return index_tensor.clone()
+
+
+def _validate_cv_artifacts(
+    data_path: Path,
+    metadata: Dict[str, Any],
+    sample_count: int,
+) -> None:
+    outer_count = metadata.get("outer_folds")
+    inner_count = metadata.get("inner_folds")
+    if not isinstance(outer_count, int) or outer_count < 2:
+        raise ValueError("metadata outer_folds must be an integer of at least two")
+    if not isinstance(inner_count, int) or inner_count < 2:
+        raise ValueError("metadata inner_folds must be an integer of at least two")
+
+    all_indices = set(range(sample_count))
+    observed_test_indices = set()
+    for outer_number in range(outer_count):
+        outer_path = data_path / "cv" / f"outer_fold_{outer_number}"
+        outer_train = _load_index_file(outer_path / "train_idx.npy", sample_count)
+        outer_test = _load_index_file(outer_path / "test_idx.npy", sample_count)
+        train_set = set(outer_train.tolist())
+        test_set = set(outer_test.tolist())
+        if train_set & test_set or train_set | test_set != all_indices:
+            raise ValueError(
+                f"Outer fold {outer_number} is not a complete disjoint partition"
+            )
+        if observed_test_indices & test_set:
+            raise ValueError("Outer test folds contain overlapping sample indices")
+        observed_test_indices.update(test_set)
+
+        for inner_number in range(inner_count):
+            inner_path = outer_path / f"inner_fold_{inner_number}"
+            inner_train = _load_index_file(
+                inner_path / "train_idx.npy",
+                sample_count,
+            )
+            inner_valid = _load_index_file(
+                inner_path / "valid_idx.npy",
+                sample_count,
+            )
+            inner_train_set = set(inner_train.tolist())
+            inner_valid_set = set(inner_valid.tolist())
+            if (
+                inner_train_set & inner_valid_set
+                or inner_train_set | inner_valid_set != train_set
+            ):
+                raise ValueError(
+                    f"Inner fold {outer_number}/{inner_number} is not a "
+                    "complete partition of its outer training set"
+                )
+
+    if observed_test_indices != all_indices:
+        raise ValueError("Outer test folds do not cover every prepared sample")
+
+
+def _load_index_file(path: Path, sample_count: int) -> np.ndarray:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing cross-validation index file: {path}")
+    indices = np.load(path, allow_pickle=False)
+    if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+        raise ValueError(f"Cross-validation indices must be a 1D integer array: {path}")
+    if indices.size:
+        if int(indices.min()) < 0 or int(indices.max()) >= sample_count:
+            raise IndexError(f"Cross-validation index is out of range: {path}")
+        if np.unique(indices).size != indices.size:
+            raise ValueError(f"Cross-validation indices contain duplicates: {path}")
+    return indices
