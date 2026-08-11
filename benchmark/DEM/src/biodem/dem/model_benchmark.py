@@ -2,7 +2,9 @@
 # Author: Lei Gu
 # Contact: goley04@foxmail.com
 
-"""Faithful multi-output DEM model and benchmark training primitives."""
+"""Single-output DEM model and benchmark training primitives."""
+
+# Migrated from: https://github.com/cma2015/DEM
 
 from __future__ import annotations
 
@@ -14,13 +16,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 
 
 @dataclass(frozen=True)
 class DEMFitResult:
-    """Selected DEM state, epoch, validation metrics, and history."""
-
     state_dict: dict[str, torch.Tensor]
     best_epoch: int
     best_metric: float
@@ -30,7 +30,6 @@ class DEMFitResult:
 
 
 def set_seed(seed: int) -> None:
-    """Seed Python, NumPy, and PyTorch for one benchmark fit."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -57,8 +56,6 @@ def _encoder(
 
 
 class ExtractionBranch(nn.Module):
-    """Original DEM extraction branch with configurable dense ordering."""
-
     def __init__(
         self,
         input_dim: int,
@@ -95,13 +92,10 @@ class ExtractionBranch(nn.Module):
     def forward(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         values = self.encoders(values)
         values = torch.flatten(values, start_dim=1)
-        hidden = self.linears[0](values)
-        return self.linears(values), hidden
+        return self.linears(values), self.linears[0](values)
 
 
 class IntegrationBranch(nn.Module):
-    """Original DEM integration branch."""
-
     def __init__(
         self,
         input_dim: int,
@@ -127,13 +121,11 @@ class IntegrationBranch(nn.Module):
         )
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
-        values = self.encoders(values)
-        values = torch.flatten(values, start_dim=1)
-        return self.linears(values)
+        return self.linears(torch.flatten(self.encoders(values), start_dim=1))
 
 
 class DEMBenchmark(nn.Module):
-    """Benchmark-owned faithful DEM dual-extraction architecture."""
+    """Faithful DEM dual-extraction architecture with configurable modalities."""
 
     def __init__(
         self,
@@ -161,54 +153,39 @@ class DEMBenchmark(nn.Module):
         self.omics_dims = dimensions
         self.output_dim = int(output_dim)
         self.extract_conc = ExtractionBranch(
-            sum(dimensions),
-            output_dim,
-            n_heads,
-            n_encoders,
-            hidden_dim,
-            dropout,
-            conc_hidden,
-            True,
+            sum(dimensions), output_dim, n_heads, n_encoders, hidden_dim,
+            dropout, conc_hidden, True,
         )
         self.extract_each_omics = nn.ModuleList(
             [
                 ExtractionBranch(
-                    dimension,
-                    output_dim,
-                    n_heads,
-                    n_encoders,
-                    hidden_dim,
-                    dropout,
-                    single_hidden,
-                    False,
+                    dimension, output_dim, n_heads, n_encoders, hidden_dim,
+                    dropout, single_hidden, False,
                 )
                 for dimension in dimensions
             ]
         )
         self.integrate_extractions = IntegrationBranch(
-            integrated_input,
-            output_dim,
-            n_heads,
-            n_encoders,
-            hidden_dim,
-            dropout,
-            integrated_hidden,
+            integrated_input, output_dim, n_heads, n_encoders, hidden_dim,
+            dropout, integrated_hidden,
         )
         self.weights_each_omics = nn.ParameterList(
-            [
-                nn.Parameter(torch.ones(1) / len(dimensions))
-                for _ in dimensions
-            ]
+            [nn.Parameter(torch.ones(1) / len(dimensions)) for _ in dimensions]
         )
         self.weight_conc = nn.Parameter(torch.ones(1))
         self.weight_integrated = nn.Parameter(torch.ones(1))
 
     def forward(self, omics: Sequence[torch.Tensor]) -> torch.Tensor:
-        predicted_conc, hidden_conc = self.extract_conc(torch.cat(tuple(omics), 1))
+        values = tuple(omics)
+        if len(values) != len(self.omics_dims):
+            raise ValueError(
+                f"DEM expected {len(self.omics_dims)} modalities, got {len(values)}"
+            )
+        predicted_conc, hidden_conc = self.extract_conc(torch.cat(values, 1))
         predictions = []
         hidden = []
         for index, extractor in enumerate(self.extract_each_omics):
-            predicted, representation = extractor(omics[index])
+            predicted, representation = extractor(values[index])
             predictions.append(self.weights_each_omics[index] * predicted)
             hidden.append(representation)
         predicted_each = torch.stack(predictions).sum(dim=0)
@@ -222,20 +199,53 @@ class DEMBenchmark(nn.Module):
         )
 
 
+class _ModalDataset(Dataset):
+    def __init__(
+        self, features: Sequence[np.ndarray], targets: np.ndarray
+    ) -> None:
+        self.features = tuple(torch.from_numpy(value).float() for value in features)
+        self.targets = torch.from_numpy(targets).float()
+
+    def __len__(self) -> int:
+        return len(self.targets)
+
+    def __getitem__(self, index: int) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        return tuple(value[index] for value in self.features), self.targets[index]
+
+
+def _as_modalities(features: np.ndarray | Sequence[np.ndarray]) -> tuple[np.ndarray, ...]:
+    if isinstance(features, np.ndarray):
+        values = (features,)
+    else:
+        values = tuple(features)
+    values = tuple(np.asarray(value, dtype=np.float32) for value in values)
+    if not values or any(value.ndim != 2 for value in values):
+        raise ValueError("DEM modalities must be non-empty two-dimensional arrays")
+    if len({len(value) for value in values}) != 1:
+        raise ValueError("DEM modalities must contain the same samples")
+    return values
+
+
 def _loader(
-    features: np.ndarray,
+    features: np.ndarray | Sequence[np.ndarray],
     targets: np.ndarray,
     batch_size: int,
     shuffle: bool,
     seed: int,
 ) -> DataLoader:
-    dataset = TensorDataset(
-        torch.from_numpy(features).float(),
-        torch.from_numpy(targets).float(),
-    )
+    modalities = _as_modalities(features)
+    if targets.ndim != 2 or targets.shape[1] != 1:
+        raise ValueError("DEM targets must have shape (samples, 1)")
+    if len(targets) != len(modalities[0]):
+        raise ValueError("DEM features and targets must align")
+    if shuffle and len(targets) < batch_size:
+        raise ValueError(
+            f"DEM training requires at least one complete batch: "
+            f"{len(targets)} samples < batch_size {batch_size}"
+        )
     generator = torch.Generator().manual_seed(seed)
     return DataLoader(
-        dataset,
+        _ModalDataset(modalities, targets),
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=shuffle,
@@ -245,25 +255,27 @@ def _loader(
 
 def predict_dem(
     model: DEMBenchmark,
-    genotypes: np.ndarray,
+    features: np.ndarray | Sequence[np.ndarray],
     targets: np.ndarray | None,
     batch_size: int,
     device: torch.device,
 ) -> tuple[np.ndarray, float]:
-    """Predict while preserving upstream batch-dependent model behavior."""
+    modalities = _as_modalities(features)
+    if len(modalities[0]) == 0:
+        raise ValueError("DEM prediction requires at least one sample")
     dummy = (
-        np.zeros((len(genotypes), model.output_dim), dtype=np.float32)
+        np.zeros((len(modalities[0]), 1), dtype=np.float32)
         if targets is None
         else targets
     )
-    loader = _loader(genotypes, dummy, batch_size, False, 0)
+    loader = _loader(modalities, dummy, batch_size, False, 0)
     criterion = nn.MSELoss()
     predictions = []
     losses = []
     model.eval()
     with torch.no_grad():
-        for features, observed in loader:
-            output = model([features.to(device)])
+        for batch_features, observed in loader:
+            output = model([value.to(device) for value in batch_features])
             predictions.append(output.cpu().numpy())
             if targets is not None:
                 losses.append(float(criterion(output, observed.to(device))))
@@ -272,24 +284,24 @@ def predict_dem(
 
 
 def train_dem(
-    train_x: np.ndarray,
+    train_x: np.ndarray | Sequence[np.ndarray],
     train_y: np.ndarray,
-    valid_x: np.ndarray | None,
+    valid_x: np.ndarray | Sequence[np.ndarray] | None,
     valid_y: np.ndarray | None,
     config: Mapping[str, Any],
     device: torch.device,
     seed: int,
     evaluator: Any,
-    trait_names: Sequence[str],
+    trait_name: str,
     fixed_epochs: int | None = None,
 ) -> DEMFitResult:
-    """Fit one DEM candidate with early stopping or fixed final epochs."""
     set_seed(seed)
+    train_modalities = _as_modalities(train_x)
     model_config = config["model"]
     train_config = config["train"]
     model = DEMBenchmark(
-        [train_x.shape[1]],
-        train_y.shape[1],
+        [value.shape[1] for value in train_modalities],
+        1,
         int(model_config["n_heads"]),
         int(model_config["n_encoders"]),
         int(model_config["hidden_dim"]),
@@ -308,7 +320,9 @@ def train_dem(
     )
     criterion = nn.MSELoss()
     batch_size = int(train_config["batch_size"])
-    train_loader = _loader(train_x, train_y, batch_size, True, seed)
+    train_loader = _loader(
+        train_modalities, train_y, batch_size, True, seed
+    )
     max_epochs = (
         int(fixed_epochs)
         if fixed_epochs is not None
@@ -319,16 +333,16 @@ def train_dem(
     best_metric = -float("inf")
     best_epoch = 1
     best_state = copy.deepcopy(model.state_dict())
-    best_predictions = np.empty((0, train_y.shape[1]), dtype=np.float32)
+    best_predictions = np.empty((0, 1), dtype=np.float32)
     best_metrics: dict[str, Any] = {}
     history = []
     stale = 0
     for epoch in range(1, max_epochs + 1):
         model.train()
         losses = []
-        for features, targets in train_loader:
+        for batch_features, targets in train_loader:
             optimizer.zero_grad(set_to_none=True)
-            prediction = model([features.to(device)])
+            prediction = model([value.to(device) for value in batch_features])
             loss = criterion(prediction, targets.to(device))
             loss.backward()
             optimizer.step()
@@ -339,11 +353,9 @@ def train_dem(
             predictions, valid_loss = predict_dem(
                 model, valid_x, valid_y, batch_size, device
             )
+            mask = np.ones_like(valid_y, dtype=bool)
             metrics = evaluator(
-                predictions,
-                valid_y,
-                np.ones_like(valid_y, dtype=bool),
-                trait_names,
+                predictions, valid_y, mask, [trait_name]
             ).metrics
             metric = float(metrics["avg_pearson"])
             record.update(valid_loss=valid_loss, valid_pearson=metric)
@@ -366,10 +378,6 @@ def train_dem(
     if valid_x is None or valid_y is None:
         best_metric = float("nan")
     return DEMFitResult(
-        best_state,
-        best_epoch,
-        best_metric,
-        best_metrics,
-        best_predictions,
-        tuple(history),
+        best_state, best_epoch, best_metric, best_metrics,
+        best_predictions, tuple(history),
     )

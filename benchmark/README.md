@@ -192,14 +192,28 @@ The benchmark adaptation preserves MENET's two-stage architecture while making m
 Some scripts from DEM were copied or adapted into our project repository. The upstream source code version referenced for this benchmark is commit `86de718f950d0ecc5554ff1916e2d59f51a33ce8`.
 
 ```sh
-cd dem
+cd DEM
 python DEM_train_benchmark.py \
-  --data-dir ../test_v2 \
-  --config configs/DEM_nested_cv.yaml \
-  --output-dir dem_nested_cv_output \
-  --jobs-per-gpu 2
+  --data-dir ../Maize1404.snp.cv.data \
+  --config configs/DEM-SNP_nested_cv.yaml \
+  --output-dir results/DEM-SNP/Maize1404
+
+python DEM_train_benchmark.py \
+  --data-dir ../Maize1404.vars.cv.data \
+  --config configs/DEM-Vars_nested_cv.yaml \
+  --output-dir results/DEM-Vars/Maize1404
 ```
 
+DEM-SNP and DEM-Vars train independent single-output models for each selected
+trait and outer fold. Missing phenotypes are removed only within the assigned
+train, validation, or test split, so predefined fold membership is unchanged,
+and training uses ordinary MSE. DEM-SNP uses the original ten-channel DEM SNP
+encoding. DEM-Vars uses ordered SNP, INDEL, and SV branches, with ten channels
+for SNPs and Aquila-Vars four-class channels for INDELs and SVs. Optional
+random-forest marker selection is fitted separately per branch on retained
+training samples only. The original batch-dependent Transformer behavior is
+preserved. See the
+[detailed DEM benchmark adaptation](docs/DEM_benchmark_adaptation.md).
 
 ### [DNAwhisper](https://github.com/Marxin1992/Whisperer_of_DNA)
 Some scripts from Whisperer of DNA were copied or adapted into our project repository. The upstream source code version referenced for this benchmark is commit `7a657cc00d44263c4b1085d3991ecc0e935c14e5`.

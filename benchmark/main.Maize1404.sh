@@ -6,6 +6,8 @@ conda activate aquila
 aquila_cv.py --phenotype $PHENO_FILE -o $COHORT.nested_cv.json --outer-folds 5 --inner-folds 4 --seed 42
 
 aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.nested_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
+aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.nested_cv.json -o $COHORT.snp.cv.data --save-raw-genotype --overwrite
+aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.nested_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
 
 cd croparnet
 /usr/bin/time -v -o $COHORT.time.txt python src_benchmark/adapter.py \
@@ -15,7 +17,6 @@ cd croparnet
   --jobs-per-gpu 4
 
 cd ../cropformer
-
 /usr/bin/time -v -o $COHORT.time.txt python src_benchmark/adapter.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
@@ -69,10 +70,16 @@ cd ../MENET
   -o results/$COHORT
 
 cd ../DEM
-/usr/bin/time -v -o $COHORT.time.txt python DEM_train_benchmark.py \
-  --data-dir ../$COHORT.cv.data \
-  --config configs/DEM_nested_cv.yaml \
-  --output-dir results/$COHORT \
+/usr/bin/time -v -o $COHORT.DEM-SNP.time.txt python DEM_train_benchmark.py \
+  --data-dir ../$COHORT.snp.cv.data \
+  --config configs/DEM-SNP_nested_cv.yaml \
+  --output-dir results/DEM-SNP/$COHORT \
+  --jobs-per-gpu 2
+
+/usr/bin/time -v -o $COHORT.DEM-Vars.time.txt python DEM_train_benchmark.py \
+  --data-dir ../$COHORT.vars.cv.data \
+  --config configs/DEM-Vars_nested_cv.yaml \
+  --output-dir results/DEM-Vars/$COHORT \
   --jobs-per-gpu 2
 
 cd ../Whisperer_of_DNA
@@ -88,3 +95,10 @@ cd ../BNNs
   --config configs/BNNs_nested_cv.yaml \
   --output-dir results/$COHORT \
   --jobs-per-gpu 2
+
+cd ../aquila-snp
+aquila_train_cv.py --data-dir ../$COHORT.cv.data --config conv_mha.aquila-snp.hpo.yaml \
+  -o results/$COHORT --live-metrics-log
+
+cd ..
+python summary_and_plot_benchmark_model.py --benchmark-dir . Maize1404
