@@ -4,6 +4,7 @@ data:
   missing_genotype_value: 3.0
 
 feature_selection:
+  enabled: false
   missing_genotype_value: 3.0
   num_boost_round: 100
   num_threads: 1

@@ -65,7 +65,7 @@ conda activate aquila
 conda env update -n aquila -f environment.yml
 ```
 
-The environment file adds the dependencies not supplied by Aquila itself, including XGBoost, the Whisperer of DNA runtime packages, R 4.3, `jsonlite`, `glmnet`, `rrBLUP`, and CLCNet's LightGBM selector. Integrated models are tested in this updated `aquila` environment; their upstream Conda environments and pinned PyTorch/CUDA stacks are not used. Consequently, for benchmarking purposes, it is not necessary to clone all original repositories, as the required scripts have been integrated or adapted into this project.
+The environment file adds the dependencies not supplied by Aquila itself, including XGBoost, the Whisperer of DNA runtime packages, R 4.3, `jsonlite`, `glmnet`, `rrBLUP`, and CLCNet's optional LightGBM selector. Integrated models are tested in this updated `aquila` environment; their upstream Conda environments and pinned PyTorch/CUDA stacks are not used. Consequently, for benchmarking purposes, it is not necessary to clone all original repositories, as the required scripts have been integrated or adapted into this project.
 
 The CRAN `hibayes` package used by BayesCpi is not available from the configured Conda channels. Install it once into the R library inside the activated Aquila environment:
 ```sh

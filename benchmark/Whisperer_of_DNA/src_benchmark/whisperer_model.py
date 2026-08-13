@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import copy
 import importlib
+import importlib.machinery
+import importlib.util
 import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -125,9 +127,15 @@ def _patch_standard_attention_mask_semantics(models_name: str) -> None:
 def apply_candidate_overrides(
     base_config: Mapping[str, Any],
     parameters: Mapping[str, Any],
-    trait_name: str,
+    trait_names: Sequence[str],
 ) -> dict[str, Any]:
     """Apply all benchmark model overrides to a deep-copied upstream config."""
+    if isinstance(trait_names, str):
+        names = (trait_names,)
+    else:
+        names = tuple(str(name) for name in trait_names)
+    if not names:
+        raise ValueError("DNAWhisper requires at least one trait")
     config = copy.deepcopy(dict(base_config))
     dropout = float(parameters.get("dropout", config["embedding"]["dropout_rate"]))
     layers = int(
@@ -139,8 +147,8 @@ def apply_candidate_overrides(
     config["embedding"]["input_type"] = "SNP"
     config["embedding"]["input_dims"] = 10
     config["embedding"]["dropout_rate"] = dropout
-    config["output_layer"]["phenotype_dim"] = 1
-    config["output_layer"]["phenotype_name"] = [trait_name]
+    config["output_layer"]["phenotype_dim"] = len(names)
+    config["output_layer"]["phenotype_name"] = list(names)
     config["output_layer"]["dropout_rate"] = dropout
     for block in config["GFI_FormerBLOCKS"]["blocks"][
         : config["GFI_FormerBLOCKS"]["num_blocks"]
@@ -152,7 +160,7 @@ def apply_candidate_overrides(
         block["decoder"]["MOE"]["dropout_rate"] = dropout
         block["decoder"]["pooling"]["dropout_rate"] = dropout
     auxiliary = config["loss_config"]["auxiliary_losses"]
-    auxiliary["Deep_Supervision"]["enabled"] = False
+    auxiliary["Deep_Supervision"]["enabled"] = True
     auxiliary["PWCosSim"]["enabled"] = False
     auxiliary["correlation"]["enabled"] = False
     return config
@@ -194,15 +202,39 @@ def build_model(
     return model.to(device)
 
 
+def _as_target_matrix(targets: np.ndarray) -> np.ndarray:
+    array = np.asarray(targets, dtype=np.float32)
+    if array.ndim == 1:
+        return array.reshape(-1, 1)
+    if array.ndim != 2:
+        raise ValueError("Phenotype targets must be a one- or two-dimensional array")
+    return array
+
+
+def _as_mask_matrix(mask: np.ndarray | None, targets: np.ndarray) -> np.ndarray:
+    if mask is None:
+        return np.isfinite(targets)
+    array = np.asarray(mask, dtype=bool)
+    if array.ndim == 1:
+        array = array.reshape(-1, 1)
+    if array.shape != targets.shape:
+        raise ValueError("Observation mask must match the phenotype matrix")
+    return array & np.isfinite(targets)
+
+
 def _loader(
     genotypes: np.ndarray,
     targets: np.ndarray,
     batch_size: int,
     shuffle: bool,
+    mask: np.ndarray | None = None,
 ) -> DataLoader:
+    target_matrix = _as_target_matrix(targets)
+    mask_matrix = _as_mask_matrix(mask, target_matrix)
     dataset = TensorDataset(
         torch.from_numpy(np.asarray(genotypes, dtype=np.float32)),
-        torch.from_numpy(np.asarray(targets, dtype=np.float32)).reshape(-1, 1),
+        torch.from_numpy(target_matrix),
+        torch.from_numpy(mask_matrix),
     )
     return DataLoader(
         dataset,
@@ -212,25 +244,52 @@ def _loader(
     )
 
 
+def _masked_mse(predictions: np.ndarray, targets: np.ndarray, mask: np.ndarray) -> float:
+    valid = np.asarray(mask, dtype=bool) & np.isfinite(predictions) & np.isfinite(targets)
+    if not valid.any():
+        return float("nan")
+    residual = np.asarray(predictions, dtype=np.float64)[valid] - np.asarray(
+        targets, dtype=np.float64
+    )[valid]
+    return float(np.mean(np.square(residual)))
+
+
+def _fill_missing_targets(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Replace missing labels with detached predictions so they do not enter the loss."""
+    return torch.where(mask, targets, predictions.detach())
+
+
 def _predict(
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     model.eval()
     predictions = []
     targets = []
+    masks = []
     with torch.no_grad():
-        for features, phenotype in loader:
+        for features, phenotype, observed in loader:
             output = model(features.to(device))["final_pred"]
             predictions.append(output.detach().cpu())
             targets.append(phenotype)
-    prediction_array = torch.cat(predictions).numpy().reshape(-1)
-    target_array = torch.cat(targets).numpy().reshape(-1)
+            masks.append(observed)
+    prediction_array = torch.cat(predictions).numpy()
+    target_array = torch.cat(targets).numpy()
+    mask_array = torch.cat(masks).numpy().astype(bool)
+    if prediction_array.ndim == 1:
+        prediction_array = prediction_array.reshape(-1, 1)
+        target_array = target_array.reshape(-1, 1)
+        mask_array = mask_array.reshape(-1, 1)
     return (
         prediction_array,
         target_array,
-        float(np.mean(np.square(prediction_array - target_array))),
+        mask_array,
+        _masked_mse(prediction_array, target_array, mask_array),
     )
 
 
@@ -247,8 +306,12 @@ def train_model(
     max_epochs: int,
     patience: int,
     fixed_epochs: int | None = None,
+    train_mask: np.ndarray | None = None,
+    valid_mask: np.ndarray | None = None,
+    trait_names: Sequence[str] | None = None,
 ) -> TrainingResult:
     """Train with validation-only selection or a fixed outer-refit duration."""
+    names = tuple(trait_names or config["output_layer"]["phenotype_name"])
     set_seed(seed)
     model = build_model(
         config,
@@ -263,9 +326,11 @@ def train_model(
         weight_decay=float(parameters["weight_decay"]),
     )
     batch_size = int(parameters["batch_size"])
-    train_loader = _loader(train_genotypes, train_targets, batch_size, True)
+    train_loader = _loader(
+        train_genotypes, train_targets, batch_size, True, train_mask
+    )
     valid_loader = (
-        _loader(valid_genotypes, valid_targets, batch_size, False)
+        _loader(valid_genotypes, valid_targets, batch_size, False, valid_mask)
         if valid_genotypes is not None and valid_targets is not None
         else None
     )
@@ -279,12 +344,14 @@ def train_model(
     for epoch in range(1, epoch_count + 1):
         model.train()
         train_losses = []
-        for features, phenotype in train_loader:
+        for features, phenotype, observed in train_loader:
             optimizer.zero_grad(set_to_none=True)
             features = features.to(device)
             phenotype = phenotype.to(device)
+            observed = observed.to(device)
             outputs = model(features)
-            losses = model.compute_loss(outputs, phenotype)
+            filled = _fill_missing_targets(outputs["final_pred"], phenotype, observed)
+            losses = model.compute_loss(outputs, filled)
             loss = losses["total_loss"]
             loss.backward()
             optimizer.step()
@@ -297,10 +364,8 @@ def train_model(
             best_state = copy.deepcopy(model.state_dict())
             history.append(row)
             continue
-        predictions, targets, valid_loss = _predict(model, valid_loader, device)
-        metrics = evaluate_regression(
-            predictions, targets, np.ones_like(targets, dtype=bool), ["trait"]
-        ).metrics
+        predictions, targets, mask, valid_loss = _predict(model, valid_loader, device)
+        metrics = evaluate_regression(predictions, targets, mask, names).metrics
         metric = float(metrics["avg_pearson"])
         row.update(
             {
@@ -336,7 +401,8 @@ def predict_model(
     config: Mapping[str, Any],
     parameters: Mapping[str, Any],
     device: torch.device,
-) -> tuple[np.ndarray, float]:
+    mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, float]:
     """Predict one held-out split from a saved DNAWhisper state."""
     model = build_model(
         config,
@@ -345,9 +411,9 @@ def predict_model(
         device,
     )
     model.load_state_dict(state_dict)
-    predictions, _, loss = _predict(
+    predictions, _, observed, loss = _predict(
         model,
-        _loader(genotypes, targets, int(parameters["batch_size"]), False),
+        _loader(genotypes, targets, int(parameters["batch_size"]), False, mask),
         device,
     )
-    return predictions, loss
+    return predictions, observed, loss

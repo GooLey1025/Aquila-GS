@@ -4,12 +4,11 @@
 # Contact: goley04@foxmail.com
 # Migrated from: https://github.com/Marxin1992/Whisperer_of_DNA.git
 
-"""Leakage-safe nested cross-validation for DNA Whisper."""
+"""Leakage-safe nested cross-validation for multi-trait DNA Whisper."""
 
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import shutil
 import sys
@@ -34,7 +33,6 @@ for import_path in (str(SOURCE_ROOT), str(BENCHMARK_SOURCE)):
 from aquila.benchmark.common import (
     aggregate_outer_folds,
     build_sample_audit,
-    evaluate_two_scales,
     sanitize_json,
     serialize_candidate,
     write_json,
@@ -45,15 +43,15 @@ from aquila.training.distributed import (
     detect_gpu_ids,
     execute_gpu_jobs,
 )
+from aquila.training.evaluator import evaluate_regression
 from aquila.training.hpo import (
     CandidateResult,
-    HPOResult,
     InnerFoldResult,
     generate_grid_candidates,
     half_up_median_epoch,
     select_best_candidate,
 )
-from whisperer_data import WhispererPreparedBenchmark
+from whisperer_data import MultiTraitSplit, WhispererPreparedBenchmark
 from whisperer_model import (
     apply_candidate_overrides,
     predict_model,
@@ -62,16 +60,15 @@ from whisperer_model import (
 
 
 @dataclass(frozen=True)
-class TraitFoldJob:
-    """One independently scheduled trait and outer-fold run."""
+class OuterFoldJob:
+    """One independently scheduled outer-fold multi-trait run."""
 
     job_id: int
-    trait_name: str
     outer_fold: int
 
 
 @dataclass(frozen=True)
-class TraitFoldContext:
+class OuterFoldContext:
     """Spawn-safe inputs shared by DNA Whisper workers."""
 
     data_directory: str
@@ -79,6 +76,7 @@ class TraitFoldContext:
     config: dict[str, Any]
     candidates: tuple[dict[str, Any], ...]
     inner_folds: tuple[int, ...]
+    trait_names: tuple[str, ...]
     max_epochs: int
     budget: dict[str, Any]
 
@@ -104,7 +102,7 @@ def expand_gpu_workers(gpu_ids: Sequence[int], jobs_per_gpu: int) -> list[int]:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run leakage-safe nested CV for single-trait DNA Whisper."
+        description="Run leakage-safe nested CV for joint multi-trait DNA Whisper."
     )
     parser.add_argument(
         "--data-dir", default=str(PROJECT_ROOT / "benchmark" / "test")
@@ -114,7 +112,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=str(SCRIPT_DIRECTORY / "configs" / "Whisperer_nested_cv.yaml"),
     )
     parser.add_argument("-o", "--output-dir", required=True)
-    parser.add_argument("--traits", nargs="+", default=None)
+    parser.add_argument(
+        "--traits",
+        nargs="+",
+        default=None,
+        help="Regression traits trained jointly in one model (default: all).",
+    )
     parser.add_argument("--outer-folds", nargs="+", type=int, default=None)
     parser.add_argument(
         "--gpus",
@@ -127,7 +130,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--jobs-per-gpu",
         type=positive_int,
         default=1,
-        help="Maximum concurrent trait/fold jobs per GPU (default: 1).",
+        help="Maximum concurrent outer-fold jobs per GPU (default: 1).",
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--max-inner-folds", type=int, default=None)
@@ -171,13 +174,74 @@ def _select_traits(
     invalid = [name for name in selected if name not in regression]
     if invalid:
         raise ValueError(f"Unknown regression traits: {invalid}")
+    if not selected:
+        raise ValueError("DNAWhisper multi-trait training requires at least one trait")
     return selected
+
+
+def _slice_scale(scale: Mapping[str, Any], trait_name: str) -> dict[str, Any]:
+    per_trait = dict(scale["per_trait"][trait_name])
+    sliced = {
+        "per_trait": {trait_name: per_trait},
+        "aggregate": {
+            "pearson": per_trait["pearson"],
+            "r2": per_trait["r2"],
+            "mse": per_trait["mse"],
+            "rmse": per_trait["rmse"],
+            "mae": per_trait["mae"],
+            "n_traits": 1,
+            "n_observations": per_trait["n"],
+        },
+    }
+    for metric_name in ("pearson", "r2", "mse", "rmse", "mae"):
+        sliced[f"avg_{metric_name}"] = per_trait[metric_name]
+    return sliced
+
+
+def _slice_metrics(metrics: Mapping[str, Any], trait_name: str) -> dict[str, Any]:
+    return {
+        "normalized": _slice_scale(metrics["normalized"], trait_name),
+        "original": _slice_scale(metrics["original"], trait_name),
+        "test_loss": metrics["normalized"]["per_trait"][trait_name]["mse"],
+    }
+
+
+def _observation_counts(split: MultiTraitSplit) -> dict[str, int]:
+    return {
+        name: int(split.observed_mask[:, index].sum())
+        for index, name in enumerate(split.trait_names)
+    }
+
+
+def _write_trait_predictions(
+    path: Path,
+    split: MultiTraitSplit,
+    predictions_processed: np.ndarray,
+    predictions_original: np.ndarray,
+    trait_name: str,
+    outer_fold: int,
+) -> None:
+    column = split.trait_names.index(trait_name)
+    observed = np.asarray(split.observed_mask[:, column], dtype=bool)
+    sample_ids = tuple(
+        sample_id for sample_id, keep in zip(split.sample_ids, observed) if keep
+    )
+    write_predictions_csv(
+        path,
+        sample_ids,
+        split.processed_targets[observed, column],
+        predictions_processed[observed, column],
+        split.raw_targets[observed, column],
+        predictions_original[observed, column],
+        trait_name=trait_name,
+        outer_fold=outer_fold,
+    )
 
 
 def run_outer_fold(
     benchmark: WhispererPreparedBenchmark,
     output_directory: Path,
-    trait_name: str,
+    trait_names: Sequence[str],
     outer_fold: int,
     config: Mapping[str, Any],
     candidates: Sequence[Mapping[str, Any]],
@@ -187,7 +251,8 @@ def run_outer_fold(
     budget: Mapping[str, Any],
 ) -> dict[str, Any]:
     started = time.time()
-    fold_path = output_directory / trait_name / f"fold_{outer_fold}"
+    names = tuple(str(name) for name in trait_names)
+    fold_path = output_directory / f"fold_{outer_fold}"
     fold_path.mkdir(parents=True, exist_ok=True)
     block_length = int(config["model"]["embedding"]["Block_length"])
     patience = int(config["training"]["patience"])
@@ -199,8 +264,8 @@ def run_outer_fold(
     global_variants = None
     variant_schema = None
     for inner_fold in inner_folds:
-        train, valid, schema = benchmark.load_single_trait_fold(
-            trait_name,
+        train, valid, schema = benchmark.load_multi_trait_fold(
+            names,
             outer_fold,
             inner_fold,
             block_length=block_length,
@@ -213,19 +278,20 @@ def run_outer_fold(
             {
                 "inner_fold": inner_fold,
                 **build_sample_audit(train, valid, held_out_name="valid"),
+                "train_observations_per_trait": _observation_counts(train),
+                "valid_observations_per_trait": _observation_counts(valid),
             }
         )
         for candidate_id, raw_parameters in enumerate(candidates):
             parameters = _candidate_parameters(raw_parameters)
             training_seed = derive_seed(
                 int(config["seed"]),
-                outer_fold * len(benchmark.trait_names)
-                + benchmark.trait_index(trait_name),
+                outer_fold,
                 candidate_id,
                 inner_fold,
             )
             model_config = apply_candidate_overrides(
-                config["model"], parameters, trait_name
+                config["model"], parameters, names
             )
             result = train_model(
                 train.genotypes,
@@ -238,6 +304,9 @@ def run_outer_fold(
                 training_seed,
                 max_epochs=max_epochs,
                 patience=patience,
+                train_mask=train.observed_mask,
+                valid_mask=valid.observed_mask,
+                trait_names=names,
             )
             inner_results[candidate_id].append(
                 InnerFoldResult(
@@ -268,18 +337,17 @@ def run_outer_fold(
     final_epoch = half_up_median_epoch(best.best_epochs)
     final_parameters = dict(best.parameters)
     final_config = apply_candidate_overrides(
-        config["model"], final_parameters, trait_name
+        config["model"], final_parameters, names
     )
     final_seed = derive_seed(
         int(config["seed"]),
-        outer_fold * len(benchmark.trait_names)
-        + benchmark.trait_index(trait_name),
+        outer_fold,
         best.candidate_id,
         999,
     )
     final_config["random_seed"] = final_seed
-    outer_train, outer_test, final_schema = benchmark.load_single_trait_fold(
-        trait_name,
+    outer_train, outer_test, final_schema = benchmark.load_multi_trait_fold(
+        names,
         outer_fold,
         None,
         block_length=block_length,
@@ -298,30 +366,41 @@ def run_outer_fold(
         max_epochs=final_epoch,
         patience=final_epoch,
         fixed_epochs=final_epoch,
+        train_mask=outer_train.observed_mask,
+        trait_names=names,
     )
-    predictions, test_loss = predict_model(
+    predictions, observed, test_loss = predict_model(
         final_result.state_dict,
         outer_test.genotypes,
         outer_test.processed_targets,
         final_config,
         final_parameters,
         device,
+        outer_test.observed_mask,
     )
-    predictions_original = benchmark.inverse_trait(
-        predictions, trait_name, outer_fold
+    predictions_original = benchmark.inverse_selected_traits(
+        predictions,
+        observed,
+        names,
+        outer_fold,
     )
-    evaluation = evaluate_two_scales(
+    processed_metrics = evaluate_regression(
         predictions,
         outer_test.processed_targets,
+        observed,
+        names,
+    ).metrics
+    original_metrics = evaluate_regression(
         predictions_original,
         outer_test.raw_targets,
-        trait_name=trait_name,
-    )
+        observed,
+        names,
+    ).metrics
     checkpoint = {
         "state_dict": final_result.state_dict,
         "config": final_config,
         "parameters": final_parameters,
-        "trait": trait_name,
+        "traits": list(names),
         "outer_fold": outer_fold,
         "final_epoch": final_epoch,
         "training_seed": final_seed,
@@ -335,6 +414,7 @@ def run_outer_fold(
                 "optimizer": final_parameters,
                 "training": config["training"],
                 "budget": dict(budget),
+                "traits": list(names),
             },
             handle,
             sort_keys=False,
@@ -357,8 +437,8 @@ def run_outer_fold(
         },
     )
     metrics = {
-        "normalized": evaluation.processed,
-        "original": evaluation.original,
+        "normalized": processed_metrics,
+        "original": original_metrics,
         "test_loss": test_loss,
     }
     write_json(fold_path / "metrics.json", metrics)
@@ -369,60 +449,76 @@ def run_outer_fold(
     write_json(
         fold_path / "sample_audit.json",
         {
-            "outer": build_sample_audit(
-                outer_train, outer_test, held_out_name="test"
-            ),
+            "outer": {
+                **build_sample_audit(
+                    outer_train, outer_test, held_out_name="test"
+                ),
+                "train_observations_per_trait": _observation_counts(outer_train),
+                "test_observations_per_trait": _observation_counts(outer_test),
+            },
             "inner_folds": inner_audit,
         },
     )
     write_json(fold_path / "variant_schema.json", variant_schema)
-    write_predictions_csv(
-        fold_path / "predictions_original_scale.csv",
-        outer_test.sample_ids,
-        evaluation.targets_processed,
-        evaluation.predictions_processed,
-        evaluation.targets_original,
-        evaluation.predictions_original,
-        trait_name=trait_name,
-        outer_fold=outer_fold,
-    )
+    for trait_name in names:
+        _write_trait_predictions(
+            fold_path / f"predictions_{trait_name}_original_scale.csv",
+            outer_test,
+            predictions,
+            predictions_original,
+            trait_name,
+            outer_fold,
+        )
+        trait_fold = output_directory / trait_name / f"fold_{outer_fold}"
+        trait_fold.mkdir(parents=True, exist_ok=True)
+        write_json(trait_fold / "metrics.json", _slice_metrics(metrics, trait_name))
+        _write_trait_predictions(
+            trait_fold / "predictions_original_scale.csv",
+            outer_test,
+            predictions,
+            predictions_original,
+            trait_name,
+            outer_fold,
+        )
     runtime = {
         "elapsed_seconds": time.time() - started,
         "device": str(device),
         "training_seed": final_seed,
         "actual_budget": dict(budget),
         "outer_test_evaluations": 1,
+        "traits": list(names),
     }
     write_json(fold_path / "runtime.json", runtime)
     return {
         "outer_fold": outer_fold,
+        "traits": list(names),
         "best_candidate_id": best.candidate_id,
         "best_parameters": best.parameters,
         "best_valid_pearson_mean": best.objective,
         "final_epoch": final_epoch,
-        "metrics": metrics,
+        "metrics": sanitize_json(metrics),
         "runtime": runtime,
     }
 
 
-def _run_trait_fold(
-    job: TraitFoldJob,
+def _run_outer_fold(
+    job: OuterFoldJob,
     device_name: str,
-    context: TraitFoldContext,
+    context: OuterFoldContext,
 ) -> dict[str, Any]:
     device = torch.device(device_name)
     if device.type == "cuda":
         torch.cuda.set_device(device)
     benchmark = WhispererPreparedBenchmark(Path(context.data_directory))
     print(
-        f"[INFO] trait={job.trait_name} outer_fold={job.outer_fold} "
+        f"[INFO] traits={list(context.trait_names)} outer_fold={job.outer_fold} "
         f"candidates={len(context.candidates)} "
         f"inner_folds={len(context.inner_folds)} device={device}"
     )
-    result = run_outer_fold(
+    return run_outer_fold(
         benchmark,
         Path(context.output_directory),
-        job.trait_name,
+        context.trait_names,
         job.outer_fold,
         context.config,
         context.candidates,
@@ -431,7 +527,6 @@ def _run_trait_fold(
         context.max_epochs,
         context.budget,
     )
-    return {"trait": job.trait_name, **result}
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -470,6 +565,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "actual_inner_folds": inner_folds,
         "actual_candidates": len(candidates),
         "actual_max_epochs": max_epochs,
+        "actual_traits": list(traits),
         "smoke_reduced": any(
             (
                 len(outer_folds) < benchmark.outer_fold_count,
@@ -482,26 +578,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
     worker_gpu_ids = expand_gpu_workers(gpu_ids, args.jobs_per_gpu)
     jobs = [
-        TraitFoldJob(
-            job_id=trait_index * len(outer_folds) + fold_index,
-            trait_name=trait_name,
-            outer_fold=outer_fold,
-        )
-        for trait_index, trait_name in enumerate(traits)
+        OuterFoldJob(job_id=fold_index, outer_fold=outer_fold)
         for fold_index, outer_fold in enumerate(outer_folds)
     ]
-    worker_context = TraitFoldContext(
+    worker_context = OuterFoldContext(
         data_directory=str(data_directory),
         output_directory=str(output_directory),
         config=config,
         candidates=tuple(dict(candidate) for candidate in candidates),
         inner_folds=tuple(inner_folds),
+        trait_names=tuple(traits),
         max_epochs=max_epochs,
         budget=budget,
     )
     work_results = execute_gpu_jobs(
         jobs,
-        _run_trait_fold,
+        _run_outer_fold,
         worker_gpu_ids,
         worker_args=(worker_context,),
         raise_on_error=True,
@@ -510,7 +602,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     run_index = []
     for trait_name in traits:
         fold_results = [
-            result for result in results if result["trait"] == trait_name
+            {
+                "trait": trait_name,
+                "outer_fold": result["outer_fold"],
+                "best_candidate_id": result["best_candidate_id"],
+                "best_parameters": result["best_parameters"],
+                "best_valid_pearson_mean": result["best_valid_pearson_mean"],
+                "final_epoch": result["final_epoch"],
+                "metrics": _slice_metrics(result["metrics"], trait_name),
+                "runtime": result["runtime"],
+            }
+            for result in results
         ]
         write_json(
             output_directory / trait_name / "summary.json",
@@ -540,6 +642,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             "config": config_path,
             "traits": traits,
             "actual_budget": budget,
+            "folds": results,
+            "metrics": aggregate_outer_folds(
+                [result["metrics"] for result in results]
+            ),
             "runs": run_index,
         },
     )

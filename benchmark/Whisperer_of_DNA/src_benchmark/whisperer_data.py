@@ -23,6 +23,21 @@ BASE_ORDER = {"A": 0, "T": 1, "C": 2, "G": 3}
 
 
 @dataclass(frozen=True)
+class MultiTraitSplit:
+    """Observed multi-trait rows for one prepared partition."""
+
+    genotypes: np.ndarray
+    processed_targets: np.ndarray
+    raw_targets: np.ndarray
+    observed_mask: np.ndarray
+    sample_ids: tuple[str, ...]
+    discarded_sample_ids: tuple[str, ...]
+    absolute_indices: np.ndarray
+    variants: tuple[VariantKey, ...]
+    trait_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class WhispererVCF:
     """Sample-major ten-class one-hot genotypes and ordered VCF schema."""
 
@@ -144,7 +159,12 @@ def load_whisperer_vcf(path: str | Path) -> WhispererVCF:
 
 
 def retained_variant_indices(variant_count: int, block_length: int) -> np.ndarray:
-    """Return deterministic prefix indices after trimming the final remainder."""
+    """Keep a phenotype-independent prefix so the SNP sequence is block-divisible.
+
+    This is not marker screening: leftover columns at the end of the ordered
+    schema are dropped solely because DNAWhisper's embedding requires the
+    sequence length to be a multiple of ``Block_length``.
+    """
     if variant_count < 1 or block_length < 1:
         raise ValueError("Variant count and block length must be positive")
     retained_count = variant_count - variant_count % block_length
@@ -199,6 +219,90 @@ class WhispererPreparedBenchmark(PreparedBenchmark):
         }
         return train, held, schema
 
+    def load_multi_trait_fold(
+        self,
+        trait_names: Sequence[str],
+        outer_fold: int,
+        inner_fold: int | None = None,
+        *,
+        block_length: int,
+        expected_variants: Sequence[VariantKey] | None = None,
+    ) -> tuple[MultiTraitSplit, MultiTraitSplit, dict[str, Any]]:
+        """Load one joint multi-trait split with per-trait observation masks."""
+        names = tuple(str(name) for name in trait_names)
+        if not names:
+            raise ValueError("DNAWhisper multi-trait training requires at least one trait")
+        invalid = [name for name in names if name not in self.trait_names]
+        if invalid:
+            raise ValueError(f"Unknown traits: {invalid}")
+        trait_indices = np.asarray(
+            [self.trait_index(name) for name in names], dtype=np.int64
+        )
+        paths = self.resolve_fold_paths(outer_fold, inner_fold)
+        train_indices = np.load(paths.train_indices, allow_pickle=False).astype(np.int64)
+        held_indices = np.load(paths.held_out_indices, allow_pickle=False).astype(np.int64)
+        train_vcf = load_whisperer_vcf(paths.train_vcf).align_samples(
+            self.sample_ids_for(train_indices)
+        )
+        held_vcf = load_whisperer_vcf(paths.held_out_vcf).align_samples(
+            self.sample_ids_for(held_indices)
+        )
+        if train_vcf.variants != held_vcf.variants:
+            raise ValueError("Training and held-out VCF variant schemas differ")
+        if expected_variants is not None and tuple(expected_variants) != train_vcf.variants:
+            raise ValueError("Fold VCF variant schema differs from the global schema")
+        keep = retained_variant_indices(len(train_vcf.variants), block_length)
+        train_processed = self._load_processed(paths.train_targets, len(train_indices))
+        held_processed = self._load_processed(paths.held_out_targets, len(held_indices))
+        train = self._multi_trait_partition(
+            train_vcf, train_indices, train_processed, names, trait_indices, keep
+        )
+        held = self._multi_trait_partition(
+            held_vcf, held_indices, held_processed, names, trait_indices, keep
+        )
+        schema = {
+            "full_variant_count": len(train_vcf.variants),
+            "retained_variant_count": int(keep.size),
+            "trimmed_remainder": len(train_vcf.variants) - int(keep.size),
+            "block_length": block_length,
+            "retained_indices": keep.tolist(),
+            "variants": [list(value) for value in train_vcf.variants],
+            "retained_variants": [list(train_vcf.variants[index]) for index in keep],
+            "trait_names": list(names),
+        }
+        return train, held, schema
+
+    def inverse_selected_traits(
+        self,
+        values: Any,
+        mask: Any,
+        trait_names: Sequence[str],
+        outer_fold: int,
+        inner_fold: int | None = None,
+    ) -> np.ndarray:
+        """Invert selected trait columns using the fold-local preprocessor."""
+        names = tuple(str(name) for name in trait_names)
+        array = np.asarray(values, dtype=np.float64)
+        mask_array = np.asarray(mask, dtype=bool)
+        if array.ndim == 1:
+            array = array.reshape(-1, 1)
+        if mask_array.ndim == 1:
+            mask_array = mask_array.reshape(-1, 1)
+        if array.shape != mask_array.shape:
+            raise ValueError("Inverse values and mask must have the same shape")
+        if array.shape[1] != len(names):
+            raise ValueError("Inverse values do not match the selected trait set")
+        full = np.zeros((array.shape[0], len(self.trait_names)), dtype=np.float64)
+        full_mask = np.zeros_like(full, dtype=bool)
+        for column, name in enumerate(names):
+            index = self.trait_index(name)
+            full[:, index] = array[:, column]
+            full_mask[:, index] = mask_array[:, column]
+        restored = np.asarray(
+            self.load_preprocessor(outer_fold, inner_fold).inverse(full, full_mask)
+        )
+        return restored[:, [self.trait_index(name) for name in names]]
+
     @staticmethod
     def _load_processed(path: Path, expected_rows: int) -> np.ndarray:
         import torch
@@ -235,4 +339,35 @@ class WhispererPreparedBenchmark(PreparedBenchmark):
             tuple(sample_array[~observed].tolist()),
             absolute_indices[observed].copy(),
             tuple(vcf.variants[index] for index in keep),
+        )
+
+    def _multi_trait_partition(
+        self,
+        vcf: WhispererVCF,
+        absolute_indices: np.ndarray,
+        processed: np.ndarray,
+        trait_names: Sequence[str],
+        trait_indices: np.ndarray,
+        keep: np.ndarray,
+    ) -> MultiTraitSplit:
+        raw = self.prepared.targets.detach().cpu().numpy()[absolute_indices][
+            :, trait_indices
+        ]
+        mask = self.prepared.target_mask.detach().cpu().numpy()[absolute_indices][
+            :, trait_indices
+        ].astype(bool)
+        selected = np.asarray(processed[:, trait_indices], dtype=np.float32)
+        observed = mask & np.isfinite(raw) & np.isfinite(selected)
+        keep_samples = observed.any(axis=1)
+        sample_array = np.asarray(vcf.sample_ids, dtype=object)
+        return MultiTraitSplit(
+            vcf.genotypes[keep_samples][:, keep].copy(),
+            selected[keep_samples].copy(),
+            np.asarray(raw[keep_samples], dtype=np.float32),
+            observed[keep_samples].copy(),
+            tuple(sample_array[keep_samples].tolist()),
+            tuple(sample_array[~keep_samples].tolist()),
+            absolute_indices[keep_samples].copy(),
+            tuple(vcf.variants[index] for index in keep),
+            tuple(trait_names),
         )

@@ -61,7 +61,7 @@ from src_benchmark.model_benchmark import CLCNetBenchmark, estimate_model_size
 
 @dataclass(frozen=True)
 class FeatureSelectionResult:
-    """Training-only chromosome-aware selected marker schema."""
+    """Training-only marker schema after optional LightGBM selection."""
 
     selected_indices: np.ndarray
     global_indices: np.ndarray
@@ -70,6 +70,7 @@ class FeatureSelectionResult:
     chromosome_importances: Mapping[str, np.ndarray]
     seed: int
     num_boost_round: int
+    method: str
 
 
 @dataclass(frozen=True)
@@ -202,6 +203,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Testing only: cap training epochs without changing the formal grid.",
     )
+    parser.add_argument(
+        "--lightgbm-selection",
+        action="store_true",
+        help=(
+            "Enable chromosome-aware LightGBM marker selection. "
+            "Disabled by default; the network then uses every marker."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -241,6 +250,45 @@ def chromosome_groups(
     }
 
 
+def lightgbm_selection_enabled(config: Mapping[str, Any]) -> bool:
+    """Return whether chromosome-aware LightGBM marker selection is enabled."""
+    return bool(config.get("enabled", False))
+
+
+def identity_feature_selection(
+    variants: Sequence[tuple[str, str, str, str, str]],
+    seed: int,
+) -> FeatureSelectionResult:
+    """Retain every marker when LightGBM selection is disabled."""
+    if not variants:
+        raise ValueError("CLCNet feature selection requires at least one variant")
+    indices = np.arange(len(variants), dtype=np.int64)
+    return FeatureSelectionResult(
+        selected_indices=indices,
+        global_indices=indices,
+        chromosome_indices={},
+        global_importances=np.zeros(len(variants), dtype=np.float64),
+        chromosome_importances={},
+        seed=int(seed),
+        num_boost_round=0,
+        method="identity",
+    )
+
+
+def apply_feature_selection_override(
+    config: dict[str, Any],
+    *,
+    enabled: bool | None,
+) -> dict[str, Any]:
+    """Apply CLI LightGBM selection override onto a loaded config."""
+    selection = dict(config.get("feature_selection") or {})
+    selection.setdefault("enabled", False)
+    if enabled:
+        selection["enabled"] = True
+    config["feature_selection"] = selection
+    return config
+
+
 def fit_feature_selector(
     train_genotypes: np.ndarray,
     train_targets: np.ndarray,
@@ -248,12 +296,7 @@ def fit_feature_selector(
     config: Mapping[str, Any],
     seed: int,
 ) -> FeatureSelectionResult:
-    """Fit upstream global and per-chromosome LightGBM selectors on training only."""
-    try:
-        import lightgbm as lgb
-    except ImportError as error:
-        raise ImportError("CLCNet chromosome-aware selection requires lightgbm") from error
-
+    """Select markers on training data only; LightGBM is optional and off by default."""
     inputs = encode_upstream_genotypes(
         train_genotypes, float(config.get("missing_genotype_value", 3.0))
     )
@@ -262,6 +305,13 @@ def fit_feature_selector(
         raise ValueError("Feature selection requires aligned nonempty training data")
     if inputs.shape[1] != len(variants):
         raise ValueError("Feature selection inputs do not match the variant schema")
+    if not lightgbm_selection_enabled(config):
+        return identity_feature_selection(variants, seed)
+
+    try:
+        import lightgbm as lgb
+    except ImportError as error:
+        raise ImportError("CLCNet chromosome-aware selection requires lightgbm") from error
 
     rounds = int(config.get("num_boost_round", 100))
     parameters = {
@@ -312,6 +362,7 @@ def fit_feature_selector(
         chromosome_importances=chromosome_importances,
         seed=int(seed),
         num_boost_round=rounds,
+        method="lightgbm",
     )
 
 
@@ -511,13 +562,20 @@ def feature_selection_payload(
     variants: Sequence[tuple[str, str, str, str, str]],
     train_sample_ids: Sequence[str],
 ) -> dict[str, Any]:
+    enabled = result.method == "lightgbm"
+    if enabled:
+        selection_rule = "importance > 0; union global and chromosome selectors"
+    else:
+        selection_rule = "retain all markers; LightGBM selection disabled"
     return {
+        "enabled": enabled,
+        "method": result.method,
         "fit_scope": "training samples only",
         "train_sample_ids": list(train_sample_ids),
         "seed": result.seed,
         "num_boost_round": result.num_boost_round,
-        "importance_type": "gain",
-        "selection_rule": "importance > 0; union global and chromosome selectors",
+        "importance_type": "gain" if enabled else None,
+        "selection_rule": selection_rule,
         "total_variants": len(variants),
         "global_selected_count": int(len(result.global_indices)),
         "chromosome_selected_counts": {
@@ -602,6 +660,7 @@ def run_outer_fold(
         )
         print(
             f"[INFO] CLCNet trait={trait_name} outer={outer_fold} inner={inner_fold} "
+            f"selection={selection.method} "
             f"selected_variants={len(selection.selected_indices)} "
             f"model={estimate_model_size(train_genotypes.shape[1])}"
         )
@@ -664,6 +723,7 @@ def run_outer_fold(
     size_estimate = estimate_model_size(outer_train_genotypes.shape[1])
     print(
         f"[INFO] CLCNet trait={trait_name} outer={outer_fold} final "
+        f"selection={final_selection.method} "
         f"selected_variants={len(final_selection.selected_indices)} "
         f"model={size_estimate}"
     )
@@ -840,6 +900,9 @@ def main() -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
     with Path(args.config).open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
+    apply_feature_selection_override(
+        config, enabled=True if args.lightgbm_selection else None
+    )
     if args.max_epochs is not None:
         if args.max_epochs < 1:
             raise ValueError("--max-epochs must be positive")

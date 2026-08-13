@@ -34,7 +34,7 @@ from aquila.benchmark.common import evaluate_two_scales
 from aquila.data.preprocessing import PerTraitPreprocessor, TraitPreprocessing
 from aquila.training.distributed import derive_seed
 from aquila.training.hpo import generate_grid_candidates, half_up_median_epoch
-from Whisperer_train_cv import expand_gpu_workers, parse_args
+from Whisperer_train_cv import _slice_metrics, expand_gpu_workers, parse_args
 from whisperer_data import (
     GENOTYPE_CLASSES,
     WhispererVCF,
@@ -43,7 +43,12 @@ from whisperer_data import (
     load_whisperer_vcf,
     retained_variant_indices,
 )
-from whisperer_model import _loader, apply_candidate_overrides, import_dna_whisper
+from whisperer_model import (
+    _fill_missing_targets,
+    _loader,
+    apply_candidate_overrides,
+    import_dna_whisper,
+)
 
 
 def test_gpu_cli_default_selection_and_cpu() -> None:
@@ -53,6 +58,7 @@ def test_gpu_cli_default_selection_and_cpu() -> None:
     cpu = parse_args([*base, "--gpus"])
     assert default.gpus is None
     assert default.jobs_per_gpu == 1
+    assert default.traits is None
     assert selected.gpus == [1, 3]
     assert cpu.gpus == []
 
@@ -137,12 +143,75 @@ def test_deterministic_block_trim() -> None:
     )
 
 
+def test_adapter_does_not_use_supervised_marker_selection() -> None:
+    adapter_files = [
+        SOURCE_DIRECTORY.parent / "Whisperer_train_cv.py",
+        SOURCE_DIRECTORY / "whisperer_data.py",
+        SOURCE_DIRECTORY / "whisperer_model.py",
+    ]
+    forbidden = (
+        "MICFilter",
+        "mic_filter",
+        "mic_filtering",
+        "lightgbm",
+        "LightGBM",
+        "feature_selection",
+        "snp_qc",
+        "calc_mic",
+    )
+    for path in adapter_files:
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in text, f"{path.name} must not reference {token}"
+    keep = retained_variant_indices(100, 32)
+    assert np.array_equal(keep, np.arange(96, dtype=np.int64))
+
+
+
 def test_split_local_missing_filter_contract() -> None:
     mask = np.array([True, False, True])
     sample_ids = np.array(["A", "B", "C"], dtype=object)
     assert tuple(sample_ids[mask]) == ("A", "C")
     assert tuple(sample_ids[~mask]) == ("B",)
     assert not np.any(np.array([1.0, -999.0, 2.0])[mask] == -999.0)
+
+
+def test_multi_trait_partition_keeps_partially_observed_samples() -> None:
+    benchmark = object.__new__(WhispererPreparedBenchmark)
+    benchmark.prepared = type(
+        "Prepared",
+        (),
+        {
+            "targets": torch.tensor(
+                [[1.0, -999.0], [-999.0, -999.0], [-999.0, 3.0]]
+            ),
+            "target_mask": torch.tensor(
+                [[True, False], [False, False], [False, True]]
+            ),
+        },
+    )()
+    genotypes = np.zeros((3, 2, 10), dtype=np.float32)
+    vcf = WhispererVCF(
+        genotypes,
+        ("A", "B", "C"),
+        (("1", "1", "rs1", "A", "G"), ("1", "2", "rs2", "C", "T")),
+    )
+    split = benchmark._multi_trait_partition(
+        vcf,
+        np.array([0, 1, 2]),
+        np.array(
+            [[0.0, -999.0], [-999.0, -999.0], [-999.0, 1.0]],
+            dtype=np.float32,
+        ),
+        ("TraitA", "TraitB"),
+        np.array([0, 1]),
+        np.array([0, 1]),
+    )
+    assert split.sample_ids == ("A", "C")
+    assert split.discarded_sample_ids == ("B",)
+    assert split.observed_mask.tolist() == [[True, False], [False, True]]
+    assert split.processed_targets.shape == (2, 2)
+    assert split.trait_names == ("TraitA", "TraitB")
 
 
 def test_prepared_partition_filters_missing_trait_samples() -> None:
@@ -185,12 +254,15 @@ def test_dropout_and_encoder_override_are_uniform() -> None:
     model_path = WHISPERER_DIRECTORY / "training" / "config" / "model_config.json"
     base = json.loads(model_path.read_text(encoding="utf-8"))
     updated = apply_candidate_overrides(
-        base, {"dropout": 0.2, "encoder_layers": 6}, "Trait"
+        base, {"dropout": 0.2, "encoder_layers": 6}, ("TraitA", "TraitB")
     )
     assert updated["embedding"]["input_dims"] == 10
-    assert updated["output_layer"]["phenotype_dim"] == 1
-    assert updated["output_layer"]["phenotype_name"] == ["Trait"]
+    assert updated["output_layer"]["phenotype_dim"] == 2
+    assert updated["output_layer"]["phenotype_name"] == ["TraitA", "TraitB"]
     assert updated["output_layer"]["dropout_rate"] == 0.2
+    assert updated["loss_config"]["auxiliary_losses"]["Deep_Supervision"]["enabled"] is True
+    assert updated["loss_config"]["auxiliary_losses"]["PWCosSim"]["enabled"] is False
+    assert updated["loss_config"]["auxiliary_losses"]["correlation"]["enabled"] is False
     for block in updated["GFI_FormerBLOCKS"]["blocks"][:2]:
         assert block["encoder"]["num_layers"] == 6
         assert block["encoder"]["attention"]["dropout_rate"] == 0.2
@@ -241,6 +313,58 @@ def test_evaluation_loader_keeps_incomplete_final_batch() -> None:
     targets = np.zeros(17, dtype=np.float32)
     loader = _loader(genotypes, targets, batch_size=8, shuffle=False)
     assert sum(batch[0].shape[0] for batch in loader) == 17
+
+
+def test_loader_keeps_two_dimensional_targets_and_observation_mask() -> None:
+    genotypes = np.zeros((5, 4, 10), dtype=np.float32)
+    targets = np.arange(10, dtype=np.float32).reshape(5, 2)
+    mask = np.array(
+        [[True, False], [True, True], [False, True], [True, True], [True, False]]
+    )
+    loader = _loader(genotypes, targets, batch_size=8, shuffle=False, mask=mask)
+    features, phenotype, observed = next(iter(loader))
+    assert features.shape == (5, 4, 10)
+    assert phenotype.shape == (5, 2)
+    assert observed.dtype == torch.bool
+    assert observed.tolist() == mask.tolist()
+
+
+def test_missing_labels_are_filled_with_detached_predictions() -> None:
+    predictions = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+    targets = torch.tensor([[10.0, -999.0], [30.0, 40.0]])
+    mask = torch.tensor([[True, False], [True, True]])
+    filled = _fill_missing_targets(predictions, targets, mask)
+    assert filled[0, 0].item() == 10.0
+    assert filled[0, 1].item() == 2.0
+    assert filled[1, 1].item() == 40.0
+    assert not filled[0, 1].requires_grad
+    residual = filled - predictions
+    assert residual[0, 1].item() == 0.0
+
+
+def test_trait_metric_slice_keeps_per_trait_pearson() -> None:
+    metrics = {
+        "normalized": {
+            "per_trait": {
+                "TraitA": {"n": 4, "pearson": 0.8, "r2": 0.5, "mse": 0.2, "rmse": 0.45, "mae": 0.3},
+                "TraitB": {"n": 3, "pearson": 0.4, "r2": 0.1, "mse": 0.9, "rmse": 0.95, "mae": 0.7},
+            },
+            "avg_pearson": 0.6,
+        },
+        "original": {
+            "per_trait": {
+                "TraitA": {"n": 4, "pearson": 0.7, "r2": 0.4, "mse": 1.2, "rmse": 1.1, "mae": 0.8},
+                "TraitB": {"n": 3, "pearson": 0.3, "r2": 0.0, "mse": 2.0, "rmse": 1.4, "mae": 1.1},
+            },
+            "avg_pearson": 0.5,
+        },
+        "test_loss": 0.55,
+    }
+    sliced = _slice_metrics(metrics, "TraitA")
+    assert sliced["normalized"]["per_trait"]["TraitA"]["pearson"] == 0.8
+    assert sliced["normalized"]["avg_pearson"] == 0.8
+    assert sliced["test_loss"] == 0.2
+    assert "TraitB" not in sliced["normalized"]["per_trait"]
 
 
 def test_standard_attention_valid_mask_fallback_is_finite() -> None:

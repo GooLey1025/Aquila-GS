@@ -36,6 +36,7 @@ def test_hpo_grid_has_exactly_32_stable_candidates() -> None:
     assert first == second
     assert first[0]["train.batch_size"] == 16
     assert first[-1]["train.scheduler_factor"] == 0.8
+    assert config["feature_selection"]["enabled"] is False
 
 
 def test_gpu_cli_defaults_to_detection() -> None:
@@ -43,6 +44,7 @@ def test_gpu_cli_defaults_to_detection() -> None:
     assert arguments.gpus is None
     assert arguments.jobs_per_gpu == 1
     assert arguments.traits is None
+    assert arguments.lightgbm_selection is False
 
 
 def test_gpu_cli_selection_and_cpu_mode() -> None:
@@ -190,6 +192,7 @@ def test_feature_selection_payload_records_training_scope_only() -> None:
         chromosome_importances={"1": np.asarray([0.0, 1.0])},
         seed=42,
         num_boost_round=100,
+        method="lightgbm",
     )
     variants = (
         ("1", "1", "a", "A", "C"),
@@ -199,6 +202,8 @@ def test_feature_selection_payload_records_training_scope_only() -> None:
     payload = MODULE.feature_selection_payload(
         selection, variants, ("train_a", "train_b")
     )
+    assert payload["enabled"] is True
+    assert payload["method"] == "lightgbm"
     assert payload["fit_scope"] == "training samples only"
     assert payload["train_sample_ids"] == ["train_a", "train_b"]
     assert payload["union_selected_count"] == 2
@@ -236,6 +241,7 @@ def test_selected_matrices_apply_training_selected_columns_unchanged() -> None:
         chromosome_importances={"2": np.asarray([1.0])},
         seed=42,
         num_boost_round=100,
+        method="lightgbm",
     )
     train_selected, held_out_selected = MODULE._selected_matrices(
         train, held_out, selection, 3.0
@@ -257,3 +263,38 @@ def test_two_scale_metrics_keep_pearson_and_restore_error_scale() -> None:
         evaluation.original["avg_pearson"],
     )
     assert evaluation.original["avg_mse"] > evaluation.processed["avg_mse"]
+
+
+def test_cli_enables_lightgbm_selection() -> None:
+    arguments = MODULE.parse_args(
+        ["--data-dir", "data", "-o", "output", "--lightgbm-selection"]
+    )
+    assert arguments.lightgbm_selection is True
+    config = {"feature_selection": {"enabled": False, "num_boost_round": 100}}
+    MODULE.apply_feature_selection_override(config, enabled=True)
+    assert config["feature_selection"]["enabled"] is True
+
+
+def test_disabled_selector_keeps_all_markers_without_lightgbm() -> None:
+    variants = (
+        ("1", "1", "a", "A", "C"),
+        ("1", "2", "b", "A", "G"),
+        ("2", "1", "c", "C", "T"),
+    )
+    genotypes = np.asarray([[0.0, 1.0, 2.0], [2.0, 0.0, 1.0]], dtype=np.float32)
+    targets = np.asarray([0.1, 0.9], dtype=np.float32)
+    result = MODULE.fit_feature_selector(
+        genotypes,
+        targets,
+        variants,
+        {"enabled": False, "missing_genotype_value": 3.0},
+        seed=7,
+    )
+    assert result.method == "identity"
+    np.testing.assert_array_equal(result.selected_indices, [0, 1, 2])
+    payload = MODULE.feature_selection_payload(result, variants, ("train_a", "train_b"))
+    assert payload["enabled"] is False
+    assert payload["method"] == "identity"
+    assert payload["union_selected_count"] == 3
+    assert payload["num_boost_round"] == 0
+    assert payload["importance_type"] is None
