@@ -9,14 +9,17 @@ To ensure a fair comparison, we first generated a fixed nested cross-validation 
 For Aquila, missing phenotypic observations are handled natively through a masked multi-task learning strategy. Specifically, missing trait values are excluded from the loss calculation while the remaining observed traits continue to contribute to model optimization, allowing the model to exploit correlations among multiple traits without requiring phenotype imputation. For other methods that do not support missing phenotypes, missing observations were handled according to their model assumptions. Single-trait models were trained using only individuals with available phenotypic records for the target trait. Importantly, these models still followed the same predefined cross-validation partitions as Aquila, ensuring that differences in performance reflect model behavior rather than differences in data splitting. This evaluation framework assesses genomic prediction performance under realistic incomplete phenotype conditions encountered in practical breeding programs.
 
 ### Generate fold mapping:
+
 ```sh
 # GSTP008.pheno downloaded from CropGS-hub (https://iagr.genomics.cn/CropGS/#/Datasets)
 wget https://iagr.genomics.cn/static/gstool/data/GSTP008/population/GSTP008.pheno
 aquila_cv.py --phenotype GSTP008.pheno -o 705rice_nested_cv.json --outer-folds 5 --inner-folds 4 --seed 42
 ```
+
 The JSON mapping fixes both outer and inner folds and was used throughout the pipeline, including [GWAS lead-variant selection](to_be_add), to avoid information leakage. Specifically, GWAS discovery and lead-variant selection were performed using only the training samples within each outer fold, while test samples were completely excluded from this process.
 
 ### Generate 5-fold training and testing sets:
+
 When having done the GWAS lead variant selection, we can use the following command to generate the training and testing sets:
 
 ```sh
@@ -41,19 +44,19 @@ For regression benchmarks, both Aquila-GS and the integrated comparison models r
 
 ## Benchmark Fairness Checklist
 
-| Check target | Purpose |
-|---|---|
-| Fixed nested-CV mapping | Use the same 5 outer and 4 inner sample partitions for every model so performance differences are not caused by different random splits. |
-| Outer-test isolation | Keep outer-test genotypes and phenotypes out of preprocessing, feature selection, HPO, early stopping, and epoch selection. |
-| Training-only learned preprocessing | Fit phenotype transforms, genotype scaling or imputation, GWAS, marker selection, encoders, and reference representations only on the corresponding training partition. |
-| Shared phenotype inputs | Reuse fold-local processed phenotypes fitted during common data preparation instead of independently normalizing the full cohort for each model. |
-| Missing-phenotype handling | Exclude unavailable targets from losses and metrics without moving samples between the predefined folds; never pass the `-999` sentinel into training or evaluation. |
-| Identical HPO budget | Evaluate the specified number of candidate configurations on every inner fold and select by mean inner-validation Pearson correlation. |
-| Final refit from scratch | Retrain the selected configuration on complete outer-training data for an inner-CV-derived duration before evaluating the outer test fold once. |
-| Complete training batches | Set `drop_last=True` for neural-network training loaders, so a final batch smaller than `batch_size` is not used for an optimizer step. This keeps training batch size consistent and avoids unstable batch-dependent normalization statistics. Validation and test loaders retain all samples with `drop_last=False`. Full-batch methods without mini-batch loaders are not affected. |
-| Consistent metrics | Report Pearson r, R², MSE, RMSE, and MAE on both processed and inverse-transformed original phenotype scales using observed test targets only. |
-| Deterministic execution | Derive and record seeds for folds, candidates, data shuffling, pair or triplet sampling, and learned preprocessing where supported. |
-| Auditable outputs | Save selected parameters, inner-fold results, epochs, preprocessing metadata, sample IDs, predictions, metrics, runtime, and final checkpoints for each outer fold. |
+| Check target                        | Purpose                                                                                                                                                                                                                                                                                                                                                                                     |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fixed nested-CV mapping             | Use the same 5 outer and 4 inner sample partitions for every model so performance differences are not caused by different random splits.                                                                                                                                                                                                                                                    |
+| Outer-test isolation                | Keep outer-test genotypes and phenotypes out of preprocessing, feature selection, HPO, early stopping, and epoch selection.                                                                                                                                                                                                                                                                 |
+| Training-only learned preprocessing | Fit phenotype transforms, genotype scaling or imputation, GWAS, marker selection, encoders, and reference representations only on the corresponding training partition.                                                                                                                                                                                                                     |
+| Shared phenotype inputs             | Reuse fold-local processed phenotypes fitted during common data preparation instead of independently normalizing the full cohort for each model.                                                                                                                                                                                                                                            |
+| Missing-phenotype handling          | Exclude unavailable targets from losses and metrics without moving samples between the predefined folds; never pass the`-999` sentinel into training or evaluation.                                                                                                                                                                                                                       |
+| Identical HPO budget                | Evaluate the specified number of candidate configurations on every inner fold and select by mean inner-validation Pearson correlation.                                                                                                                                                                                                                                                      |
+| Final refit from scratch            | Retrain the selected configuration on complete outer-training data for an inner-CV-derived duration before evaluating the outer test fold once.                                                                                                                                                                                                                                             |
+| Complete training batches           | Set`drop_last=True` for neural-network training loaders, so a final batch smaller than `batch_size` is not used for an optimizer step. This keeps training batch size consistent and avoids unstable batch-dependent normalization statistics. Validation and test loaders retain all samples with `drop_last=False`. Full-batch methods without mini-batch loaders are not affected. |
+| Consistent metrics                  | Report Pearson r, R², MSE, RMSE, and MAE on both processed and inverse-transformed original phenotype scales using observed test targets only.                                                                                                                                                                                                                                             |
+| Deterministic execution             | Derive and record seeds for folds, candidates, data shuffling, pair or triplet sampling, and learned preprocessing where supported.                                                                                                                                                                                                                                                         |
+| Auditable outputs                   | Save selected parameters, inner-fold results, epochs, preprocessing metadata, sample IDs, predictions, metrics, runtime, and final checkpoints for each outer fold.                                                                                                                                                                                                                         |
 
 ## Prerequisites
 
@@ -68,6 +71,7 @@ conda env update -n aquila -f environment.yml
 The environment file adds the dependencies not supplied by Aquila itself, including XGBoost, the Whisperer of DNA runtime packages, R 4.3, `jsonlite`, `glmnet`, `rrBLUP`, and CLCNet's optional LightGBM selector. Integrated models are tested in this updated `aquila` environment; their upstream Conda environments and pinned PyTorch/CUDA stacks are not used. Consequently, for benchmarking purposes, it is not necessary to clone all original repositories, as the required scripts have been integrated or adapted into this project.
 
 The CRAN `hibayes` package used by BayesCpi is not available from the configured Conda channels. Install it once into the R library inside the activated Aquila environment:
+
 ```sh
 # A proxy may be required to download this package.
 Rscript -e 'install.packages("hibayes", repos="https://cloud.r-project.org")'
@@ -78,9 +82,11 @@ Environment: NVIDIA-GPU-4090 x3, Driver Version: 580.105.08, CUDA Version: 12.2
 ## Reproduce of 705rice dataset
 
 ### [Aquila](https://github.com/GooLey1025/Aquila-GS)
+
 Generate the shared prepared-data directory once, as described above. Every model command below requires this directory explicitly and consumes its fixed outer and inner folds.
 
 Run Aquila with the same prepared data:
+
 ```sh
 cd aquila
 
@@ -118,6 +124,7 @@ python src_benchmark/adapter.py \
 ```
 
 ### XGBoost
+
 ```sh
 cd xgboost
 python xgboost_train_nested_cv.py \
@@ -126,7 +133,9 @@ python xgboost_train_nested_cv.py \
   -o results/xgboost \
   --n-jobs 32
 ```
+
 ### BayesCpi
+
 ```sh
 cd bayescpi
 python bayescpi_nested_cv.py \
@@ -136,6 +145,7 @@ python bayescpi_nested_cv.py \
 ```
 
 ### rrBLUP
+
 ```sh
 cd rrBLUP
 python rrblup_nested_cv.py \
@@ -143,7 +153,9 @@ python rrblup_nested_cv.py \
   --config configs/nested_cv.yaml \
   -o results/rrblup
 ```
+
 ### Lasso
+
 ```sh
 cd Lasso
 python lasso_nested_cv.py \
@@ -153,6 +165,7 @@ python lasso_nested_cv.py \
 ```
 
 ### ElasticNet
+
 ```sh
 cd ElasticNet
 python elasticnet_nested_cv.py \
@@ -162,6 +175,7 @@ python elasticnet_nested_cv.py \
 ```
 
 ### [CLCNet](https://github.com/SuppurNewer/CLCNet)
+
 Some scripts from CLCNet were copied or adapted into our project repository. The upstream source code version referenced for this benchmark is commit `01d7792c97dc05f8a54afbfb2f62427607f60aad`.
 
 ```sh
@@ -174,6 +188,7 @@ python CLCNet_train_cv.py \
 ```
 
 ### [MeNet](https://github.com/ganlab/MENET)
+
 Some scripts from MENET were copied or adapted into our project repository. The upstream source code version referenced for this benchmark is commit `06456e4542ab26716c4db8dd8f17517aa5155ff4`.
 
 ```sh
@@ -189,6 +204,7 @@ python MENET_train_cv.py \
 The benchmark adaptation preserves MENET's two-stage architecture while making model selection and evaluation compatible with the shared leakage-safe nested CV protocol. See the [detailed MENET benchmark adaptation](docs/MENET_benchmark_adaptation.md).
 
 ### [DEM](https://github.com/cma2015/DEM/)
+
 Some scripts from DEM were copied or adapted into our project repository. The upstream source code version referenced for this benchmark is commit `86de718f950d0ecc5554ff1916e2d59f51a33ce8`.
 
 ```sh
@@ -216,9 +232,11 @@ preserved. See the
 [detailed DEM benchmark adaptation](docs/DEM_benchmark_adaptation.md).
 
 ### [DNAwhisper](https://github.com/Marxin1992/Whisperer_of_DNA)
+
 Some scripts from Whisperer of DNA were copied or adapted into our project repository. The upstream source code version referenced for this benchmark is commit `7a657cc00d44263c4b1085d3991ecc0e935c14e5`.
 
 #### Train
+
 ```sh
 cd ~/projects/Aquila-GS/benchmark/Whisperer_of_DNA
 python Whisperer_train_cv.py \
