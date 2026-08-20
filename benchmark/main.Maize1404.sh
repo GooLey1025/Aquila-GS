@@ -2,20 +2,18 @@ COHORT=Maize1404
 PHENO_FILE=species_data/Maize1404/Maize1404_GSTP004.pheno
 VCF_FILE=species_data/Maize1404/Maize1404.LD.rename.vcf.gz
 
-# COHORT=Soybean2795
-# PHENO_FILE=species_data/Soybean2795/GSTP014.pheno
-# VCF_FILE=species_data/Soybean2795/Soybean2795.merge.impute.biallelic_pruned.rename.vcf.gz
+COHORT=Soybean2795
+PHENO_FILE=species_data/Soybean2795/GSTP014.pheno
+VCF_FILE=species_data/Soybean2795/Soybean2795.LD.rename.vcf.gz
 # COHORT=wheat850_Nature2024
 # PHENO_FILE=species_data/Maize1404/Maize1404_GSTP004.pheno
 # VCF_FILE=species_data/Maize1404/Wheat850.LD.vcf.gz
 
 
 conda activate aquila
-aquila_cv.py --phenotype $PHENO_FILE -o $COHORT.nested_cv.json --outer-folds 5 --inner-folds 4 --seed 42
+aquila_cv.py --phenotype $PHENO_FILE -o $COHORT.nested_cv.json --outer-folds 5 --inner-folds 4 --seed 42 --min-observed 20
 
 aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.nested_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
-aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.nested_cv.json -o $COHORT.snp.cv.data --save-raw-genotype --overwrite
-aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.nested_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
 
 cd croparnet
 /usr/bin/time -v -o $COHORT.time.txt python src_benchmark/adapter.py \

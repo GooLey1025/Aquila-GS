@@ -48,5 +48,5 @@ if python3 -c "import matplotlib" >/dev/null 2>&1; then
 else
     PLOT_PY=/data4/gulei/anaconda3/bin/python
 fi
-"$PLOT_PY" plot_pca.py "${P}.impute"
-"$PLOT_PY" plot_pca.py "${P}.LD.rename"
+"$PLOT_PY" plot_pca.py "${P}.impute.pca"
+"$PLOT_PY" plot_pca.py "${P}.LD.rename.pca"
