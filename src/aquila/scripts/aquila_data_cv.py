@@ -41,6 +41,7 @@ class PreparationConfig:
     output_directory: Path
     encoding_type: str = "diploid_onehot"
     variant_type: str | None = None
+    id_prefix: str | None = None
     sample_id_column: str | None = None
     traits: Sequence[str] | None = None
     classification_tasks: Sequence[str] | None = None
@@ -90,6 +91,7 @@ class NestedCVDataPreparer:
             str(self.config.genotype_file),
             encoding_type=self.config.encoding_type,
             variant_type=self.config.variant_type,
+            id_prefix=self.config.id_prefix,
         )
         genotypes = self._normalize_genotypes(parsed)
         phenotype = self._read_phenotypes()
@@ -640,6 +642,7 @@ class NestedCVDataPreparer:
             "phenotype_file": str(self.config.phenotype_file.resolve()),
             "encoding_type": self.config.encoding_type,
             "variant_type": self.config.variant_type,
+            "id_prefix": self.config.id_prefix,
             "feature_kind": (
                 "branches" if isinstance(aligned["features"], dict) else "tensor"
             ),
@@ -949,7 +952,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--encoding",
         "--encoding-type",
-        choices=("token", "diploid_onehot", "onehot"),
+        choices=("token", "diploid_onehot", "onehot", "10classed_onehot"),
         default="diploid_onehot",
         help="Genotype encoding passed to aquila.encoding.parse_genotype_file.",
     )
@@ -958,10 +961,21 @@ def parse_args() -> argparse.Namespace:
         choices=("snp", "indel", "sv"),
         default=None,
         help=(
-            "Optional explicit input type. Every VCF record is treated as the "
-            "selected SNP, INDEL, or SV type without requiring a type prefix "
-            "in the ID column. When omitted, variant types are detected "
-            "automatically."
+            "Optional explicit encoding type for kept records. Every retained "
+            "VCF record is encoded as SNP, INDEL, or SV. This does not filter "
+            "by ID; use --id-prefix for that. When omitted, variant types are "
+            "detected automatically."
+        ),
+    )
+    parser.add_argument(
+        "--id-prefix",
+        "--variant-type-prefix",
+        dest="id_prefix",
+        default=None,
+        help=(
+            "Keep VCF records whose ID starts with one of these prefixes. "
+            "Separate alternatives with '|'. "
+            "Examples: 'SNP-' or 'SNP- | INDEL-'."
         ),
     )
     parser.add_argument(
@@ -1075,6 +1089,7 @@ def main() -> None:
         output_directory=Path(args.output_directory),
         encoding_type=args.encoding,
         variant_type=args.variant_type,
+        id_prefix=args.id_prefix,
         sample_id_column=args.sample_id_column,
         traits=args.traits,
         classification_tasks=args.classification_tasks,

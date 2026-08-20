@@ -3,8 +3,10 @@ Architectural building blocks for genomic neural networks.
 These blocks can be composed via YAML configuration to build custom architectures.
 """
 
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Optional
 from . import layers
@@ -437,6 +439,200 @@ def transformer(d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
                             use_positional_encoding=use_positional_encoding,
                             positional_encoding_type=positional_encoding_type,
                             max_position=max_position, **kwargs)
+
+
+class ExpertChoiceMoE(nn.Module):
+    """Whisperer-style Expert-Choice MoE over genomic tokens.
+
+    Each expert selects its own top-k tokens from the sequence and applies an FFN.
+    This is token routing after a shared encoder, not per-trait gating on a pooled vector.
+    """
+
+    def __init__(self, d_model=256, num_experts=3, expansion_factor=4, capacity_factor=1.25,
+                 dropout=0.1, activation='gelu', experts_sharing=False, residual=True):
+        super().__init__()
+        self.num_experts = int(num_experts)
+        self.d_model = int(d_model)
+        self.capacity_factor = float(capacity_factor)
+        self.experts_sharing = bool(experts_sharing)
+        self.residual = bool(residual)
+        self.norm = nn.LayerNorm(d_model)
+        self.gate = nn.Linear(d_model, self.num_experts, bias=False)
+        hidden = d_model * int(expansion_factor)
+        act = nn.GELU() if activation == 'gelu' else nn.ReLU()
+
+        def make_ffn():
+            return nn.Sequential(
+                nn.Linear(d_model, hidden),
+                act,
+                nn.Dropout(dropout),
+                nn.Linear(hidden, d_model),
+                nn.Dropout(dropout),
+            )
+
+        if self.experts_sharing:
+            self.expert_network = make_ffn()
+            self.expert_networks = None
+        else:
+            self.expert_network = None
+            self.expert_networks = nn.ModuleList([make_ffn() for _ in range(self.num_experts)])
+
+    def _route_tokens(self, x, mask=None):
+        if x.ndim != 3:
+            raise ValueError(
+                "expert_choice_moe expects (batch, seq_len, d_model). "
+                "Place it after transformer and before pooling."
+            )
+        residual = x
+        x = self.norm(x)
+        batch_size, seq_len, d_model = x.shape
+        if seq_len == 0:
+            empty = residual.new_zeros(batch_size, self.num_experts, 0, d_model)
+            empty_idx = residual.new_zeros(batch_size, self.num_experts, 0, dtype=torch.long)
+            return empty, empty_idx, empty[..., 0], empty
+
+        router_logits = self.gate(x)
+        valid_mask = None
+        if mask is not None and mask.shape[-1] == seq_len:
+            valid_mask = mask.bool()
+            router_logits = router_logits.masked_fill(~valid_mask.unsqueeze(-1), float('-inf'))
+
+        router_probs = F.softmax(router_logits.float(), dim=-1).type_as(x)
+        expert_probs = router_probs.permute(0, 2, 1)
+        if valid_mask is not None:
+            expert_probs = expert_probs.masked_fill(~valid_mask.unsqueeze(1), float('-inf'))
+
+        top_k = min(seq_len, max(1, int(math.ceil(seq_len * self.capacity_factor / self.num_experts))))
+        top_k_scores, top_k_indices = torch.topk(expert_probs.float(), k=top_k, dim=2)
+        top_k_scores = top_k_scores.type_as(x).masked_fill(~torch.isfinite(top_k_scores), 0.0)
+
+        gathered = torch.gather(
+            x.unsqueeze(1).expand(-1, self.num_experts, -1, -1),
+            dim=2,
+            index=top_k_indices.unsqueeze(-1).expand(-1, -1, -1, d_model),
+        )
+        if self.experts_sharing:
+            expert_out = self.expert_network(gathered)
+        else:
+            expert_out = torch.stack(
+                [self.expert_networks[i](gathered[:, i]) for i in range(self.num_experts)],
+                dim=1,
+            )
+        weighted = expert_out * top_k_scores.unsqueeze(-1)
+        residual_tokens = torch.gather(
+            residual.unsqueeze(1).expand(-1, self.num_experts, -1, -1),
+            dim=2,
+            index=top_k_indices.unsqueeze(-1).expand(-1, -1, -1, d_model),
+        )
+        return weighted, top_k_indices, top_k_scores, residual_tokens
+
+    def forward(self, x, mask=None):
+        weighted, top_k_indices, _, residual_tokens = self._route_tokens(x, mask=mask)
+        batch_size, _, top_k, d_model = weighted.shape
+        if top_k == 0:
+            return x if self.residual else x.new_zeros(x.shape)
+        src = weighted.reshape(batch_size, self.num_experts * top_k, d_model)
+        # AMP: LayerNorm stays fp32 while expert Linear is bf16, so zeros_like(x)
+        # and expert outputs can disagree. scatter_add_ requires matching dtypes.
+        output = torch.zeros(
+            batch_size,
+            x.shape[1],
+            d_model,
+            device=src.device,
+            dtype=src.dtype,
+        )
+        index = (
+            top_k_indices.reshape(batch_size, self.num_experts * top_k)
+            .unsqueeze(-1)
+            .expand(-1, -1, d_model)
+            .contiguous()
+        )
+        output.scatter_add_(dim=1, index=index, src=src)
+        if mask is not None and mask.shape[-1] == x.shape[1]:
+            output = output.masked_fill(~mask.bool().unsqueeze(-1), 0.0)
+        if self.residual:
+            output = output + x.to(dtype=output.dtype)
+        return output
+
+
+def expert_choice_moe(d_model=256, num_experts=3, expansion_factor=4, capacity_factor=1.25,
+                      dropout=0.1, activation='gelu', experts_sharing=False, residual=True,
+                      **kwargs):
+    return ExpertChoiceMoE(
+        d_model=d_model,
+        num_experts=num_experts,
+        expansion_factor=expansion_factor,
+        capacity_factor=capacity_factor,
+        dropout=dropout,
+        activation=activation,
+        experts_sharing=experts_sharing,
+        residual=residual,
+    )
+
+
+class ExpertChoiceMoEPool(ExpertChoiceMoE):
+    """Expert-Choice MoE followed by per-expert attention pooling.
+
+    Unlike expert_choice_moe, this keeps expert identity: each expert's selected
+    tokens are pooled to one vector and concatenated to (batch, num_experts * d_model).
+    """
+
+    def __init__(self, d_model=256, num_experts=3, expansion_factor=4, capacity_factor=1.25,
+                 dropout=0.1, activation='gelu', experts_sharing=False, residual=True):
+        super().__init__(
+            d_model=d_model,
+            num_experts=num_experts,
+            expansion_factor=expansion_factor,
+            capacity_factor=capacity_factor,
+            dropout=dropout,
+            activation=activation,
+            experts_sharing=experts_sharing,
+            residual=residual,
+        )
+        self.query = nn.Parameter(torch.empty(num_experts, d_model))
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.pool_dropout = nn.Dropout(dropout)
+        self.scale = d_model ** -0.5
+        nn.init.xavier_uniform_(self.query)
+
+    def forward(self, x, mask=None):
+        weighted, _, top_k_scores, residual_tokens = self._route_tokens(x, mask=mask)
+        tokens = weighted
+        if self.residual and residual_tokens.ndim == weighted.ndim:
+            tokens = residual_tokens.to(dtype=weighted.dtype) + weighted
+        if tokens.shape[2] == 0:
+            return x.new_zeros(
+                x.shape[0], self.num_experts * self.d_model, dtype=weighted.dtype
+            )
+
+        keys = self.k_proj(tokens)
+        values = self.v_proj(tokens)
+        query = self.query.view(1, self.num_experts, 1, self.d_model)
+        scores = (keys * query).sum(dim=-1) * self.scale
+        invalid = top_k_scores == 0
+        scores = scores.masked_fill(invalid, torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores.float(), dim=-1).type_as(tokens)
+        weights = weights.masked_fill(invalid, 0.0)
+        denom = weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        weights = weights / denom
+        pooled = (self.pool_dropout(weights).unsqueeze(-1) * values).sum(dim=2)
+        return pooled.reshape(pooled.shape[0], self.num_experts * self.d_model)
+
+
+def expert_choice_moe_pool(d_model=256, num_experts=3, expansion_factor=4, capacity_factor=1.25,
+                           dropout=0.1, activation='gelu', experts_sharing=False, residual=True,
+                           **kwargs):
+    return ExpertChoiceMoEPool(
+        d_model=d_model,
+        num_experts=num_experts,
+        expansion_factor=expansion_factor,
+        capacity_factor=capacity_factor,
+        dropout=dropout,
+        activation=activation,
+        experts_sharing=experts_sharing,
+        residual=residual,
+    )
 
 
 def transformerTranspose(d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
@@ -3146,6 +3342,401 @@ def regression_head(in_features=None, num_targets=None, hidden_features=None,
                           hidden_features=hidden_features, dropout=dropout, activation=activation)
 
 
+def _head_activation(activation):
+    return nn.GELU() if activation == 'gelu' else nn.ReLU()
+
+
+def _head_linear(in_features, out_features):
+    if in_features is None:
+        return nn.LazyLinear(out_features)
+    return nn.Linear(in_features, out_features)
+
+
+def _mlp_to_scalar(in_features, hidden_features, dropout, activation):
+    return nn.Sequential(
+        _head_linear(in_features, hidden_features),
+        nn.LayerNorm(hidden_features),
+        _head_activation(activation),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_features, 1),
+    )
+
+
+def _flatten_head_input(x):
+    if x.ndim > 2:
+        return x.reshape(x.shape[0], -1)
+    return x
+
+
+def group_traits_by_family(task_names):
+    """Group trait indices by the prefix before the first underscore."""
+    families = {}
+    for index, name in enumerate(task_names):
+        prefix = str(name).split('_', 1)[0]
+        families.setdefault(prefix, []).append(index)
+    return families
+
+
+class PerTraitRegressionHead(nn.Module):
+    """Independent MLP per trait: in -> hidden -> 1."""
+
+    def __init__(self, in_features=None, num_targets=None, hidden_features=64,
+                 dropout=0.1, activation='gelu'):
+        super().__init__()
+        if num_targets is None or num_targets < 1:
+            raise ValueError("per_trait_regression_head requires num_targets")
+        self.towers = nn.ModuleList([
+            _mlp_to_scalar(in_features, hidden_features, dropout, activation)
+            for _ in range(num_targets)
+        ])
+
+    def forward(self, x):
+        x = _flatten_head_input(x)
+        return torch.cat([tower(x) for tower in self.towers], dim=-1)
+
+
+def per_trait_regression_head(in_features=None, num_targets=None, hidden_features=64,
+                              dropout=0.1, activation='gelu', **kwargs):
+    return PerTraitRegressionHead(
+        in_features=in_features,
+        num_targets=num_targets,
+        hidden_features=hidden_features,
+        dropout=dropout,
+        activation=activation,
+    )
+
+
+class SharedStemPrivateHead(nn.Module):
+    """Shared stem followed by a private MLP per trait."""
+
+    def __init__(self, in_features=None, num_targets=None, stem_features=256,
+                 hidden_features=64, dropout=0.1, activation='gelu'):
+        super().__init__()
+        if num_targets is None or num_targets < 1:
+            raise ValueError("shared_stem_private_head requires num_targets")
+        self.stem = nn.Sequential(
+            _head_linear(in_features, stem_features),
+            nn.LayerNorm(stem_features),
+            _head_activation(activation),
+            nn.Dropout(dropout),
+        )
+        self.towers = nn.ModuleList([
+            _mlp_to_scalar(stem_features, hidden_features, dropout, activation)
+            for _ in range(num_targets)
+        ])
+
+    def forward(self, x):
+        shared = self.stem(_flatten_head_input(x))
+        return torch.cat([tower(shared) for tower in self.towers], dim=-1)
+
+
+def shared_stem_private_head(in_features=None, num_targets=None, stem_features=256,
+                             hidden_features=64, dropout=0.1, activation='gelu', **kwargs):
+    return SharedStemPrivateHead(
+        in_features=in_features,
+        num_targets=num_targets,
+        stem_features=stem_features,
+        hidden_features=hidden_features,
+        dropout=dropout,
+        activation=activation,
+    )
+
+
+class FamilyGroupedRegressionHead(nn.Module):
+    """One shared MLP per trait-name family, mapped back to original order."""
+
+    def __init__(self, in_features=None, num_targets=None, hidden_features=128,
+                 dropout=0.1, activation='gelu', task_names=None):
+        super().__init__()
+        if num_targets is None or num_targets < 1:
+            raise ValueError("family_grouped_regression_head requires num_targets")
+        if task_names is None:
+            task_names = [f"trait_{i}" for i in range(num_targets)]
+        if len(task_names) != num_targets:
+            raise ValueError(
+                f"task_names length {len(task_names)} != num_targets {num_targets}"
+            )
+        self.num_targets = num_targets
+        self.families = group_traits_by_family(task_names)
+        self.family_names = list(self.families.keys())
+        self.family_heads = nn.ModuleDict()
+        for family, indices in self.families.items():
+            self.family_heads[family] = nn.Sequential(
+                _head_linear(in_features, hidden_features),
+                nn.LayerNorm(hidden_features),
+                _head_activation(activation),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_features, len(indices)),
+            )
+
+    def forward(self, x):
+        x = _flatten_head_input(x)
+        outputs = x.new_zeros(x.shape[0], self.num_targets)
+        for family in self.family_names:
+            indices = self.families[family]
+            family_pred = self.family_heads[family](x)
+            outputs[:, indices] = family_pred
+        return outputs
+
+
+def family_grouped_regression_head(in_features=None, num_targets=None, hidden_features=128,
+                                   dropout=0.1, activation='gelu', task_names=None, **kwargs):
+    return FamilyGroupedRegressionHead(
+        in_features=in_features,
+        num_targets=num_targets,
+        hidden_features=hidden_features,
+        dropout=dropout,
+        activation=activation,
+        task_names=task_names,
+    )
+
+
+class SharedStemFamilyHead(nn.Module):
+    """Shared MLP stem plus a family-specific linear readout."""
+
+    def __init__(self, in_features=None, num_targets=None, stem_features=256,
+                 dropout=0.1, activation='gelu', task_names=None):
+        super().__init__()
+        if num_targets is None or num_targets < 1:
+            raise ValueError("shared_stem_family_head requires num_targets")
+        if task_names is None:
+            task_names = [f"trait_{i}" for i in range(num_targets)]
+        if len(task_names) != num_targets:
+            raise ValueError(
+                f"task_names length {len(task_names)} != num_targets {num_targets}"
+            )
+        self.num_targets = num_targets
+        self.families = group_traits_by_family(task_names)
+        self.family_names = list(self.families.keys())
+        self.stem = nn.Sequential(
+            _head_linear(in_features, stem_features),
+            nn.LayerNorm(stem_features),
+            _head_activation(activation),
+            nn.Dropout(dropout),
+        )
+        self.family_outs = nn.ModuleDict({
+            family: nn.Linear(stem_features, len(indices))
+            for family, indices in self.families.items()
+        })
+
+    def forward(self, x):
+        shared = self.stem(_flatten_head_input(x))
+        outputs = shared.new_zeros(shared.shape[0], self.num_targets)
+        for family in self.family_names:
+            outputs[:, self.families[family]] = self.family_outs[family](shared)
+        return outputs
+
+
+def shared_stem_family_head(in_features=None, num_targets=None, stem_features=256,
+                            dropout=0.1, activation='gelu', task_names=None, **kwargs):
+    return SharedStemFamilyHead(
+        in_features=in_features,
+        num_targets=num_targets,
+        stem_features=stem_features,
+        dropout=dropout,
+        activation=activation,
+        task_names=task_names,
+    )
+
+
+class MMoERegressionHead(nn.Module):
+    """Multi-gate mixture of experts.
+
+    gate_type:
+        - input: per-trait Linear(x) -> expert weights
+        - static: per-trait logits over experts, independent of x
+    tower_hidden:
+        - int: private MLP tower per trait after mixing
+        - None: linear readout per trait after mixing
+    """
+
+    def __init__(self, in_features=None, num_targets=None, num_experts=4,
+                 expert_dim=64, tower_hidden=32, dropout=0.1, activation='gelu',
+                 gate_type='input'):
+        super().__init__()
+        if num_targets is None or num_targets < 1:
+            raise ValueError("mmoe_regression_head requires num_targets")
+        if gate_type not in ('input', 'static'):
+            raise ValueError(f"Unknown gate_type: {gate_type}")
+        self.gate_type = gate_type
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                _head_linear(in_features, expert_dim),
+                nn.LayerNorm(expert_dim),
+                _head_activation(activation),
+                nn.Dropout(dropout),
+            )
+            for _ in range(num_experts)
+        ])
+        if gate_type == 'input':
+            self.gates = nn.ModuleList([
+                _head_linear(in_features, num_experts) for _ in range(num_targets)
+            ])
+            self.gate_logits = None
+        else:
+            self.gates = None
+            self.gate_logits = nn.Parameter(torch.zeros(num_targets, num_experts))
+        if tower_hidden is None:
+            self.towers = None
+            self.out_weight = nn.Parameter(torch.empty(num_targets, expert_dim))
+            self.out_bias = nn.Parameter(torch.zeros(num_targets))
+            nn.init.xavier_uniform_(self.out_weight)
+        else:
+            self.towers = nn.ModuleList([
+                _mlp_to_scalar(expert_dim, tower_hidden, dropout, activation)
+                for _ in range(num_targets)
+            ])
+            self.out_weight = None
+            self.out_bias = None
+
+    def _mix_experts(self, x, expert_stack):
+        if self.gate_type == 'static':
+            weights = torch.softmax(self.gate_logits, dim=-1)
+            return torch.einsum('bed,te->btd', expert_stack, weights)
+        gate_logits = torch.stack([gate(x) for gate in self.gates], dim=1)
+        weights = torch.softmax(gate_logits, dim=-1)
+        return torch.einsum('bed,bte->btd', expert_stack, weights)
+
+    def forward(self, x):
+        x = _flatten_head_input(x)
+        expert_stack = torch.stack([expert(x) for expert in self.experts], dim=1)
+        mixed = self._mix_experts(x, expert_stack)
+        if self.towers is None:
+            return (mixed * self.out_weight.unsqueeze(0)).sum(dim=-1) + self.out_bias
+        outputs = [tower(mixed[:, index]) for index, tower in enumerate(self.towers)]
+        return torch.cat(outputs, dim=-1)
+
+
+def mmoe_regression_head(in_features=None, num_targets=None, num_experts=4,
+                         expert_dim=64, tower_hidden=32, dropout=0.1,
+                         activation='gelu', gate_type='input', **kwargs):
+    return MMoERegressionHead(
+        in_features=in_features,
+        num_targets=num_targets,
+        num_experts=num_experts,
+        expert_dim=expert_dim,
+        tower_hidden=tower_hidden,
+        dropout=dropout,
+        activation=activation,
+        gate_type=gate_type,
+    )
+
+
+class FiLMRegressionHead(nn.Module):
+    """Shared MLP with per-trait FiLM modulation and linear readout."""
+
+    def __init__(self, in_features=None, num_targets=None, hidden_features=256,
+                 dropout=0.1, activation='gelu'):
+        super().__init__()
+        if num_targets is None or num_targets < 1:
+            raise ValueError("film_regression_head requires num_targets")
+        self.stem = nn.Sequential(
+            _head_linear(in_features, hidden_features),
+            nn.LayerNorm(hidden_features),
+            _head_activation(activation),
+            nn.Dropout(dropout),
+        )
+        self.trait_film = nn.Embedding(num_targets, hidden_features * 2)
+        self.out_weight = nn.Parameter(torch.empty(num_targets, hidden_features))
+        self.out_bias = nn.Parameter(torch.zeros(num_targets))
+        nn.init.xavier_uniform_(self.out_weight)
+        nn.init.zeros_(self.trait_film.weight)
+
+    def forward(self, x):
+        hidden = self.stem(_flatten_head_input(x))
+        num_targets = self.out_weight.shape[0]
+        film = self.trait_film.weight.view(num_targets, 2, -1)
+        gamma = film[:, 0].unsqueeze(0)
+        beta = film[:, 1].unsqueeze(0)
+        modulated = hidden.unsqueeze(1) * (1.0 + gamma) + beta
+        return (modulated * self.out_weight.unsqueeze(0)).sum(dim=-1) + self.out_bias
+
+
+def film_regression_head(in_features=None, num_targets=None, hidden_features=256,
+                         dropout=0.1, activation='gelu', **kwargs):
+    return FiLMRegressionHead(
+        in_features=in_features,
+        num_targets=num_targets,
+        hidden_features=hidden_features,
+        dropout=dropout,
+        activation=activation,
+    )
+
+
+class TraitQueryRegressionHead(nn.Module):
+    """Per-trait learnable query attending over genomic tokens.
+
+    h_t = Attention(q_t, H, H); y_t = w_t · MLP(h_t)
+    MLP weights are shared across traits; only queries and readout are per-trait.
+    """
+
+    def __init__(self, d_model=256, num_targets=None, num_heads=8, dropout=0.1,
+                 hidden_features=256, activation='gelu', in_features=None, **kwargs):
+        super().__init__()
+        if num_targets is None or num_targets < 1:
+            raise ValueError("trait_query_regression_head requires num_targets")
+        if in_features is not None:
+            d_model = int(in_features)
+        if d_model % num_heads != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by num_heads={num_heads}")
+        self.d_model = d_model
+        self.queries = nn.Parameter(torch.empty(num_targets, d_model))
+        nn.init.xavier_uniform_(self.queries)
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm = nn.LayerNorm(d_model)
+        if hidden_features:
+            self.mlp = nn.Sequential(
+                nn.Linear(d_model, hidden_features),
+                nn.LayerNorm(hidden_features),
+                _head_activation(activation),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_features, d_model),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.mlp = None
+        self.out_weight = nn.Parameter(torch.empty(num_targets, d_model))
+        self.out_bias = nn.Parameter(torch.zeros(num_targets))
+        nn.init.xavier_uniform_(self.out_weight)
+
+    def forward(self, x, mask=None):
+        if x.ndim != 3:
+            raise ValueError(
+                "trait_query_regression_head expects (batch, seq_len, d_model). "
+                "Keep genomic tokens; do not put multi_head_pool in the trunk."
+            )
+        batch_size, seq_len, _ = x.shape
+        query = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
+        key_padding_mask = None
+        if mask is not None:
+            key_padding_mask = ~mask.bool()
+            if key_padding_mask.shape[-1] != seq_len:
+                key_padding_mask = None
+        hidden, _ = self.cross_attn(
+            query, x, x, key_padding_mask=key_padding_mask, need_weights=False
+        )
+        hidden = self.norm(hidden)
+        if self.mlp is not None:
+            hidden = hidden + self.mlp(hidden)
+        return (hidden * self.out_weight.unsqueeze(0)).sum(dim=-1) + self.out_bias
+
+
+def trait_query_regression_head(d_model=256, num_targets=None, num_heads=8, dropout=0.1,
+                                hidden_features=256, activation='gelu', in_features=None,
+                                **kwargs):
+    return TraitQueryRegressionHead(
+        d_model=d_model,
+        num_targets=num_targets,
+        num_heads=num_heads,
+        dropout=dropout,
+        hidden_features=hidden_features,
+        activation=activation,
+        in_features=in_features,
+    )
+
+
 class ClassificationHead(nn.Module):
     """Classification head with optional hidden layers."""
 
@@ -3823,6 +4414,8 @@ name_func = {
 
     # Transformers
     'transformer': transformer,
+    'expert_choice_moe': expert_choice_moe,
+    'expert_choice_moe_pool': expert_choice_moe_pool,
     'transformer_tower': transformer_tower,
 
     # Transpose Transformers
@@ -3872,6 +4465,13 @@ name_func = {
 
     # Heads
     'regression_head': regression_head,
+    'per_trait_regression_head': per_trait_regression_head,
+    'shared_stem_private_head': shared_stem_private_head,
+    'family_grouped_regression_head': family_grouped_regression_head,
+    'shared_stem_family_head': shared_stem_family_head,
+    'mmoe_regression_head': mmoe_regression_head,
+    'film_regression_head': film_regression_head,
+    'trait_query_regression_head': trait_query_regression_head,
     'classification_head': classification_head,
 
     # Fusion (Multi-Branch)
