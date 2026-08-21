@@ -506,16 +506,34 @@ def create_model_from_config(
     model_params['classification_tasks'] = classification_tasks or []
 
     # Auto-update head dimensions based on detected tasks
+    _MULTI_TASK_REGRESSION_HEADS = {
+        'regression_head',
+        'per_trait_regression_head',
+        'shared_stem_private_head',
+        'family_grouped_regression_head',
+        'shared_stem_family_head',
+        'mmoe_regression_head',
+        'film_regression_head',
+        'trait_query_regression_head',
+    }
+    _FAMILY_REGRESSION_HEADS = {
+        'family_grouped_regression_head',
+        'shared_stem_family_head',
+    }
     if 'heads' in model_params:
         # Update regression head
         if 'regression' in model_params['heads'] and regression_tasks:
             head_blocks = model_params['heads']['regression']
             if isinstance(head_blocks, list):
                 for block in head_blocks:
-                    if isinstance(block, dict) and block.get('name') == 'regression_head':
+                    if isinstance(block, dict) and block.get('name') in _MULTI_TASK_REGRESSION_HEADS:
                         block['num_targets'] = len(regression_tasks)
-            elif isinstance(head_blocks, dict) and head_blocks.get('name') == 'regression_head':
+                        if block.get('name') in _FAMILY_REGRESSION_HEADS:
+                            block['task_names'] = list(regression_tasks)
+            elif isinstance(head_blocks, dict) and head_blocks.get('name') in _MULTI_TASK_REGRESSION_HEADS:
                 head_blocks['num_targets'] = len(regression_tasks)
+                if head_blocks.get('name') in _FAMILY_REGRESSION_HEADS:
+                    head_blocks['task_names'] = list(regression_tasks)
 
         # Update classification head
         if 'classification' in model_params['heads'] and classification_tasks:
