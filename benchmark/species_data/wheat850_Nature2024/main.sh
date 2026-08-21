@@ -7,7 +7,7 @@ P=Wheat850
 THREADS="${THREADS:-$(nproc)}"
 LD_WINDOW=1000
 LD_STEP=50
-LD_R2=0.003
+LD_R2=0.005
 FILTER_TAG="max_missing_0.5.maf_0.05.biallelic.filter"
 
 VCF_IN="${P}.merge.vcf.gz"
@@ -31,7 +31,7 @@ bcftools view --threads "${THREADS}" \
     -S "${KEEP_SAMPLES}" \
     -Oz -o "${VCF_KEEP}" \
     "${VCF_IN}"
-bcftools index --tbi --force "${VCF_KEEP}"
+bcftools index --threads "${THREADS}" --csi --force "${VCF_KEEP}"
 
 "${COMMON_SCRIPT_DIR}/filter_vcf.sh" "${VCF_KEEP}" "${VCF_FILT}" "${THREADS}"
 

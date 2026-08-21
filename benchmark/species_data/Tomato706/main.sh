@@ -7,7 +7,7 @@ P=Tomato706
 THREADS="${THREADS:-$(nproc)}"
 LD_WINDOW=1000
 LD_STEP=50
-LD_R2=0.003
+LD_R2=0.005
 FILTER_TAG="max_missing_0.5.maf_0.05.biallelic.filter"
 
 VCF_IN="${P}.merge_snp.vcf.gz"

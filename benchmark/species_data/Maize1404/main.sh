@@ -7,7 +7,7 @@ P=Maize1404
 THREADS="${THREADS:-$(nproc)}"
 LD_WINDOW=1000
 LD_STEP=50
-LD_R2=0.003
+LD_R2=0.005
 FILTER_TAG="max_missing_0.5.maf_0.05.biallelic.filter"
 
 VCF_IN="${P}.vcf.gz"
@@ -15,6 +15,14 @@ VCF_FILT="${P}.${FILTER_TAG}.vcf.gz"
 VCF_IMPUTE="results/${P}.${FILTER_TAG}.impute.biallelic.vcf.gz"
 VCF_PRUNED="${P}.LD.vcf.gz"
 VCF_PRUNED_RENAME="${P}.LD.rename.vcf.gz"
+PHENO_IN="${P}_GSTP004.pheno"
+PHENO_OUT="${P}.pheno"
+
+if python3 -c "import pandas" >/dev/null 2>&1; then
+    PY=python3
+else
+    PY=/data4/gulei/anaconda3/bin/python
+fi
 
 "${COMMON_SCRIPT_DIR}/filter_vcf.sh" "${VCF_IN}" "${VCF_FILT}" "${THREADS}"
 
@@ -28,10 +36,9 @@ fi
 "${COMMON_SCRIPT_DIR}/ld_prune_plink2.sh" \
     "${VCF_IMPUTE}" "${P}" "${LD_WINDOW}" "${LD_STEP}" "${LD_R2}"
 
-bcftools query -l "${VCF_PRUNED}" > sample_name.txt
-sed -i 's/^0_CUBIC_//' sample_name.txt
-bcftools reheader -N sample_name.txt "${VCF_PRUNED}" -o "${VCF_PRUNED_RENAME}"
-bcftools index --threads "${THREADS}" -f "${VCF_PRUNED_RENAME}"
+# VCF IDs are CUBIC_MG_*; phenotype LINEs are MG_*. Keep the intersection.
+"$PY" "${SCRIPT_DIR}/scripts/rename_ld_vcf_and_pheno.py" \
+    "${VCF_PRUNED}" "${PHENO_IN}" "${VCF_PRUNED_RENAME}" "${PHENO_OUT}"
 
 plink2 \
     --vcf "${VCF_IMPUTE}" \

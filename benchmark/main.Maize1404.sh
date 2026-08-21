@@ -1,13 +1,14 @@
 COHORT=Maize1404
-PHENO_FILE=species_data/Maize1404/Maize1404_GSTP004.pheno
+PHENO_FILE=species_data/Maize1404/Maize1404.pheno
 VCF_FILE=species_data/Maize1404/Maize1404.LD.rename.vcf.gz
 
 COHORT=Soybean2795
 PHENO_FILE=species_data/Soybean2795/GSTP014.pheno
 VCF_FILE=species_data/Soybean2795/Soybean2795.LD.rename.vcf.gz
-# COHORT=wheat850_Nature2024
-# PHENO_FILE=species_data/Maize1404/Maize1404_GSTP004.pheno
-# VCF_FILE=species_data/Maize1404/Wheat850.LD.vcf.gz
+
+COHORT=wheat850_Nature2024
+PHENO_FILE=species_data/Maize1404/Maize1404_GSTP004.pheno
+VCF_FILE=species_data/Maize1404/Wheat850.LD.vcf.gz
 
 
 conda activate aquila

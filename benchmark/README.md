@@ -25,7 +25,6 @@ When having done the GWAS lead variant selection, we can use the following comma
 ```sh
 aquila_data_cv.py --vcf ../case/705rice_0.03.full.all.impute.biallelic.vcf.gz --phenotype GSTP008.pheno --encoding-type diploid_onehot --variant-type snp --id-prefix "SNP-" --fold-mapping 705rice_nested_cv.json -o test --save-raw-genotype --overwrite
 aquila_data_cv.py --vcf ../case/705rice_0.03.full.all.impute.biallelic.vcf.gz --phenotype GSTP008.pheno --encoding-type 10classed_onehot --variant-type snp --id-prefix "SNP-" --fold-mapping 705rice_nested_cv.json -o test_10classes_onehot --save-raw-genotype --overwrite
-
 ```
 
 When `--save-raw-genotype` is enabled, sample-subset VCF files are written under `test/raw_genotype/`. Every outer fold contains `train.vcf.gz` and `test.vcf.gz`; every nested inner fold contains `train.vcf.gz` and `valid.vcf.gz`. These files preserve the source variants and genotype fields, but include only the samples assigned to that split. These raw fold-specific VCFs allow benchmark models to apply their own genotype encodings while using exactly the same samples as Aquila.
