@@ -8,6 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+from entmax import entmax15
+
 
 ############################################################
 # Activation Functions
@@ -146,16 +148,35 @@ class PositionalEncoding(nn.Module):
 # Attention Mechanisms
 ############################################################
 
+def attention_normalize(scores, dim=-1, normalize="softmax"):
+    """Turn attention logits into weights.
+
+    ``entmax`` / ``entmax15`` is 1.5-entmax (sparse Tsallis). Computed in
+    float32 so AMP/bf16 logits still sum to one after the cast back.
+    """
+    kind = str(normalize or "softmax").lower()
+    if kind == "softmax":
+        return F.softmax(scores, dim=dim)
+    if kind in ("entmax", "entmax15"):
+        weights = entmax15(scores.float(), dim=dim)
+        return weights.to(dtype=scores.dtype)
+    raise ValueError(
+        f"Unknown attention normalize '{normalize}'. "
+        "Use 'softmax' or 'entmax15'."
+    )
+
+
 class MultiHeadSelfAttention(nn.Module):
     """Multi-head self-attention mechanism."""
 
-    def __init__(self, d_model, num_heads, dropout=0.1):
+    def __init__(self, d_model, num_heads, dropout=0.1, attn_normalize="softmax"):
         super().__init__()
         assert d_model % num_heads == 0
 
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.attn_normalize = attn_normalize
 
         self.qkv_proj = nn.Linear(d_model, 3 * d_model)
         self.out_proj = nn.Linear(d_model, d_model)
@@ -188,7 +209,7 @@ class MultiHeadSelfAttention(nn.Module):
             mask = mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, seq_len)
             attn = attn.masked_fill(~mask, float('-inf'))
 
-        attn = F.softmax(attn, dim=-1)
+        attn = attention_normalize(attn, dim=-1, normalize=self.attn_normalize)
         attn = self.dropout(attn)
 
         # Apply attention to values
@@ -201,13 +222,14 @@ class MultiHeadSelfAttention(nn.Module):
 class MultiHeadSelfAttentionRoPE(nn.Module):
     """Multi-head self-attention with Rotary Position Embedding (RoPE)."""
 
-    def __init__(self, d_model, num_heads, dropout=0.1):
+    def __init__(self, d_model, num_heads, dropout=0.1, attn_normalize="softmax"):
         super().__init__()
         assert d_model % num_heads == 0
 
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.attn_normalize = attn_normalize
 
         self.qkv_proj = nn.Linear(d_model, 3 * d_model)
         self.out_proj = nn.Linear(d_model, d_model)
@@ -246,7 +268,7 @@ class MultiHeadSelfAttentionRoPE(nn.Module):
             mask = mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, seq_len)
             attn = attn.masked_fill(~mask, float('-inf'))
 
-        attn = F.softmax(attn, dim=-1)
+        attn = attention_normalize(attn, dim=-1, normalize=self.attn_normalize)
         attn = self.dropout(attn)
 
         # Apply attention to values
@@ -403,17 +425,30 @@ class MultiQueryAttentionRoPE(nn.Module):
 ############################################################
 
 class FeedForward(nn.Module):
-    """Position-wise feed-forward network."""
+    """Position-wise feed-forward network.
 
-    def __init__(self, d_model, d_ff, dropout=0.1, activation='gelu'):
+    ``num_hidden_layers=1`` is the standard transformer FFN:
+    ``d_model → d_ff → d_model``. Extra hidden layers stay at ``d_ff``
+    (``d_model → d_ff → … → d_ff → d_model``).
+    """
+
+    def __init__(self, d_model, d_ff, dropout=0.1, activation='gelu',
+                 num_hidden_layers=1):
         super().__init__()
-        self.linear1 = nn.Linear(d_model, d_ff)
-        self.linear2 = nn.Linear(d_ff, d_model)
+        if num_hidden_layers < 1:
+            raise ValueError(
+                f"num_hidden_layers must be >= 1, got {num_hidden_layers}")
+        hidden = [nn.Linear(d_model, d_ff)]
+        hidden.extend(nn.Linear(d_ff, d_ff) for _ in range(num_hidden_layers - 1))
+        self.hidden = nn.ModuleList(hidden)
+        self.out = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
         self.activation = activation
 
     def forward(self, x):
-        return self.linear2(self.dropout(activate(self.linear1(x), self.activation)))
+        for layer in self.hidden:
+            x = self.dropout(activate(layer(x), self.activation))
+        return self.out(x)
 
 
 ############################################################
@@ -515,11 +550,13 @@ class MultiHeadPooling(nn.Module):
     statistical properties of the sequence.
     """
 
-    def __init__(self, d_model, num_heads=4, dropout=0.1, pool_axis=1):
+    def __init__(self, d_model, num_heads=4, dropout=0.1, pool_axis=1,
+                 attn_normalize="softmax"):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.pool_axis = pool_axis
+        self.attn_normalize = attn_normalize
 
         # Attention pooling head
         if pool_axis == 1:
@@ -584,8 +621,9 @@ class MultiHeadPooling(nn.Module):
                 x).squeeze(-1)  # (batch, seq_len)
             if mask is not None:
                 attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
-            attn_weights = F.softmax(
-                attn_logits, dim=1).unsqueeze(-1)  # (batch, seq_len, 1)
+            attn_weights = attention_normalize(
+                attn_logits, dim=1, normalize=self.attn_normalize
+            ).unsqueeze(-1)  # (batch, seq_len, 1)
             attn_pooled = (x * attn_weights).sum(dim=1)
             pooled.append(attn_pooled)
 
@@ -627,8 +665,9 @@ class MultiHeadPooling(nn.Module):
             x_reshaped = x.unsqueeze(-1)  # (batch, seq_len, d_model, 1)
             attn_logits = self.attention_pool(
                 x_reshaped).squeeze(-1)  # (batch, seq_len, d_model)
-            # (batch, seq_len, d_model)
-            attn_weights = F.softmax(attn_logits, dim=2)
+            attn_weights = attention_normalize(
+                attn_logits, dim=2, normalize=self.attn_normalize
+            )  # (batch, seq_len, d_model)
             attn_pooled = (x * attn_weights).sum(dim=2)  # (batch, seq_len)
             pooled.append(attn_pooled)
 

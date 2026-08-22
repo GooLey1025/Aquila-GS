@@ -84,11 +84,11 @@ cd ../DEM
   --output-dir results/DEM-SNP/$COHORT \
   --jobs-per-gpu 2
 
-/usr/bin/time -v -o $COHORT.DEM-Vars.time.txt python DEM_train_benchmark.py \
-  --data-dir ../$COHORT.vars.cv.data \
-  --config configs/DEM-Vars_nested_cv.yaml \
-  --output-dir results/DEM-Vars/$COHORT \
-  --jobs-per-gpu 2
+# /usr/bin/time -v -o $COHORT.DEM-Vars.time.txt python DEM_train_benchmark.py \
+#   --data-dir ../$COHORT.vars.cv.data \
+#   --config configs/DEM-Vars_nested_cv.yaml \
+#   --output-dir results/DEM-Vars/$COHORT \
+#   --jobs-per-gpu 2
 
 cd ../Whisperer_of_DNA
 /usr/bin/time -v -o $COHORT.time.txt python Whisperer_train_cv.py \

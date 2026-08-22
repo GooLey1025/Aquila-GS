@@ -255,13 +255,17 @@ class TransformerBlock(nn.Module):
             self.pos_encoding = None
 
         # Choose attention mechanism based on use_rope
+        attn_normalize = str(kwargs.pop('attn_normalize', 'softmax'))
         if use_rope:
             self.attention = layers.MultiHeadSelfAttentionRoPE(
-                d_model, num_heads, dropout)
+                d_model, num_heads, dropout, attn_normalize=attn_normalize)
         else:
             self.attention = layers.MultiHeadSelfAttention(
-                d_model, num_heads, dropout)
-        self.ffn = layers.FeedForward(d_model, d_ff, dropout, activation)
+                d_model, num_heads, dropout, attn_normalize=attn_normalize)
+        ffn_num_hidden_layers = int(kwargs.pop('ffn_num_hidden_layers', 1))
+        self.ffn = layers.FeedForward(
+            d_model, d_ff, dropout, activation,
+            num_hidden_layers=ffn_num_hidden_layers)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
@@ -412,7 +416,7 @@ class TransformerBlockTranspose(nn.Module):
 
 def transformer(d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
                 use_rope=False, use_positional_encoding=False, positional_encoding_type='sinusoidal',
-                max_position=50000, **kwargs):
+                max_position=50000, ffn_num_hidden_layers=1, attn_normalize='softmax', **kwargs):
     """Single transformer encoder block.
 
     Args:
@@ -425,6 +429,8 @@ def transformer(d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
         use_positional_encoding: Whether to use positional encoding (default False)
         positional_encoding_type: Type of positional encoding - 'sinusoidal' or 'learnable' (default 'sinusoidal')
         max_position: Maximum sequence length for positional encoding (default 50000)
+        ffn_num_hidden_layers: Hidden Linear count inside the FFN (1 = standard)
+        attn_normalize: Attention weights, 'softmax' or 'entmax15'
 
     Returns:
         TransformerBlock module
@@ -438,7 +444,10 @@ def transformer(d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
                             dropout=dropout, activation=activation, use_rope=use_rope,
                             use_positional_encoding=use_positional_encoding,
                             positional_encoding_type=positional_encoding_type,
-                            max_position=max_position, **kwargs)
+                            max_position=max_position,
+                            ffn_num_hidden_layers=ffn_num_hidden_layers,
+                            attn_normalize=attn_normalize,
+                            **kwargs)
 
 
 class ExpertChoiceMoE(nn.Module):
@@ -3179,7 +3188,8 @@ def global_pool(pool_type='mean', d_model=None, pool_axis=1, dropout=0.1, **kwar
     return layers.GlobalPooling(d_model=d_model or 128, pool_type=pool_type, pool_axis=pool_axis, dropout=dropout)
 
 
-def multi_head_pool(d_model, num_heads=4, dropout=0.1, pool_axis=1, **kwargs):
+def multi_head_pool(d_model, num_heads=4, dropout=0.1, pool_axis=1,
+                    attn_normalize="softmax", **kwargs):
     """Multi-head pooling block.
 
     Combines mean, max, attention, and std pooling strategies in parallel,
@@ -3190,11 +3200,18 @@ def multi_head_pool(d_model, num_heads=4, dropout=0.1, pool_axis=1, **kwargs):
         num_heads: Number of pooling heads (default 4: mean, max, attention, std)
         dropout: Dropout rate
         pool_axis: Pooling axis - 1 for sequence dimension (default), 2 for feature dimension
+        attn_normalize: Attention-head weights, 'softmax' or 'entmax15'
 
     Returns:
         MultiHeadPooling module
     """
-    return layers.MultiHeadPooling(d_model=d_model, num_heads=num_heads, dropout=dropout, pool_axis=pool_axis)
+    return layers.MultiHeadPooling(
+        d_model=d_model,
+        num_heads=num_heads,
+        dropout=dropout,
+        pool_axis=pool_axis,
+        attn_normalize=attn_normalize,
+    )
 
 
 def learnable_query_pool(d_model, num_queries=1, num_layers=2, dropout=0.1, pool_axis=1, **kwargs):
@@ -3294,30 +3311,41 @@ class RegressionHead(nn.Module):
     """Regression head with optional hidden layers."""
 
     def __init__(self, in_features=None, num_targets=None, hidden_features=None,
-                 dropout=0.1, activation='gelu'):
+                 dropout=0.1, activation='gelu', num_hidden_layers=1):
         super().__init__()
         layer_list = []
+        num_hidden_layers = int(num_hidden_layers)
 
         if hidden_features is not None:
-            # Use lazy initialization for first layer if in_features not specified
+            if num_hidden_layers < 1:
+                raise ValueError(
+                    f"num_hidden_layers must be >= 1 when hidden_features is set, "
+                    f"got {num_hidden_layers}")
             if in_features is None:
                 layer_list.append(nn.LazyLinear(hidden_features))
             else:
                 layer_list.append(nn.Linear(in_features, hidden_features))
-
+            act = nn.GELU() if activation == 'gelu' else nn.ReLU()
             layer_list.extend([
                 nn.LayerNorm(hidden_features),
-                nn.GELU() if activation == 'gelu' else nn.ReLU(),
+                act,
                 nn.Dropout(dropout),
-                nn.Linear(hidden_features, num_targets)
             ])
+            for _ in range(num_hidden_layers - 1):
+                layer_list.extend([
+                    nn.Linear(hidden_features, hidden_features),
+                    nn.LayerNorm(hidden_features),
+                    nn.GELU() if activation == 'gelu' else nn.ReLU(),
+                    nn.Dropout(dropout),
+                ])
+            layer_list.append(nn.Linear(hidden_features, num_targets))
         else:
-            # Use lazy initialization if in_features not specified
             if in_features is None:
                 layer_list.append(nn.LazyLinear(num_targets))
             else:
                 layer_list.append(nn.Linear(in_features, num_targets))
 
+        self.num_hidden_layers = 0 if hidden_features is None else num_hidden_layers
         self.network = nn.Sequential(*layer_list)
 
     def forward(self, x):
@@ -3325,7 +3353,7 @@ class RegressionHead(nn.Module):
 
 
 def regression_head(in_features=None, num_targets=None, hidden_features=None,
-                    dropout=0.1, activation='gelu', **kwargs):
+                    dropout=0.1, activation='gelu', num_hidden_layers=1, **kwargs):
     """Regression head block.
 
     Args:
@@ -3334,12 +3362,19 @@ def regression_head(in_features=None, num_targets=None, hidden_features=None,
         hidden_features: Hidden layer dimension (None for no hidden layer)
         dropout: Dropout rate
         activation: Activation function
+        num_hidden_layers: Hidden MLP count before the output Linear (default 1)
 
     Returns:
         RegressionHead module
     """
-    return RegressionHead(in_features=in_features, num_targets=num_targets,
-                          hidden_features=hidden_features, dropout=dropout, activation=activation)
+    return RegressionHead(
+        in_features=in_features,
+        num_targets=num_targets,
+        hidden_features=hidden_features,
+        dropout=dropout,
+        activation=activation,
+        num_hidden_layers=num_hidden_layers,
+    )
 
 
 def _head_activation(activation):
