@@ -10,6 +10,7 @@ COHORT=wheat850_Nature2024
 PHENO_FILE=species_data/Maize1404/Maize1404_GSTP004.pheno
 VCF_FILE=species_data/Maize1404/Wheat850.LD.vcf.gz
 
+export PATH="$CONDA_PREFIX/bin:$PATH"
 
 conda activate aquila
 aquila_cv.py --phenotype $PHENO_FILE -o $COHORT.nested_cv.json --outer-folds 5 --inner-folds 4 --seed 42 --min-observed 20

@@ -254,14 +254,18 @@ def train_model(
     _set_seed(seed)
     model = _model(train_x.shape[1], config).to(device)
     training = config["training"]
+    n_train = int(train_x.shape[0])
+    if n_train < 1:
+        raise ValueError("CropFormer requires at least one training sample")
+    batch_size = int(training["batch_size"])
     loader = DataLoader(
         TensorDataset(
             torch.as_tensor(train_x, dtype=torch.float32),
             torch.as_tensor(train_y, dtype=torch.float32),
         ),
-        batch_size=int(training["batch_size"]),
+        batch_size=batch_size,
         shuffle=True,
-        drop_last=True,
+        drop_last=n_train > batch_size,
         generator=torch.Generator().manual_seed(seed),
     )
     optimizer = torch.optim.Adam(
@@ -283,6 +287,10 @@ def train_model(
             loss.backward()
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
+        if not losses:
+            raise RuntimeError(
+                f"No training batches produced (n={n_train}, batch_size={batch_size})"
+            )
         score = 0.0
         if valid_x is not None and valid_y is not None:
             model.eval()
