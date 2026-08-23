@@ -46,6 +46,7 @@ def derive_seed(
     fold_id: int = 0,
     trial_id: int = 0,
     inner_fold_id: int = 0,
+    *extra: int,
 ) -> int:
     """Derive a stable 31-bit seed from nested-CV coordinates."""
     coordinates = (
@@ -53,6 +54,7 @@ def derive_seed(
         int(fold_id),
         int(trial_id),
         int(inner_fold_id),
+        *map(int, extra),
     )
     digest = hashlib.blake2b(
         ":".join(map(str, coordinates)).encode("ascii"),

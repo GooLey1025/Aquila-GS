@@ -79,7 +79,7 @@ cd ../MENET
 
 cd ../DEM
 /usr/bin/time -v -o $COHORT.DEM-SNP.time.txt python DEM_train_benchmark.py \
-  --data-dir ../$COHORT.snp.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/DEM-SNP_nested_cv.yaml \
   --output-dir results/DEM-SNP/$COHORT \
   --jobs-per-gpu 2
