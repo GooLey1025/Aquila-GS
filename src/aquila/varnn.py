@@ -52,23 +52,29 @@ class VariantsNeuralNetwork(nn.Module):
     def build_model(self):
         """Build model dynamically from trunk and head configs."""
         # Build embedder if specified (can be a single block or list of blocks)
+        self.embedder_save_as: list[str | None] = []
         if 'embedder' in self.params:
             embedder_config = self.params['embedder']
             if isinstance(embedder_config, list):
-                # Multiple embedder blocks
                 self.embedder = nn.ModuleList()
                 for block_params in embedder_config:
-                    self.embedder.append(self.build_block(block_params))
+                    cleaned, save_as = self._split_save_as(block_params)
+                    self.embedder_save_as.append(save_as)
+                    self.embedder.append(self.build_block(cleaned))
             else:
-                # Single embedder block
-                self.embedder = self.build_block(embedder_config)
+                cleaned, save_as = self._split_save_as(embedder_config)
+                self.embedder_save_as.append(save_as)
+                self.embedder = self.build_block(cleaned)
         else:
             self.embedder = None
         
         # Build trunk blocks
         self.trunk_blocks = nn.ModuleList()
+        self.trunk_save_as: list[str | None] = []
         for block_params in self.params.get('trunk', []):
-            self.trunk_blocks.append(self.build_block(block_params))
+            cleaned, save_as = self._split_save_as(block_params)
+            self.trunk_save_as.append(save_as)
+            self.trunk_blocks.append(self.build_block(cleaned))
         
         # Build head blocks
         self.head_blocks = nn.ModuleDict()
@@ -86,6 +92,32 @@ class VariantsNeuralNetwork(nn.Module):
         if self.params.get('verbose', False):
             print(f"Built model with {len(self.trunk_blocks)} trunk blocks and {len(self.head_blocks)} heads")
     
+    @staticmethod
+    def _split_save_as(block_params):
+        if not isinstance(block_params, dict):
+            raise ValueError(f"Block params must be dict, got {type(block_params)}")
+        cleaned = block_params.copy()
+        save_as = cleaned.pop('save_as', None)
+        return cleaned, save_as
+
+    def _run_trunk_block(self, block, current, mask, saved):
+        from aquila.blocks import SkipFusePool, SkipFuseSeq
+
+        if isinstance(block, (SkipFuseSeq, SkipFusePool)):
+            if block.source not in saved:
+                raise KeyError(
+                    f"SkipFuse source '{block.source}' was not saved. "
+                    f"Available: {sorted(saved)}"
+                )
+            fused = block(current, saved[block.source], mask=mask)
+            return fused, mask
+        if self._block_accepts_mask(block):
+            result = block(current, mask=mask)
+            if isinstance(result, tuple):
+                return result
+            return result, mask
+        return block(current), mask
+
     def build_block(self, block_params):
         """Build a single block from parameters.
         
@@ -97,6 +129,7 @@ class VariantsNeuralNetwork(nn.Module):
         """
         if isinstance(block_params, dict):
             block_params = block_params.copy()
+            block_params.pop('save_as', None)
             block_name = block_params.pop('name')
         else:
             raise ValueError(f"Block params must be dict, got {type(block_params)}")
@@ -147,42 +180,37 @@ class VariantsNeuralNetwork(nn.Module):
         else:
             raise ValueError(f"Unexpected input shape: {x.shape}")
         
+        saved: Dict[str, torch.Tensor] = {}
         # Embedder (can be single block or ModuleList)
         if self.embedder is not None:
             if isinstance(self.embedder, nn.ModuleList):
-                # Multiple embedder blocks: apply sequentially
                 current = x
-                for embedder_block in self.embedder:
+                for embedder_block, save_as in zip(self.embedder, self.embedder_save_as):
                     result = embedder_block(current)
-                    # Handle blocks that return (output, mask) tuple
                     if isinstance(result, tuple):
                         current, mask = result
                     else:
                         current = result
+                    if save_as:
+                        saved[save_as] = current
             else:
-                # Single embedder block
                 result = self.embedder(x)
-                # Handle blocks that return (output, mask) tuple
                 if isinstance(result, tuple):
                     current, mask = result
                 else:
                     current = result
+                for save_as in self.embedder_save_as:
+                    if save_as:
+                        saved[save_as] = current
         else:
-            # If no embedder specified, assume x is already embedded
             current = x
         
         # Trunk blocks
-        for block in self.trunk_blocks:
-            # Check if block accepts mask argument
-            if self._block_accepts_mask(block):
-                result = block(current, mask=mask)
-                # Handle blocks that return (output, mask) tuple
-                if isinstance(result, tuple):
-                    current, mask = result
-                else:
-                    current = result
-            else:
-                current = block(current)
+        trunk_saves = getattr(self, "trunk_save_as", [None] * len(self.trunk_blocks))
+        for block, save_as in zip(self.trunk_blocks, trunk_saves):
+            current, mask = self._run_trunk_block(block, current, mask, saved)
+            if save_as:
+                saved[save_as] = current
         
         # Save trunk output for embeddings
         trunk_output = current

@@ -3214,6 +3214,105 @@ def multi_head_pool(d_model, num_heads=4, dropout=0.1, pool_axis=1,
     )
 
 
+def _match_seq_len(current: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+    """Align skip sequence length to current by linear interpolation if needed."""
+    cur_len = current.size(1)
+    skip_len = skip.size(1)
+    if skip_len == cur_len:
+        return skip
+    if skip.ndim == 3:
+        aligned = F.interpolate(
+            skip.transpose(1, 2), size=cur_len, mode="linear", align_corners=False
+        )
+        return aligned.transpose(1, 2)
+    aligned = F.interpolate(
+        skip.unsqueeze(1), size=cur_len, mode="linear", align_corners=False
+    )
+    return aligned.squeeze(1)
+
+
+def _build_skip_align(align, kwargs):
+    if not align:
+        return None
+    if align != "std_down_conv_tower":
+        raise ValueError(
+            f"Unsupported skip align '{align}'. Use 'std_down_conv_tower' or omit."
+        )
+    from aquila.blocks_v2 import std_down_conv_tower
+
+    tower_keys = {
+        "in_channels",
+        "out_channels",
+        "kernel_size",
+        "dropout",
+        "residual",
+        "repeat",
+        "seq_len_threshold",
+        "gain",
+        "bn_momentum",
+    }
+    tower_kwargs = {key: kwargs[key] for key in tower_keys if key in kwargs}
+    return std_down_conv_tower(**tower_kwargs)
+
+
+class SkipFuseSeq(nn.Module):
+    """Add a saved activation onto the current ``(B, L, D)`` stream (SkipFuse-seq)."""
+
+    def __init__(self, source, align=None):
+        super().__init__()
+        self.source = str(source)
+        self.align = align
+
+    def forward(self, current, skip, mask=None):
+        if self.align is not None:
+            result = self.align(skip, mask) if mask is not None else self.align(skip)
+            skip = result[0] if isinstance(result, tuple) else result
+        return current + _match_seq_len(current, skip)
+
+
+class SkipFusePool(nn.Module):
+    """Pool a saved activation and add it to the current ``(B, L)`` stream."""
+
+    def __init__(self, source, pool, align=None):
+        super().__init__()
+        self.source = str(source)
+        self.align = align
+        self.pool = pool
+
+    def forward(self, current, skip, mask=None):
+        if self.align is not None:
+            result = self.align(skip, mask) if mask is not None else self.align(skip)
+            skip = result[0] if isinstance(result, tuple) else result
+        if skip.ndim == 3:
+            skip = _match_seq_len(current.unsqueeze(-1), skip)
+        pooled = self.pool(skip)
+        if isinstance(pooled, tuple):
+            pooled = pooled[0]
+        return current + _match_seq_len(current, pooled)
+
+
+def skip_fuse_seq(source, align=None, **kwargs):
+    """Residual-add a saved tensor onto the pre-pool sequence embedding."""
+    return SkipFuseSeq(source=source, align=_build_skip_align(align, kwargs))
+
+
+def skip_fuse_pool(source, align=None, d_model=256, num_heads=4, pool_axis=2,
+                   dropout=0.1, attn_normalize="softmax", **kwargs):
+    """Pool a saved tensor and residual-add onto the post-pool 1D embedding."""
+    pool = layers.MultiHeadPooling(
+        d_model=d_model,
+        num_heads=num_heads,
+        dropout=dropout,
+        pool_axis=pool_axis,
+        attn_normalize=attn_normalize,
+    )
+    return SkipFusePool(
+        source=source,
+        pool=pool,
+        align=_build_skip_align(align, kwargs),
+    )
+
+
 def learnable_query_pool(d_model, num_queries=1, num_layers=2, dropout=0.1, pool_axis=1, **kwargs):
     """Learnable query pooling block (Set2Set style).
 
@@ -4494,6 +4593,8 @@ name_func = {
     # Pooling
     'global_pool': global_pool,
     'multi_head_pool': multi_head_pool,
+    'skip_fuse_seq': skip_fuse_seq,
+    'skip_fuse_pool': skip_fuse_pool,
     'learnable_query_pool': learnable_query_pool,
     'hierarchical_pool': hierarchical_pool,
     'transformer_pool': transformer_pool,
