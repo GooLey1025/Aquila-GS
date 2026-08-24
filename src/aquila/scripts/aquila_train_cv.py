@@ -25,6 +25,11 @@ from aquila.data.cv import load_fold_indices, parse_fold_selector
 from aquila.data.dataset import PreparedData, load_prepared_data
 from aquila.data.preprocessing import PerTraitPreprocessor
 from aquila.models.registry import create_model
+from aquila.training.cuda_runtime import (
+    configure_cuda_runtime,
+    resolve_train_deterministic,
+    train_deterministic_enabled,
+)
 from aquila.training.distributed import (
     FoldJob,
     FoldJobResult,
@@ -46,7 +51,7 @@ from aquila.training.hpo import (
     run_hpo,
     select_best_candidate,
 )
-from aquila.training.trainer import NestedCVTrainer
+from aquila.training.trainer import NestedCVTrainer, set_training_seed
 from aquila.utils import load_config
 
 
@@ -172,6 +177,15 @@ def parse_args() -> argparse.Namespace:
             "(overrides train.live_metrics_log=false in the config)."
         ),
     )
+    parser.add_argument(
+        "--use-deterministic",
+        action="store_true",
+        help=(
+            "Use CUDA deterministic algorithms, overriding train.deterministic "
+            "in the YAML. Omitted: use YAML (default false). Typically "
+            "10-30 percent slower."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -266,6 +280,23 @@ def _make_model(
         seq_length=_sequence_lengths(prepared_data.features),
         regression_tasks=list(regression_tasks),
         classification_tasks=list(classification_tasks or []),
+    )
+
+
+def _make_seeded_model(
+    config: Mapping[str, Any],
+    prepared_data: PreparedData,
+    regression_tasks: Sequence[str],
+    classification_tasks: Sequence[str] | None,
+    seed: int,
+) -> torch.nn.Module:
+    """Build a model after seeding so init does not inherit the worker RNG."""
+    set_training_seed(int(seed))
+    return _make_model(
+        config,
+        prepared_data,
+        regression_tasks,
+        classification_tasks,
     )
 
 
@@ -466,11 +497,12 @@ def _train_inner_fold(
     )
     inner_seed = derive_seed(worker_seed, fold_id, candidate_id, inner_fold)
     trainer = NestedCVTrainer(
-        _make_model(
+        _make_seeded_model(
             candidate_config,
             prepared,
             regression_tasks,
             classification_tasks,
+            inner_seed,
         ),
         num_regression_tasks=len(regression_tasks),
         num_classification_tasks=len(classification_tasks),
@@ -499,12 +531,10 @@ def _evaluate_hpo_candidate_job(
     context: HPOCandidateContext,
 ) -> CandidateResult:
     """Spawn-safe worker: evaluate one grid candidate on all inner folds."""
-    if device.startswith("cuda:"):
-        torch.cuda.set_device(int(device.split(":", 1)[1]))
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+    configure_cuda_runtime(
+        device,
+        deterministic=train_deterministic_enabled(context.config),
+    )
 
     def run_inner(
         parameters: Mapping[str, Any],
@@ -593,6 +623,7 @@ def _run_grid_hpo_on_gpus(
         gpu_ids,
         worker_args=(worker_context,),
         raise_on_error=True,
+        deterministic=train_deterministic_enabled(context.config),
     )
     candidates = [result.value for result in work_results]
     return select_best_candidate(
@@ -602,13 +633,11 @@ def _run_grid_hpo_on_gpus(
     )
 
 
-def _configure_worker_device(device: str) -> None:
-    if device.startswith("cuda:"):
-        torch.cuda.set_device(int(device.split(":", 1)[1]))
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+def _configure_worker_device(device: str, config: Mapping[str, Any]) -> None:
+    configure_cuda_runtime(
+        device,
+        deterministic=train_deterministic_enabled(config),
+    )
 
 
 def _nested_cv_gpu_worker(
@@ -617,7 +646,7 @@ def _nested_cv_gpu_worker(
     context: NestedCVPoolContext,
 ) -> Dict[str, Any]:
     """Spawn-safe worker for one inner fold or one outer final refit."""
-    _configure_worker_device(device)
+    _configure_worker_device(device, context.config)
     worker_seed = derive_seed(context.global_seed, int(job.fold_id))
     if job.kind == "inner":
         metrics_log_path = None
@@ -798,6 +827,7 @@ def _run_pipelined_grid_cv(
         gpu_ids,
         _nested_cv_gpu_worker,
         worker_args=(pool_context,),
+        deterministic=train_deterministic_enabled(pool_context.config),
     ) as pool:
         pool.submit_many(inner_jobs)
         while len(fold_summaries) < len(selected_folds):
@@ -926,11 +956,12 @@ def _finalize_outer_fold(
     )
     final_seed = derive_seed(worker_seed, fold_id, hpo_result.best.candidate_id)
     final_trainer = NestedCVTrainer(
-        _make_model(
+        _make_seeded_model(
             selected_config,
             prepared,
             regression_tasks,
             classification_tasks,
+            final_seed,
         ),
         num_regression_tasks=len(regression_tasks),
         num_classification_tasks=len(classification_tasks),
@@ -1096,8 +1127,10 @@ def execute_outer_fold(job: FoldJob, device: str, worker_seed: int) -> Dict[str,
     # Do not create a parent CUDA context before multi-GPU HPO. An idle parent
     # context on cuda:0 otherwise depresses GPU-0 utilization in nvidia-smi.
     if device.startswith("cuda") and not parallel_grid:
-        torch.cuda.set_device(int(device.split(":", 1)[1]))
-        torch.backends.cudnn.benchmark = True
+        configure_cuda_runtime(
+            device,
+            deterministic=train_deterministic_enabled(config),
+        )
     live_metrics_log = bool(train_config.get("live_metrics_log", False))
     candidate_context = HPOCandidateContext(
         prepared_data=prepared,
@@ -1121,8 +1154,10 @@ def execute_outer_fold(job: FoldJob, device: str, worker_seed: int) -> Dict[str,
             hpo_gpu_ids,
         )
         if device.startswith("cuda"):
-            torch.cuda.set_device(int(device.split(":", 1)[1]))
-            torch.backends.cudnn.benchmark = True
+            configure_cuda_runtime(
+                device,
+                deterministic=train_deterministic_enabled(config),
+            )
     else:
         def run_inner(
             parameters: Mapping[str, Any],
@@ -1269,6 +1304,10 @@ def main() -> None:
     config = load_config(args.config)
     config.setdefault("train", {})
     config["train"]["precision"] = args.precision
+    resolve_train_deterministic(
+        config,
+        True if args.use_deterministic else None,
+    )
     if args.live_metrics_log:
         config["train"]["live_metrics_log"] = True
     if "mixed_precision" in config["train"]:
@@ -1295,6 +1334,12 @@ def main() -> None:
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
     global_seed = int(prepared.metadata["seed"])
     device = f"cuda:{gpu_ids[0]}" if gpu_ids else "cpu"
+    deterministic = train_deterministic_enabled(config)
+    if deterministic:
+        print(
+            "[INFO] CUDA deterministic algorithms enabled "
+            "(CUBLAS_WORKSPACE_CONFIG=:4096:8; typically ~10-30% slower)"
+        )
     normalized_hpo = normalize_hpo_config(config.get("hpo", {}))
     use_pipeline = bool(gpu_ids) and normalized_hpo["method"] == "grid"
 
@@ -1399,6 +1444,7 @@ def main() -> None:
         "data_dir": str(Path(args.data_dir).resolve()),
         "config": str(Path(args.config).resolve()),
         "params_yaml": str(params_copy.resolve()),
+        "deterministic": train_deterministic_enabled(config),
     }
     if failed:
         summary["failures"] = failed

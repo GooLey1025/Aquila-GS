@@ -251,6 +251,7 @@ def execute_gpu_jobs(
     worker_args: tuple[Any, ...] = (),
     start_method: str = "spawn",
     raise_on_error: bool = True,
+    deterministic: bool = False,
 ) -> list[GPUWorkResult]:
     """Run independent jobs across GPUs with dynamic scheduling.
 
@@ -278,6 +279,7 @@ def execute_gpu_jobs(
             worker_args=worker_args,
             job_id_attr=job_id_attr,
             start_method=start_method,
+            deterministic=deterministic,
         )
     results.sort(key=lambda result: result.job_id)
     failures = [result for result in results if not result.succeeded]
@@ -297,6 +299,7 @@ def _run_gpu_jobs_spawned(
     worker_args: tuple[Any, ...],
     job_id_attr: str,
     start_method: str,
+    deterministic: bool = False,
 ) -> list[GPUWorkResult]:
     context = mp.get_context(start_method)
     task_queue = context.Queue()
@@ -317,6 +320,7 @@ def _run_gpu_jobs_spawned(
                 worker,
                 worker_args,
                 job_id_attr,
+                deterministic,
             ),
         )
         process.start()
@@ -351,12 +355,11 @@ def _gpu_job_worker(
     worker: Callable[..., Any],
     worker_args: tuple[Any, ...],
     job_id_attr: str,
+    deterministic: bool = False,
 ) -> None:
-    if device.startswith("cuda:"):
-        import torch
+    from aquila.training.cuda_runtime import configure_cuda_runtime
 
-        torch.cuda.set_device(int(device.split(":", 1)[1]))
-        torch.backends.cudnn.benchmark = True
+    configure_cuda_runtime(device, deterministic=bool(deterministic))
     while True:
         job = task_queue.get()
         if job is None:
@@ -402,6 +405,7 @@ class PersistentGPUPool:
         worker_args: tuple[Any, ...] = (),
         job_id_attr: str = "job_id",
         start_method: str = "spawn",
+        deterministic: bool = False,
     ) -> None:
         if not gpu_ids:
             raise ValueError("PersistentGPUPool requires at least one GPU id")
@@ -424,6 +428,7 @@ class PersistentGPUPool:
                     worker,
                     worker_args,
                     job_id_attr,
+                    bool(deterministic),
                 ),
             )
             process.start()
