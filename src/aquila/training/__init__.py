@@ -33,6 +33,7 @@ __all__ = [
     "run_bayesian_hpo",
     "run_hpo",
     "set_config_path",
+    "resolve_training_seed",
     "set_training_seed",
     "share_memory_tensors",
     "suggest_parameters",
@@ -76,6 +77,7 @@ _MODULE_EXPORTS = {
     "trainer": {
         "NestedCVTrainer",
         "TrainingResult",
+        "resolve_training_seed",
         "set_training_seed",
         "supports_bf16",
         "train_final_model",

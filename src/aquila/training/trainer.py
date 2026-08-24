@@ -48,6 +48,26 @@ def set_training_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def resolve_training_seed(
+    config: Mapping[str, Any] | None,
+    *,
+    fallback: int = 42,
+) -> int:
+    """Return the shared init/train seed for every nested-CV fit.
+
+    Preference: ``train.seed`` > ``hpo.seed`` > ``fallback`` (prepared-data seed).
+    """
+    if not config:
+        return int(fallback)
+    train = config.get("train")
+    if isinstance(train, Mapping) and train.get("seed") is not None:
+        return int(train["seed"])
+    hpo = config.get("hpo")
+    if isinstance(hpo, Mapping) and hpo.get("seed") is not None:
+        return int(hpo["seed"])
+    return int(fallback)
+
+
 def supports_bf16(device: torch.device | str) -> bool:
     """Return whether CUDA bf16 autocast is safe on the selected device."""
     resolved = torch.device(device)
@@ -189,6 +209,7 @@ class NestedCVTrainer:
                             "best_epoch": best_epoch,
                             "best_valid_r": best_score,
                             "early_stop": True,
+                            "seed": self.seed,
                         },
                     )
                     break
@@ -205,6 +226,7 @@ class NestedCVTrainer:
                     if np.isfinite(best_score)
                     else None,
                     "early_stop": False,
+                    "seed": self.seed,
                 },
             )
 

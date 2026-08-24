@@ -51,7 +51,11 @@ from aquila.training.hpo import (
     run_hpo,
     select_best_candidate,
 )
-from aquila.training.trainer import NestedCVTrainer, set_training_seed
+from aquila.training.trainer import (
+    NestedCVTrainer,
+    resolve_training_seed,
+    set_training_seed,
+)
 from aquila.utils import load_config
 
 
@@ -495,14 +499,17 @@ def _train_inner_fold(
         shuffle=False,
         **effective_loader_options,
     )
-    inner_seed = derive_seed(worker_seed, fold_id, candidate_id, inner_fold)
+    training_seed = resolve_training_seed(
+        candidate_config,
+        fallback=int(prepared.metadata.get("seed", 42)),
+    )
     trainer = NestedCVTrainer(
         _make_seeded_model(
             candidate_config,
             prepared,
             regression_tasks,
             classification_tasks,
-            inner_seed,
+            training_seed,
         ),
         num_regression_tasks=len(regression_tasks),
         num_classification_tasks=len(classification_tasks),
@@ -510,7 +517,7 @@ def _train_inner_fold(
             candidate_config,
             device,
             regression_tasks,
-            inner_seed,
+            training_seed,
         ),
     )
     return trainer.train_inner(
@@ -954,14 +961,17 @@ def _finalize_outer_fold(
         shuffle=False,
         **final_loader_options,
     )
-    final_seed = derive_seed(worker_seed, fold_id, hpo_result.best.candidate_id)
+    training_seed = resolve_training_seed(
+        selected_config,
+        fallback=int(prepared.metadata.get("seed", 42)),
+    )
     final_trainer = NestedCVTrainer(
         _make_seeded_model(
             selected_config,
             prepared,
             regression_tasks,
             classification_tasks,
-            final_seed,
+            training_seed,
         ),
         num_regression_tasks=len(regression_tasks),
         num_classification_tasks=len(classification_tasks),
@@ -969,7 +979,7 @@ def _finalize_outer_fold(
             selected_config,
             device,
             regression_tasks,
-            final_seed,
+            training_seed,
         ),
     )
     final_training = final_trainer.train_fixed_epochs(
@@ -1074,7 +1084,7 @@ def _finalize_outer_fold(
             else None
         ),
         "worker_seed": worker_seed,
-        "final_seed": final_seed,
+        "training_seed": training_seed,
         "elapsed_seconds": time.time() - started,
         "python": platform.python_version(),
         "torch": torch.__version__,
