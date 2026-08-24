@@ -1,0 +1,112 @@
+# 训练基础配置
+training:
+  random_seed: 42
+  precision: bf16-mixed  # 混合精度训练: 16, 32, 'bf16-mixed'
+  tensor_cores: 'high'  # 新增选项: 'medium'或'high'
+  accelerator: 'gpu'
+  devices: [0, 1]  # 使用的 GPU 设备列表
+  max_epochs: 200
+  accumulate_grad_batches: 1 # 梯度累积步数 (1 表示不累积)
+  gradient_clip_val: 3 # 梯度裁剪阈值 (0 表示不裁剪)
+  val_check_interval: 1
+  # --- 数据集划分配置 K折交叉验证配置 ---
+  train_ratio: 1       # 训练集比例 (0.0 到 1.0)
+  val_ratio: 0.0        # 验证集比例 (0.0 到 1.0)
+  test_ratio: 0.0       # 测试集比例 (0.0 到 1.0) - 确保三者和为 1.0
+  use_cv_folds: false    # 是否启用 K 折交叉验证 (覆盖 train/val ratio)
+  cv_n_splits: 3         # K 折的数量 (如果 use_cv_folds 为 true)
+  cv_fold_idx: 0         # 当前使用的折数索引 (0 到 cv_n_splits-1)
+
+# 梯度检查点配置（新增/修改的配置部分）
+gradient_checkpointing:
+  enabled: true  # 全局开关
+  gfi_block: true  # 开启GFIFormer块级别检查点  
+  encoder_block: true  # 开启整个encoder层级别检查点
+  self_attention: false  # 关闭自注意力内部检查点
+  cross_attention: false  # 关闭交叉注意力内部检查点
+  ffn: true  # 关闭FFN内部检查点
+  use_reentrant: false  # 使用不可重入模式（性能更好）
+  embedding_cnn_extractors: true # 新增：开启 Embedding 层中 CNN 特征提取器的检查点
+  embedding_block_pooling: true  # 新增：开启 Embedding 层中块池化的检查点
+
+# --- 新增：MIC 筛选配置 --- 
+mic_filtering:
+  enabled: false                   # 是否启用 MIC 筛选
+  mic_file_path: "/media/marxin/softs/workspace/Whisper_of_DNA_pl/data/maize1404_genotype/A_cubic_1404_mic_qc_MIC.bimmic" # <--- **需要修改为实际的 MIC 文件路径**
+  filter_ratio: [0.02, 0.02, 0.02]              # 要保留的 Top SNP 比例 (0.0 到 1.0)
+  #phenotypes_to_consider: ["env1", "env2", "env3", "env4"] # 可选：指定用于筛选的表型，默认使用模型输出的所有表型
+
+# 数据加载配置
+data:
+  batch_size: 80       # 训练批次大小
+  val_batch_size: 64    # 新增：验证和 Sanity Check 批次大小
+  num_workers: 8
+  pin_memory: true
+  shuffle: true
+  include_position_embedding: true
+  data_path: "/media/marxin/softs/workspace/Whisper_of_DNA_pl/output/maize1404_test_memory/maize1404_preprocessed_newtry.h5"  # 预处理后数据存放路径
+  genotype_csv_path: "/media/marxin/softs/workspace/Whisper_of_DNA_pl/data/example-data/wheat599/SNP_pca/wheat599_pc95.csv"   # <-- 新增：指定基因型CSV文件路径
+  phenotype_csv_path: "/media/marxin/softs/workspace/Whisper_of_DNA_pl/data/example-data/wheat599/SNP_pca/wheatY.csv" # <-- 新增：指定表型CSV文件路径
+  normalize_position: false # 是否对位置编码进行归一化 (Dataset 参数)
+  normalize_snp: false     # SNP已经是独热编码，通常不需要再归一化 (Dataset 参数)
+  normalize_phenotype: true # 是否对表型进行归一化 (Dataset 参数)
+  position_encoding_method: "transformer" # 位置编码归一化方法 (Dataset 参数)
+  phenotype_norm_method: "minmax" # 表型归一化方法 (Dataset 参数) standard minmax
+
+# 优化器配置
+optimizer:
+  type: 'lion'  # 'adam', 'adamw', 'sgd', 'lion'
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  
+# 学习率调度器配置
+scheduler:
+  type: 'cosine'  # 'cosine', 'cosine_warm_restarts', 'step', 'reduce_on_plateau'
+  cosine:
+    t_max: 200
+    eta_min: 1.0e-6
+  cosine_warm_restarts:
+    T_0: 15      # 第一个周期的长度 (steps or epochs, depends on interval)
+    T_mult: 3     # 周期长度乘数 (T_i = T_0 * T_mult**(i-1))
+    eta_min: 1.0e-7 # 最小学习率
+  step:
+    step_size: 10
+    gamma: 0.1
+  reduce_on_plateau:
+    patience: 10
+    factor: 0.5
+    
+# 检查点配置
+checkpoint:
+  save_top_k: 3
+  monitor: 'train_pw_loss'
+  mode: 'min'
+  every_n_epochs: 1
+  dirpath: '/media/marxin/softs/workspace/Whisper_of_DNA_pl/output/checkpoints_wheatpca_599_envall_pretrain'
+  filename: '{epoch}-{val_loss:.4f}'
+  save_last: true  # 保存最后一个模型，便于恢复训练
+  
+# 早停配置
+early_stopping:
+  enabled: true
+  monitor: 'train_pw_loss'
+  patience: 100
+  mode: 'min'
+  min_delta: 0.00001
+  verbose: true                    # <-- 新增: 打印早停信息
+  
+# 日志配置
+logging:
+  log_every_n_steps: 3
+  logger: 'tensorboard'  # 'tensorboard', 'wandb'
+  project_name: 'DNAWhisperpretrain'
+  experiment_name: 'run0_wheatpca_599_envall_30k'
+  save_dir: 'logs0/'
+  log_gradient_norms: true  # <--- 新增：是否记录梯度范数
+  gradient_norm_log_interval: 5 # <--- 新增：梯度范数记录频率 (每 N 步)
+
+# 动态训练优化器配置
+dynamic_optimizer:
+  enabled: false
+  min_throughput_ratio: 0.95
+  max_accumulate_grad_batches: 16
