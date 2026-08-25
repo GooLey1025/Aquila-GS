@@ -40,7 +40,8 @@ class GFIFormerBlock(nn.Module):
     def __init__(self,
                  input_dim: int,
                  block_config: Dict[str, Any],
-                 random_seed: Optional[int] = None):
+                 random_seed: Optional[int] = None,
+                 phenotype_dim: Optional[int] = None):
         super().__init__()
         self.input_dim = input_dim
         self.block_config = block_config
@@ -133,16 +134,27 @@ class GFIFormerBlock(nn.Module):
         self.pooling: BasePooling = create_pooling_from_config(pooling_config_copy)
 
         # 3. Auxiliary Supervision FFN
+        # DS 输出维跟随 output_layer.phenotype_dim（由性状列表决定），
+        # 不把 MoE expert 数当成表型数。expert 数与表型数相同时保持上游逐 expert 一头。
+        resolved_phenotype_dim = phenotype_dim
+        if resolved_phenotype_dim is None:
+            resolved_phenotype_dim = block_config.get("phenotype_dim")
+        self.aux_phenotype_dim = int(
+            resolved_phenotype_dim if resolved_phenotype_dim is not None else self.num_experts
+        )
+        if self.aux_phenotype_dim <= 0:
+            raise ValueError(f"Block '{self.name}': phenotype_dim must be a positive integer.")
+        self.use_per_expert_aux = self.num_experts == self.aux_phenotype_dim
         aux_ffn_expansion_factor = moe_config.get("aux_ffn_expansion_factor", 4)
         aux_hidden_dim = self.experts_dims * aux_ffn_expansion_factor
         self.norm_before_aux_ffn = GlobalContextLayerNorm(self.experts_dims)
-        if self.num_experts == 1:
+        if self.use_per_expert_aux and self.num_experts == 1:
             self.aux_loss_ffn = nn.Sequential(
                 nn.Linear(self.experts_dims, aux_hidden_dim),
                 nn.Tanh(),
                 nn.Linear(aux_hidden_dim, 1)
             )
-        else:
+        elif self.use_per_expert_aux:
             self.aux_loss_ffns = nn.ModuleList()
             for _ in range(self.num_experts):
                 self.aux_loss_ffns.append(
@@ -152,6 +164,12 @@ class GFIFormerBlock(nn.Module):
                         nn.Linear(aux_hidden_dim, 1)
                     )
                 )
+        else:
+            self.aux_loss_ffn = nn.Sequential(
+                nn.Linear(self.experts_dims, aux_hidden_dim),
+                nn.Tanh(),
+                nn.Linear(aux_hidden_dim, self.aux_phenotype_dim),
+            )
         if hasattr(self, 'aux_loss_projection_layer'):
             del self.aux_loss_projection_layer
         if hasattr(self, 'aux_loss_projection_layers'):
@@ -288,19 +306,27 @@ class GFIFormerBlock(nn.Module):
 
         aux_loss_projections = None
         if self.training:
-            if self.num_experts == 1:
-                input_for_aux_ffn = pooled_output.squeeze(1) 
+            if self.use_per_expert_aux and self.num_experts == 1:
+                input_for_aux_ffn = pooled_output.squeeze(1)
                 input_for_aux_ffn = self.norm_before_aux_ffn(input_for_aux_ffn, batch_size=batch_size, num_blocks=num_blocks, mask=None)
-                aux_proj_flat = self.aux_loss_ffn(input_for_aux_ffn) 
-                aux_loss_projections = aux_proj_flat.unsqueeze(1) 
-            else: 
+                aux_proj_flat = self.aux_loss_ffn(input_for_aux_ffn)
+                aux_loss_projections = aux_proj_flat.unsqueeze(1)
+            elif self.use_per_expert_aux:
                 expert_aux_projections_list = []
                 for i_expert in range(self.num_experts):
-                    features_for_expert_i = pooled_output[:, i_expert, :] 
+                    features_for_expert_i = pooled_output[:, i_expert, :]
                     features_for_expert_i = self.norm_before_aux_ffn(features_for_expert_i, batch_size=batch_size, num_blocks=num_blocks, mask=None)
-                    proj_for_expert_i = self.aux_loss_ffns[i_expert](features_for_expert_i) 
+                    proj_for_expert_i = self.aux_loss_ffns[i_expert](features_for_expert_i)
                     expert_aux_projections_list.append(proj_for_expert_i)
-                aux_loss_projections = torch.stack(expert_aux_projections_list, dim=1) 
+                aux_loss_projections = torch.stack(expert_aux_projections_list, dim=1)
+            else:
+                if self.num_experts == 1:
+                    input_for_aux_ffn = pooled_output.squeeze(1)
+                else:
+                    input_for_aux_ffn = pooled_output.mean(dim=1)
+                input_for_aux_ffn = self.norm_before_aux_ffn(input_for_aux_ffn, batch_size=batch_size, num_blocks=num_blocks, mask=None)
+                aux_proj_flat = self.aux_loss_ffn(input_for_aux_ffn)
+                aux_loss_projections = aux_proj_flat.unsqueeze(-1) 
 
         output_features = pooled_output
 
@@ -333,6 +359,11 @@ class GFIFormer(nn.Module):
         self.use_gfi_block_checkpointing = gradient_checkpointing_config.get("gfi_block", True)
         self.use_reentrant = gradient_checkpointing_config.get("use_reentrant", False)
 
+        output_config = config.get("output_layer", {})
+        self.phenotype_dim = output_config.get("phenotype_dim")
+        if self.phenotype_dim is None:
+             raise ValueError("Output layer config requires 'phenotype_dim'.")
+
         self.gfi_blocks = nn.ModuleList()
         self.pre_block_sequence_norms = nn.ModuleList() # 新增: 用于块前序列InstanceNorm
         current_block_input_dim = self.input_dim
@@ -341,6 +372,7 @@ class GFIFormer(nn.Module):
         for i in range(self.num_blocks): # MODIFIED: Changed from num_gfi_blocks to num_blocks
             block_config = blocks[i]
             block_config["gradient_checkpointing"] = gradient_checkpointing_config
+            block_config.setdefault("phenotype_dim", self.phenotype_dim)
 
             self.pre_block_sequence_norms.append(
                 nn.InstanceNorm1d(current_block_input_dim, affine=True)
@@ -349,18 +381,14 @@ class GFIFormer(nn.Module):
             gfi_block = GFIFormerBlock(
                 input_dim=current_block_input_dim, 
                 block_config=block_config,
-                random_seed=random_seed
+                random_seed=random_seed,
+                phenotype_dim=self.phenotype_dim,
             )
             self.gfi_blocks.append(gfi_block)
             current_block_input_dim = gfi_block.block_output_dim
             self.block_output_dims.append(current_block_input_dim)
 
         self.final_output_dim = current_block_input_dim 
-
-        output_config = config.get("output_layer", {})
-        self.phenotype_dim = output_config.get("phenotype_dim")
-        if self.phenotype_dim is None:
-             raise ValueError("Output layer config requires 'phenotype_dim'.")
 
         print(f"梯度检查点启用状态: {self.use_gradient_checkpointing}")
         print(f"GFIFormer 最终输出维度 (E*D_moe_last): {self.final_output_dim}")

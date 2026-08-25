@@ -129,7 +129,11 @@ def apply_candidate_overrides(
     parameters: Mapping[str, Any],
     trait_names: Sequence[str],
 ) -> dict[str, Any]:
-    """Apply all benchmark model overrides to a deep-copied upstream config."""
+    """Apply all benchmark model overrides to a deep-copied upstream config.
+
+    Trait count is taken from ``trait_names`` and written to both the output
+    layer and each GFI block so Deep Supervision heads match the data.
+    """
     if isinstance(trait_names, str):
         names = (trait_names,)
     else:
@@ -144,15 +148,17 @@ def apply_candidate_overrides(
             config["GFI_FormerBLOCKS"]["blocks"][0]["encoder"]["num_layers"],
         )
     )
+    phenotype_dim = len(names)
     config["embedding"]["input_type"] = "SNP"
     config["embedding"]["input_dims"] = 10
     config["embedding"]["dropout_rate"] = dropout
-    config["output_layer"]["phenotype_dim"] = len(names)
+    config["output_layer"]["phenotype_dim"] = phenotype_dim
     config["output_layer"]["phenotype_name"] = list(names)
     config["output_layer"]["dropout_rate"] = dropout
     for block in config["GFI_FormerBLOCKS"]["blocks"][
         : config["GFI_FormerBLOCKS"]["num_blocks"]
     ]:
+        block["phenotype_dim"] = phenotype_dim
         block["encoder"]["num_layers"] = layers
         block["encoder"]["attention"]["dropout_rate"] = dropout
         block["encoder"]["dropout_rate"] = dropout

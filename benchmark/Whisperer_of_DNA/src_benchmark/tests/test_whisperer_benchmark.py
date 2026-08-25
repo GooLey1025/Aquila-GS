@@ -264,11 +264,23 @@ def test_dropout_and_encoder_override_are_uniform() -> None:
     assert updated["loss_config"]["auxiliary_losses"]["PWCosSim"]["enabled"] is False
     assert updated["loss_config"]["auxiliary_losses"]["correlation"]["enabled"] is False
     for block in updated["GFI_FormerBLOCKS"]["blocks"][:2]:
+        assert block["phenotype_dim"] == 2
         assert block["encoder"]["num_layers"] == 6
         assert block["encoder"]["attention"]["dropout_rate"] == 0.2
         assert block["decoder"]["cross_attention"]["dropout_rate"] == 0.2
         assert block["decoder"]["MOE"]["dropout_rate"] == 0.2
         assert block["decoder"]["pooling"]["dropout_rate"] == 0.2
+
+
+def test_phenotype_dim_follows_trait_list() -> None:
+    model_path = WHISPERER_DIRECTORY / "training" / "config" / "model_config.json"
+    base = json.loads(model_path.read_text(encoding="utf-8"))
+    names = tuple(f"Trait{index}" for index in range(7))
+    updated = apply_candidate_overrides(base, {}, names)
+    assert updated["output_layer"]["phenotype_dim"] == len(names)
+    assert updated["output_layer"]["phenotype_name"] == list(names)
+    for block in updated["GFI_FormerBLOCKS"]["blocks"][:2]:
+        assert block["phenotype_dim"] == len(names)
 
 
 def test_inverse_transform_and_two_scale_metrics() -> None:
