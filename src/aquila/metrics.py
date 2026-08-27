@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import Dict, List, Optional, Tuple
+from aquila.training.evaluator import _within_accession_pearson
 from sklearn.metrics import (
     mean_squared_error, mean_absolute_error, r2_score,
     accuracy_score, precision_score, recall_score, f1_score,
@@ -315,6 +316,10 @@ class MetricsCalculator:
                 [metrics.get(f'task_{i}_r2', 0) for i in range(n_tasks)])
             metrics['avg_pearson'] = np.mean(
                 [metrics.get(f'task_{i}_pearson', 0) for i in range(n_tasks)])
+
+        within = _within_accession_pearson(predictions, targets, mask)
+        metrics['avg_within_accession_pearson'] = within['mean']
+        metrics['n_accessions_within_accession'] = within['n_accessions']
 
         return metrics
 

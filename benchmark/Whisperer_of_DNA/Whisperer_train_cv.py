@@ -191,10 +191,14 @@ def _slice_scale(scale: Mapping[str, Any], trait_name: str) -> dict[str, Any]:
             "mae": per_trait["mae"],
             "n_traits": 1,
             "n_observations": per_trait["n"],
+            "within_accession_pearson": float("nan"),
+            "n_accessions_within_accession": 0,
         },
     }
     for metric_name in ("pearson", "r2", "mse", "rmse", "mae"):
         sliced[f"avg_{metric_name}"] = per_trait[metric_name]
+    sliced["avg_within_accession_pearson"] = float("nan")
+    sliced["n_accessions_within_accession"] = 0
     return sliced
 
 

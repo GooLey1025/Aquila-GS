@@ -249,7 +249,6 @@ class GFIFormerBlock(nn.Module):
         normed_value_source = self.norm_cross_attn(value_source_for_cross_attn, batch_size=batch_size, num_blocks=num_blocks, mask=mask)
 
         cross_output = None
-        cross_attn_weights = None
         cross_attn_mask_for_call = mask 
         if self.training and self.use_gradient_checkpointing and self.use_cross_attention_checkpointing:
              cross_output = checkpoint(
@@ -262,7 +261,7 @@ class GFIFormerBlock(nn.Module):
                  preserve_rng_state=True
              )
         else:
-             cross_output, cross_attn_weights = self.cross_attention(
+             cross_output, _ = self.cross_attention(
                  query=normed_encoder_output,
                  key=normed_encoder_output, 
                  value=normed_value_source,
@@ -329,13 +328,7 @@ class GFIFormerBlock(nn.Module):
                 aux_loss_projections = aux_proj_flat.unsqueeze(-1) 
 
         output_features = pooled_output
-
-        weights_dict = {}
-        if not self.training:
-             weights_dict['cross_attention'] = cross_attn_weights
-             weights_dict['pooling'] = pooling_return[1] if len(pooling_return) > 1 else None
-
-        return output_features, aux_loss_projections, weights_dict
+        return output_features, aux_loss_projections, {}
 
 
 class GFIFormer(nn.Module):
@@ -400,7 +393,6 @@ class GFIFormer(nn.Module):
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[List[torch.Tensor], List[Optional[torch.Tensor]], List[Dict[str, Optional[torch.Tensor]]]]:
         all_block_features: List[torch.Tensor] = []
         all_aux_projections: List[Optional[torch.Tensor]] = []
-        attention_weights_list: List[Dict[str, Optional[torch.Tensor]]] = []
 
         true_batch_size, current_seq_len, current_dim = x.shape
         current_input = x
@@ -475,7 +467,7 @@ class GFIFormer(nn.Module):
             else:
                 block_output_tuple = gfi_block(parallel_input, parallel_mask, true_batch_size, num_blocks_for_this_layer)
 
-            block_output_features, aux_projections_flat, attention_weights = block_output_tuple
+            block_output_features, aux_projections_flat, _ = block_output_tuple
             
             reshaped_features = block_output_features.view(
                 true_batch_size, num_blocks_for_this_layer, gfi_block.num_experts, gfi_block.experts_dims
@@ -499,13 +491,7 @@ class GFIFormer(nn.Module):
                 del parallel_mask
             del block_output_features 
 
-            if not self.training and attention_weights:
-                 attention_weights_list.append(attention_weights)
-
-        if self.training or not attention_weights_list:
-            attention_weights_list = [{} for _ in self.gfi_blocks]
-
-        return all_block_features, all_aux_projections, attention_weights_list
+        return all_block_features, all_aux_projections, [{} for _ in self.gfi_blocks]
 
 
 class DNAWhisperModel(nn.Module):
@@ -575,20 +561,15 @@ class DNAWhisperModel(nn.Module):
         embedding_outputs = self.embedding(x)
         embed_features = embedding_outputs[0]
         embed_aux_proj = embedding_outputs[1]
-        emb_pool_weights_from_layer = None
         num_emb_blocks_from_layer = 1
-
-        if len(embedding_outputs) > 2:
-            emb_pool_weights_from_layer = embedding_outputs[2]
         if len(embedding_outputs) > 3:
             num_emb_blocks_from_layer = embedding_outputs[3]
 
         if self.gfi_former is None:
             gfi_block_features_list: List[torch.Tensor] = []
             gfi_aux_proj_list: List[Optional[torch.Tensor]] = []
-            attention_weights_list_raw: List[Dict[str, Optional[torch.Tensor]]] = [{} for _ in range(0)]
         else:
-            gfi_block_features_list, gfi_aux_proj_list, attention_weights_list_raw = self.gfi_former(embed_features, mask)
+            gfi_block_features_list, gfi_aux_proj_list, _ = self.gfi_former(embed_features, mask)
  
         if not gfi_block_features_list:
             if self.gfi_former.num_blocks > 0: # MODIFIED: Changed from num_gfi_blocks to num_blocks
@@ -601,17 +582,13 @@ class DNAWhisperModel(nn.Module):
             output_layer_input = output_layer_input.mean(dim=1)
         final_pred = self.output_layer(output_layer_input)
 
-        outputs_dict = {
+        return {
             'final_pred': final_pred,
             'embed_features': embed_features,
             'gfi_block_features': gfi_block_features_list,
             'embed_aux_proj': embed_aux_proj,
             'gfi_aux_projections': gfi_aux_proj_list,
-            'attention_weights_full': attention_weights_list_raw if not self.training else [{} for _ in range(getattr(self.gfi_former, 'num_blocks', 0))],
+            'attention_weights_full': [{} for _ in range(getattr(self.gfi_former, 'num_blocks', 0) if self.gfi_former is not None else 0)],
+            'embedding_pooling_weights': None,
+            'num_embedding_blocks': num_emb_blocks_from_layer,
         }
-
-        if not self.training:
-            outputs_dict['embedding_pooling_weights'] = emb_pool_weights_from_layer
-            outputs_dict['num_embedding_blocks'] = num_emb_blocks_from_layer
-        
-        return outputs_dict

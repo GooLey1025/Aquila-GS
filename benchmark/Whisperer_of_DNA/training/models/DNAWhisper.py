@@ -452,54 +452,114 @@ class DNAWhisper(pl.LightningModule):
              warnings.warn(f"Unsupported loss type: {loss_type}. Using MSE with reduction={reduction}.")
              return partial(self._mse_loss, reduction=reduction)
 
-    def _log_cosh_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    def _zero_like_loss(self, y_pred: torch.Tensor) -> torch.Tensor:
+        return y_pred.sum() * 0.0
+
+    def _select_observed(
+        self,
+        y_pred: torch.Tensor,
+        y_true: torch.Tensor,
+        observation_mask: Optional[torch.Tensor],
+        column: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if observation_mask is None:
+            return y_pred[:, column], y_true[:, column]
+        valid = observation_mask[:, column]
+        return y_pred[valid, column], y_true[valid, column]
+
+    def _log_cosh_loss(
+        self,
+        y_pred: torch.Tensor,
+        y_true: torch.Tensor,
+        observation_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         diff = y_pred - y_true
         loss = torch.log(torch.cosh(diff) + 1e-12)
-        return torch.mean(loss) # LogCosh typically uses mean reduction
+        if observation_mask is None:
+            return torch.mean(loss)
+        valid = observation_mask.bool()
+        if not valid.any():
+            return self._zero_like_loss(y_pred)
+        return loss[valid].mean()
 
-    def _mse_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor, reduction: str) -> torch.Tensor:
+    def _mse_loss(
+        self,
+        y_pred: torch.Tensor,
+        y_true: torch.Tensor,
+        reduction: str,
+        observation_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Calculates the Mean Squared Error loss with configurable reduction."""
         if y_pred.shape != y_true.shape:
              raise ValueError(f"MSE Loss: Shape mismatch between prediction {y_pred.shape} and target {y_true.shape}")
 
         loss = F.mse_loss(y_pred, y_true, reduction='none') # Calculate element-wise loss first
+        valid = None if observation_mask is None else observation_mask.bool()
+        if valid is not None and valid.shape != loss.shape:
+            raise ValueError(
+                f"MSE Loss: Observation mask shape {valid.shape} does not match {loss.shape}"
+            )
 
         if reduction == "minimax":
-            # Maximize the minimum loss across phenotypes (per sample), then average over batch
-            loss_per_phenotype = loss.mean(dim=0) # Average over batch first [E]
-            return loss_per_phenotype.max() # Maximize the average loss across phenotypes
-        elif reduction == "mean":
-            return loss.mean() # Average over all elements
-        else: # Default to mean if reduction is unknown
-             warnings.warn(f"Unsupported MSE reduction: {reduction}. Using 'mean'.")
-             return loss.mean()
+            per_phenotype = []
+            for index in range(loss.shape[1]):
+                column = loss[:, index]
+                if valid is None:
+                    per_phenotype.append(column.mean())
+                    continue
+                observed = valid[:, index]
+                if observed.any():
+                    per_phenotype.append(column[observed].mean())
+            if not per_phenotype:
+                return self._zero_like_loss(y_pred)
+            return torch.stack(per_phenotype).max()
+        if valid is not None:
+            if not valid.any():
+                return self._zero_like_loss(y_pred)
+            return loss[valid].mean()
+        if reduction == "mean":
+            return loss.mean()
+        warnings.warn(f"Unsupported MSE reduction: {reduction}. Using 'mean'.")
+        return loss.mean()
 
 
-    def _pearson_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor, pearson_factor: float, reduction: str, eps: float = 1e-9) -> torch.Tensor:
+    def _pearson_loss(
+        self,
+        y_pred: torch.Tensor,
+        y_true: torch.Tensor,
+        pearson_factor: float,
+        reduction: str,
+        eps: float = 1e-9,
+        observation_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Calculates a loss based on the Pearson correlation coefficient with configurable reduction.
         Aims to maximize correlation (minimize 1-correlation). Operates per phenotype.
+        Missing labels are excluded when ``observation_mask`` is provided.
         """
-        if y_pred.shape[0] <= 1:
-            return torch.tensor(0.0, device=y_pred.device, requires_grad=y_pred.requires_grad) # Cannot compute correlation for batch size <= 1
         if pearson_factor == 0:
-             return torch.tensor(0.0, device=y_pred.device, requires_grad=y_pred.requires_grad) # No Pearson loss if factor is 0
+             return self._zero_like_loss(y_pred)
         if y_pred.shape != y_true.shape:
              raise ValueError(f"Pearson Loss: Shape mismatch between prediction {y_pred.shape} and target {y_true.shape}")
         if y_pred.ndim != 2 or y_pred.shape[1] == 0:
              warnings.warn(f"Pearson Loss expects 2D input [B, E], got {y_pred.shape}. Returning 0 loss.")
-             return torch.tensor(0.0, device=y_pred.device, requires_grad=y_pred.requires_grad)
+             return self._zero_like_loss(y_pred)
+        if observation_mask is not None and observation_mask.shape != y_true.shape:
+            raise ValueError(
+                f"Pearson Loss: Observation mask shape {observation_mask.shape} does not match {y_true.shape}"
+            )
 
-
-        # Ensure float32 for stable correlation calculation
         y_pred_f32 = y_pred.float()
         y_true_f32 = y_true.float()
+        valid_mask = None if observation_mask is None else observation_mask.bool()
 
-        # Calculate correlation per phenotype (column-wise)
         losses_per_phenotype = []
         for i in range(y_pred_f32.shape[1]):
-            pred_col = y_pred_f32[:, i]
-            true_col = y_true_f32[:, i]
+            pred_col, true_col = self._select_observed(
+                y_pred_f32, y_true_f32, valid_mask, i
+            )
+            if pred_col.numel() <= 1:
+                continue
 
             vx = pred_col - torch.mean(pred_col)
             vy = true_col - torch.mean(true_col)
@@ -508,27 +568,24 @@ class DNAWhisper(pl.LightningModule):
             std_vy = torch.sqrt(torch.sum(vy ** 2))
 
             if std_vx < eps or std_vy < eps:
-                # Handle constant columns: correlation is undefined, assign 0 correlation -> max loss (1.0)
-                p = torch.tensor(0.0, device=y_pred.device)
+                p = torch.zeros((), device=y_pred.device, dtype=y_pred_f32.dtype)
             else:
                 p = torch.sum(vx * vy) / (std_vx * std_vy)
-                p = torch.clamp(p, -1.0, 1.0) # Clamp for numerical stability
+                p = torch.clamp(p, -1.0, 1.0)
 
-            # Loss: (1 - correlation) / factor, squared to penalize negative correlation more
-            # Ensure loss is non-negative
-            loss_i = ((1.0 - p) / pearson_factor) ** 2
-            losses_per_phenotype.append(loss_i)
+            losses_per_phenotype.append(((1.0 - p) / pearson_factor) ** 2)
 
-        losses_tensor = torch.stack(losses_per_phenotype) # Shape [E]
+        if not losses_per_phenotype:
+            return self._zero_like_loss(y_pred)
+
+        losses_tensor = torch.stack(losses_per_phenotype)
 
         if reduction == "minimax":
-            # Maximize the minimum loss across phenotypes
-            return losses_tensor.max() # Maximize the loss (minimize the worst correlation)
-        elif reduction == "mean":
-            return losses_tensor.mean() # Average loss across phenotypes
-        else:
-            warnings.warn(f"Unsupported Pearson reduction: {reduction}. Using 'mean'.")
+            return losses_tensor.max()
+        if reduction == "mean":
             return losses_tensor.mean()
+        warnings.warn(f"Unsupported Pearson reduction: {reduction}. Using 'mean'.")
+        return losses_tensor.mean()
 
     def l1_regularization_loss(self) -> torch.Tensor:
         l1_loss = torch.tensor(0.0, device=self.device)
@@ -538,7 +595,7 @@ class DNAWhisper(pl.LightningModule):
         return l1_loss
 
     # --- 修改：重写 compute_loss ---
-    def compute_loss(self, model_outputs: Dict[str, Any], y_true: torch.Tensor, raw_features: Optional[torch.Tensor] = None) -> Dict[str, Tensor]:
+    def compute_loss(self, model_outputs: Dict[str, Any], y_true: torch.Tensor, raw_features: Optional[torch.Tensor] = None, observation_mask: Optional[torch.Tensor] = None) -> Dict[str, Tensor]:
         final_pred = model_outputs['final_pred']
         embed_features = model_outputs['embed_features'] # Shape [B, N_emb, D_emb]
         gfi_block_features = model_outputs['gfi_block_features'] # List of [B, N_i, D_i]
@@ -546,14 +603,21 @@ class DNAWhisper(pl.LightningModule):
         gfi_aux_projections = model_outputs['gfi_aux_projections'] # List of [B*N_i, E, 1]
 
         true_batch_size = y_true.shape[0]
-        phenotype_dim = y_true.shape[1] 
+        phenotype_dim = y_true.shape[1]
+        observed = None if observation_mask is None else observation_mask.bool()
+        if observed is not None and observed.shape != y_true.shape:
+            raise ValueError(
+                f"Observation mask shape {tuple(observed.shape)} does not match targets {tuple(y_true.shape)}"
+            )
 
         primary_loss_fn = self._get_loss_function(
             self.primary_loss_type,
             pearson_factor=self.primary_pearson_factor,
             reduction=self.primary_reduction
         )
-        primary_loss = primary_loss_fn(final_pred, y_true)
+        primary_loss = primary_loss_fn(
+            final_pred, y_true, observation_mask=observed
+        )
         loss_requires_grad = primary_loss.requires_grad
 
         total_deep_supervision_loss = torch.tensor(0.0, device=final_pred.device, requires_grad=loss_requires_grad)
@@ -566,7 +630,9 @@ class DNAWhisper(pl.LightningModule):
             ds_losses = []
             if len(self.ds_weights) > 0 and self.ds_weights[0] > 0:
                 if embed_aux_proj is not None and embed_aux_proj.shape == y_true.shape:
-                    loss_emb = ds_loss_fn(embed_aux_proj, y_true)
+                    loss_emb = ds_loss_fn(
+                        embed_aux_proj, y_true, observation_mask=observed
+                    )
                     ds_losses.append(self.ds_weights[0] * loss_emb)
                 elif embed_aux_proj is not None:
                     warnings.warn(f"Deep Supervision: Embedding aux projection shape {embed_aux_proj.shape} "
@@ -582,7 +648,11 @@ class DNAWhisper(pl.LightningModule):
                                 aux_proj_reshaped = aux_proj_flat.view(true_batch_size, num_context_blocks, phenotype_dim, 1)
                                 aux_proj_processed = aux_proj_reshaped.mean(dim=1).squeeze(-1)
                                 if aux_proj_processed.shape == y_true.shape:
-                                    loss_block = ds_loss_fn(aux_proj_processed, y_true)
+                                    loss_block = ds_loss_fn(
+                                        aux_proj_processed,
+                                        y_true,
+                                        observation_mask=observed,
+                                    )
                                     ds_losses.append(self.ds_weights[weight_idx] * loss_block)
                                 else:
                                     warnings.warn(f"Deep Supervision: GFI Block {i} processed aux projection shape {aux_proj_processed.shape} mismatched with target shape {y_true.shape} after processing. Skipping DS loss for block {i}.")

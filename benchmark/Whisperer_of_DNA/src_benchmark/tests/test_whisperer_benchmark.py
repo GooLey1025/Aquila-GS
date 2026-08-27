@@ -354,6 +354,51 @@ def test_missing_labels_are_filled_with_detached_predictions() -> None:
     assert residual[0, 1].item() == 0.0
 
 
+def test_pearson_loss_ignores_missing_observations() -> None:
+    whisper_cls = import_dna_whisper()
+    whisper = whisper_cls.__new__(whisper_cls)
+    predictions = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    targets = torch.tensor(
+        [[0.0, 99.0], [1.0, 99.0], [2.0, 99.0]],
+        dtype=torch.float32,
+    )
+    mask = torch.tensor([[True, False], [True, False], [True, False]])
+    masked = whisper._pearson_loss(
+        predictions,
+        targets,
+        pearson_factor=1.0,
+        reduction="mean",
+        observation_mask=mask,
+    )
+    unmasked = whisper._pearson_loss(
+        predictions,
+        targets,
+        pearson_factor=1.0,
+        reduction="mean",
+    )
+    assert float(masked) == pytest.approx(0.0, abs=1e-5)
+    assert float(unmasked) == pytest.approx(0.5, abs=1e-5)
+
+
+def test_mse_loss_averages_only_observed_entries() -> None:
+    whisper_cls = import_dna_whisper()
+    whisper = whisper_cls.__new__(whisper_cls)
+    predictions = torch.tensor([[1.0, 100.0], [3.0, 100.0]])
+    targets = torch.tensor([[1.0, 0.0], [3.0, 0.0]])
+    mask = torch.tensor([[True, False], [True, False]])
+    loss = whisper._mse_loss(
+        predictions,
+        targets,
+        reduction="mean",
+        observation_mask=mask,
+    )
+    assert float(loss) == pytest.approx(0.0)
+
+
 def test_trait_metric_slice_keeps_per_trait_pearson() -> None:
     metrics = {
         "normalized": {
@@ -375,6 +420,7 @@ def test_trait_metric_slice_keeps_per_trait_pearson() -> None:
     sliced = _slice_metrics(metrics, "TraitA")
     assert sliced["normalized"]["per_trait"]["TraitA"]["pearson"] == 0.8
     assert sliced["normalized"]["avg_pearson"] == 0.8
+    assert np.isnan(sliced["normalized"]["avg_within_accession_pearson"])
     assert sliced["test_loss"] == 0.2
     assert "TraitB" not in sliced["normalized"]["per_trait"]
 

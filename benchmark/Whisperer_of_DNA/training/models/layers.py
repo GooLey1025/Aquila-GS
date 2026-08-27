@@ -973,11 +973,8 @@ class EmbeddingLayer_onlySNP(nn.Module):
         normed_pooling_input = self.ln_before_pooling(cnn_output_blocked, batch_size, num_blocks)
 
         pooled_output_val = None
-        embedding_pooling_weights_to_return = None # Will be conditionally assigned
-        # 应用块池化 - 输出形状 [B*N, E, C]
-        # pooled_output, _ = self.block_pooling(normed_pooling_input)
+        embedding_pooling_weights_to_return = None
         if self.block_pooling is not None:
-            actual_weights_from_pooling = None
             if self.training and self.use_pooling_checkpointing:
                 pooled_output_tuple_ckpt = checkpoint(
                     self.block_pooling, 
@@ -989,12 +986,8 @@ class EmbeddingLayer_onlySNP(nn.Module):
                 pooled_output_val = pooled_output_tuple_ckpt[0]
 
             else: 
-                pooled_output_val_direct, actual_weights_direct = self.block_pooling(normed_pooling_input, None) 
+                pooled_output_val_direct, _ = self.block_pooling(normed_pooling_input, None) 
                 pooled_output_val = pooled_output_val_direct
-                actual_weights_from_pooling = actual_weights_direct
-
-            if not self.training and actual_weights_from_pooling is not None:
-                embedding_pooling_weights_to_return = actual_weights_from_pooling
         else: 
             if L > 1:
                  warnings.warn("Block pooling is enabled (L > 1) but self.block_pooling is None. This is unexpected.")

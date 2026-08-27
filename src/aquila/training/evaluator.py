@@ -77,6 +77,11 @@ class RegressionEvaluator:
             bool(np.isfinite(metrics["rmse"])) for metrics in per_trait.values()
         )
         aggregate["n_observations"] = int(mask_array.sum())
+        within_accession = _within_accession_pearson(
+            prediction_array, target_array, mask_array
+        )
+        aggregate["within_accession_pearson"] = within_accession["mean"]
+        aggregate["n_accessions_within_accession"] = within_accession["n_accessions"]
 
         metrics: dict[str, Any] = {
             "per_trait": per_trait,
@@ -84,6 +89,8 @@ class RegressionEvaluator:
         }
         for metric_name in self.METRIC_NAMES:
             metrics[f"avg_{metric_name}"] = aggregate[metric_name]
+        metrics["avg_within_accession_pearson"] = within_accession["mean"]
+        metrics["n_accessions_within_accession"] = within_accession["n_accessions"]
 
         return EvaluationResult(
             metrics=metrics,
@@ -150,6 +157,35 @@ class RegressionEvaluator:
     @staticmethod
     def _finite_mean(values: list[float]) -> float:
         return float(np.mean(values)) if values else float("nan")
+
+
+def _within_accession_pearson(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    mask: np.ndarray,
+) -> dict[str, float | int]:
+    """Mean Pearson r between observed and predicted trait vectors per accession.
+
+    An accession contributes only when it has at least two observed traits and
+    both vectors have nonzero variance. This is undefined for single-trait
+    evaluations.
+    """
+    correlations: list[float] = []
+    for index in range(predictions.shape[0]):
+        valid = mask[index]
+        if int(valid.sum()) < 2:
+            continue
+        predicted = np.asarray(predictions[index, valid], dtype=np.float64)
+        observed = np.asarray(targets[index, valid], dtype=np.float64)
+        if float(np.std(predicted)) <= 0.0 or float(np.std(observed)) <= 0.0:
+            continue
+        value = float(np.corrcoef(predicted, observed)[0, 1])
+        if np.isfinite(value):
+            correlations.append(value)
+    return {
+        "mean": float(np.mean(correlations)) if correlations else float("nan"),
+        "n_accessions": len(correlations),
+    }
 
 
 def evaluate_regression(

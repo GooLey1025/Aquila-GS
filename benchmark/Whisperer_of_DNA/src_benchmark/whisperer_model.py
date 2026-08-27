@@ -250,6 +250,11 @@ def _loader(
     )
 
 
+def _snapshot_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Copy trainable weights to CPU so the live GPU graph is not duplicated."""
+    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+
 def _masked_mse(predictions: np.ndarray, targets: np.ndarray, mask: np.ndarray) -> float:
     valid = np.asarray(mask, dtype=bool) & np.isfinite(predictions) & np.isfinite(targets)
     if not valid.any():
@@ -344,7 +349,7 @@ def train_model(
     best_epoch = epoch_count
     best_metric = -float("inf")
     best_metrics: dict[str, Any] = {}
-    best_state = copy.deepcopy(model.state_dict())
+    best_state = _snapshot_state(model)
     history = []
     stale = 0
     for epoch in range(1, epoch_count + 1):
@@ -356,8 +361,11 @@ def train_model(
             phenotype = phenotype.to(device)
             observed = observed.to(device)
             outputs = model(features)
-            filled = _fill_missing_targets(outputs["final_pred"], phenotype, observed)
-            losses = model.compute_loss(outputs, filled)
+            losses = model.compute_loss(
+                outputs,
+                phenotype,
+                observation_mask=observed,
+            )
             loss = losses["total_loss"]
             loss.backward()
             optimizer.step()
@@ -367,7 +375,7 @@ def train_model(
             "train_loss": float(np.mean(train_losses)),
         }
         if valid_loader is None:
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = _snapshot_state(model)
             history.append(row)
             continue
         predictions, targets, mask, valid_loss = _predict(model, valid_loader, device)
@@ -385,14 +393,14 @@ def train_model(
             best_metric = metric
             best_epoch = epoch
             best_metrics = metrics
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = _snapshot_state(model)
             stale = 0
         else:
             stale += 1
             if stale >= patience:
                 break
     return TrainingResult(
-        {key: value.detach().cpu() for key, value in best_state.items()},
+        best_state,
         best_epoch,
         best_metric,
         best_metrics,

@@ -1230,16 +1230,19 @@ def _aggregate_outer_test_metrics(
     predictions here; those remain available under each fold's metrics.json.
     """
     values: list[float] = []
+    within_values: list[float] = []
     for item in completed:
         scale_metrics = item.get("metrics", {}).get("normalized", {})
         value = scale_metrics.get("avg_pearson")
-        if value is None:
-            continue
-        values.append(float(value))
+        if value is not None:
+            values.append(float(value))
+        within = scale_metrics.get("avg_within_accession_pearson")
+        if within is not None and np.isfinite(float(within)):
+            within_values.append(float(within))
     if not values:
         return {}
     array = np.asarray(values, dtype=float)
-    return {
+    summary = {
         "scale": "normalized",
         "n_folds": int(array.size),
         "test_pearsonr_per_fold": values,
@@ -1248,6 +1251,14 @@ def _aggregate_outer_test_metrics(
             float(np.std(array, ddof=1)) if array.size > 1 else 0.0
         ),
     }
+    if within_values:
+        within_array = np.asarray(within_values, dtype=float)
+        summary["test_within_accession_pearsonr_per_fold"] = within_values
+        summary["test_within_accession_pearsonr_mean"] = float(np.mean(within_array))
+        summary["test_within_accession_pearsonr_std"] = (
+            float(np.std(within_array, ddof=1)) if within_array.size > 1 else 0.0
+        )
+    return summary
 
 
 def _selected_per_fold(
