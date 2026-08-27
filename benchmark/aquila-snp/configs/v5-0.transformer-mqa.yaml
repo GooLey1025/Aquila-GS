@@ -80,6 +80,7 @@ model:
     dropout: 0.1
     activation: gelu
     use_rope: true
+    d_ff: 512
   - name: multi_head_pool
     d_model: 256
     num_heads: 4

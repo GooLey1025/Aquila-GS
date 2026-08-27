@@ -239,3 +239,41 @@ def test_skipfuse_configs_forward() -> None:
         out = model(torch.randn(2, 4096, 8))["regression"]
     assert out.shape == (2, 2)
     assert torch.isfinite(out).all()
+
+
+def test_mqa_d_ff_is_configurable() -> None:
+    from aquila.blocks import transformer_mqa
+
+    wide = transformer_mqa(d_model=32, num_query_heads=4, qk_head_dim=8, v_head_dim=8)
+    narrow = transformer_mqa(
+        d_model=32, num_query_heads=4, qk_head_dim=8, v_head_dim=8, d_ff=32
+    )
+    assert wide.ffn.hidden[0].out_features == 64
+    assert narrow.ffn.hidden[0].out_features == 32
+    x = torch.randn(2, 16, 32)
+    assert wide(x).shape == x.shape
+    assert narrow(x).shape == x.shape
+
+
+def test_v5_transformer_ablation_configs_forward() -> None:
+    import yaml
+    from pathlib import Path
+    from aquila.varnn import create_model_from_config
+
+    root = Path("/home/gulei/projects/Aquila-GS/benchmark/aquila-snp/configs")
+    x = torch.randn(2, 128, 8)
+    for name in (
+        "v5.baseline.yaml",
+        "v5-1.transformer-mqa-norope.yaml",
+        "v5-2.transformer-mha-rope.yaml",
+        "v5-0.transformer-mqa.yaml",
+    ):
+        cfg = yaml.safe_load((root / name).read_text())
+        model = create_model_from_config(
+            cfg, seq_length=128, regression_tasks=["t0", "t1"]
+        )
+        model.eval()
+        with torch.no_grad():
+            out = model(x)["regression"]
+        assert out.shape == (2, 2), name
+        assert torch.isfinite(out).all(), name

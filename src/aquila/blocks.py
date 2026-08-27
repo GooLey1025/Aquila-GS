@@ -1143,8 +1143,10 @@ class TransformerBlockMQA(nn.Module):
     """Transformer block with Multi-Query Attention and RoPE."""
 
     def __init__(self, d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
-                 dropout=0.1, max_position=8192, norm_type='layer', activation='gelu', use_rope=True, **kwargs):
+                 dropout=0.1, max_position=8192, norm_type='layer', activation='gelu',
+                 use_rope=True, d_ff=None, **kwargs):
         super().__init__()
+        hidden_ff = int(2 * d_model if d_ff is None else d_ff)
 
         # Choose normalization type
         if norm_type == 'rms':
@@ -1169,12 +1171,9 @@ class TransformerBlockMQA(nn.Module):
             use_rope=use_rope
         )
 
-        # Feed-forward network (2x expansion with activation, AlphaGenome style)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 2 * d_model),
-            layers.Activation(activation),
-            nn.Dropout(dropout),
-            nn.Linear(2 * d_model, d_model)
+        self.ffn = layers.FeedForward(
+            d_model, hidden_ff, dropout, activation,
+            num_hidden_layers=int(kwargs.pop("ffn_num_hidden_layers", 1)),
         )
 
         self.dropout1 = nn.Dropout(dropout)
@@ -1197,7 +1196,8 @@ class TransformerBlockMQA(nn.Module):
 
 
 def transformer_mqa(d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
-                    dropout=0.1, max_position=8192, norm_type='layer', activation='gelu', **kwargs):
+                    dropout=0.1, max_position=8192, norm_type='layer', activation='gelu',
+                    use_rope=True, d_ff=None, **kwargs):
     """Single transformer block with Multi-Query Attention.
 
     Args:
@@ -1208,9 +1208,8 @@ def transformer_mqa(d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
         dropout: Dropout rate
         max_position: Maximum position for RoPE
         norm_type: 'layer' for LayerNorm (default) or 'rms' for RMSNorm
-
-    Returns:
-        TransformerBlockMQA module
+        use_rope: Whether to use RoPE (default True)
+        d_ff: FFN hidden size. Default ``2 * d_model`` when omitted.
     """
     return TransformerBlockMQA(
         d_model=d_model,
@@ -1221,6 +1220,8 @@ def transformer_mqa(d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
         max_position=max_position,
         norm_type=norm_type,
         activation=activation,
+        use_rope=use_rope,
+        d_ff=d_ff,
         **kwargs
     )
 
@@ -1229,7 +1230,8 @@ class TransformerTowerMQA(nn.Module):
     """Stack of transformer blocks with Multi-Query Attention and RoPE."""
 
     def __init__(self, embed_dim, repeat=9, num_query_heads=8, qk_head_dim=128,
-                 v_head_dim=192, dropout=0.1, max_position=8192, norm_type='layer', activation='gelu', use_rope=True, **kwargs):
+                 v_head_dim=192, dropout=0.1, max_position=8192, norm_type='layer',
+                 activation='gelu', use_rope=True, d_ff=None, **kwargs):
         super().__init__()
 
         self.layers = nn.ModuleList([
@@ -1242,7 +1244,9 @@ class TransformerTowerMQA(nn.Module):
                 max_position=max_position,
                 norm_type=norm_type,
                 activation=activation,
-                use_rope=use_rope
+                use_rope=use_rope,
+                d_ff=d_ff,
+                **kwargs
             )
             for _ in range(repeat)
         ])
@@ -1255,7 +1259,8 @@ class TransformerTowerMQA(nn.Module):
 
 def transformer_tower_mqa(embed_dim, repeat=9, num_query_heads=8, qk_head_dim=128,
                           v_head_dim=192, dropout=0.1, max_position=8192,
-                          norm_type='layer', activation='gelu', use_rope=True, **kwargs):
+                          norm_type='layer', activation='gelu', use_rope=True,
+                          d_ff=None, **kwargs):
     """Stack of transformer blocks with Multi-Query Attention.
 
     Args:
@@ -1278,7 +1283,7 @@ def transformer_tower_mqa(embed_dim, repeat=9, num_query_heads=8, qk_head_dim=12
         - RoPE for position encoding (optional, default enabled)
         - Soft-clipping of attention logits for stability
         - Optional RMSNorm instead of LayerNorm
-        - FFN with 2x expansion and activation
+        - FFN width set by ``d_ff`` (default ``2 * d_model``)
     """
     return TransformerTowerMQA(
         embed_dim=embed_dim,
@@ -1291,6 +1296,7 @@ def transformer_tower_mqa(embed_dim, repeat=9, num_query_heads=8, qk_head_dim=12
         norm_type=norm_type,
         activation=activation,
         use_rope=use_rope,
+        d_ff=d_ff,
         **kwargs
     )
 
