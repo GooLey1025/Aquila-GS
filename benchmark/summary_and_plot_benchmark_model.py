@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from scipy.stats import friedmanchisquare, wilcoxon
 
 
 MODEL_SPECS = (
@@ -482,6 +483,140 @@ def model_order(status_df: pd.DataFrame) -> list[str]:
     return available_models + [model for model in configured if model not in available_models]
 
 
+def holm_adjust(pvalues: Sequence[float]) -> list[float]:
+    values = np.asarray(list(pvalues), dtype=float)
+    count = values.size
+    if count == 0:
+        return []
+    order = np.argsort(values)
+    adjusted = np.empty(count, dtype=float)
+    running = 0.0
+    for rank, index in enumerate(order):
+        running = max(running, values[index] * (count - rank))
+        adjusted[index] = min(1.0, running)
+    return [float(value) for value in adjusted]
+
+
+def pairwise_wilcoxon_tests(long_df: pd.DataFrame, order: Sequence[str]) -> pd.DataFrame:
+    """Paired Wilcoxon tests of per-trait Pearson r between models."""
+    wide = long_df.pivot(index="phenotype", columns="model", values="pearson_r")
+    records: list[dict[str, Any]] = []
+    pairs: list[tuple[str, str]] = []
+    raw_pvalues: list[float] = []
+
+    available = [model for model in order if model in wide.columns]
+    for left_index, left in enumerate(available):
+        for right in available[left_index + 1 :]:
+            paired = wide[[left, right]].dropna()
+            left_values = paired[left].to_numpy(dtype=float)
+            right_values = paired[right].to_numpy(dtype=float)
+            if left_values.size < 2:
+                continue
+            try:
+                statistic, pvalue = wilcoxon(
+                    left_values,
+                    right_values,
+                    alternative="two-sided",
+                    zero_method="wilcox",
+                )
+            except ValueError:
+                statistic, pvalue = float("nan"), 1.0
+            pvalue = 1.0 if not math.isfinite(float(pvalue)) else float(pvalue)
+            pairs.append((left, right))
+            raw_pvalues.append(pvalue)
+            records.append(
+                {
+                    "model_a": left,
+                    "model_b": right,
+                    "n_paired_traits": int(left_values.size),
+                    "wilcoxon_statistic": (
+                        float(statistic) if math.isfinite(float(statistic)) else np.nan
+                    ),
+                    "p_raw": pvalue,
+                }
+            )
+
+    adjusted = holm_adjust(raw_pvalues)
+    for record, p_holm in zip(records, adjusted):
+        record["p_holm"] = p_holm
+        record["significant_0.05"] = bool(p_holm < 0.05)
+    return pd.DataFrame.from_records(records)
+
+
+def friedman_pvalue(long_df: pd.DataFrame, models: Sequence[str]) -> float | None:
+    wide = long_df.pivot(index="phenotype", columns="model", values="pearson_r")
+    present = [model for model in models if model in wide.columns]
+    if len(present) < 3:
+        return None
+    complete = wide[present].dropna(axis=0, how="any")
+    if complete.shape[0] < 2:
+        return None
+    try:
+        _statistic, pvalue = friedmanchisquare(
+            *[complete[model].to_numpy(dtype=float) for model in present]
+        )
+    except ValueError:
+        return None
+    number = finite_float(pvalue)
+    return number
+
+
+def _maximal_cliques(adjacency: np.ndarray) -> list[set[int]]:
+    count = int(adjacency.shape[0])
+    cliques: list[set[int]] = []
+
+    def bron_kerbosch(current: set[int], candidates: set[int], excluded: set[int]) -> None:
+        if not candidates and not excluded:
+            cliques.append(set(current))
+            return
+        pivot = next(iter(candidates | excluded))
+        pivot_neighbors = {index for index in range(count) if adjacency[pivot, index]}
+        for vertex in list(candidates - pivot_neighbors):
+            neighbors = {index for index in range(count) if adjacency[vertex, index]}
+            bron_kerbosch(current | {vertex}, candidates & neighbors, excluded & neighbors)
+            candidates.remove(vertex)
+            excluded.add(vertex)
+
+    bron_kerbosch(set(), set(range(count)), set())
+    return cliques
+
+
+def compact_letter_display(
+    models: Sequence[str],
+    pairwise_df: pd.DataFrame,
+    alpha: float = 0.05,
+) -> dict[str, str]:
+    """Letter groups for models; shared letters mean no significant difference."""
+    names = list(models)
+    if not names:
+        return {}
+    count = len(names)
+    index = {name: position for position, name in enumerate(names)}
+    different = np.zeros((count, count), dtype=bool)
+    for row in pairwise_df.itertuples(index=False):
+        if row.model_a not in index or row.model_b not in index:
+            continue
+        if float(row.p_holm) < alpha:
+            left = index[str(row.model_a)]
+            right = index[str(row.model_b)]
+            different[left, right] = True
+            different[right, left] = True
+
+    adjacent = ~different
+    np.fill_diagonal(adjacent, False)
+    cliques = _maximal_cliques(adjacent)
+    if not cliques:
+        cliques = [{position} for position in range(count)]
+    cliques.sort(key=lambda clique: (min(clique), -len(clique)))
+
+    letters = [""] * count
+    for clique_index, clique in enumerate(cliques):
+        glyph = chr(ord("a") + clique_index)
+        for position in sorted(clique):
+            letters[position] += glyph
+    return {name: letters[position] for position, name in enumerate(names)}
+
+
 def configure_style() -> None:
     mpl.rcParams.update(
         {
@@ -529,10 +664,12 @@ def plot_performance_distribution(
     cohort: str,
     output_dir: Path,
     dpi: int,
+    letters: Mapping[str, str] | None = None,
+    friedman_p: float | None = None,
 ) -> mpl.figure.Figure:
     plot_df = long_df[np.isfinite(long_df["pearson_r"])].copy()
     width = max(9.5, 0.78 * len(order))
-    figure, axis = plt.subplots(figsize=(width, 5.2))
+    figure, axis = plt.subplots(figsize=(width, 5.55))
     palette = {model: MODEL_COLORS[model] for model in order}
 
     if not plot_df.empty:
@@ -582,10 +719,34 @@ def plot_performance_distribution(
 
     finite_values = plot_df["pearson_r"].to_numpy(dtype=float)
     lower = min(-0.05, float(np.nanmin(finite_values)) - 0.08) if finite_values.size else -0.05
-    upper = max(0.85, float(np.nanmax(finite_values)) + 0.08) if finite_values.size else 1.0
+    letter_pad = 0.07 if letters else 0.08
+    upper = (
+        max(0.85, float(np.nanmax(finite_values)) + letter_pad)
+        if finite_values.size
+        else 1.0
+    )
     lower = max(-1.0, lower)
-    upper = min(1.0, upper)
+    upper = min(1.08, upper)
     axis.set_ylim(lower, upper)
+
+    if letters and not plot_df.empty:
+        tops = plot_df.groupby("model")["pearson_r"].max()
+        for index, model in enumerate(order):
+            letter = letters.get(model)
+            if not letter or model not in tops:
+                continue
+            axis.text(
+                index,
+                float(tops[model]) + 0.018 * (upper - lower),
+                letter,
+                ha="center",
+                va="bottom",
+                fontsize=9.5,
+                fontweight="bold",
+                color="#111111",
+                clip_on=False,
+                zorder=6,
+            )
 
     missing = set(status_df.loc[status_df["traits_found"] == 0, "model"])
     for index, model in enumerate(order):
@@ -613,7 +774,24 @@ def plot_performance_distribution(
         label.set_ha("right")
         label.set_fontweight("bold")
     beautify_axes(axis)
-    figure.tight_layout()
+    note = (
+        "Letters: paired Wilcoxon signed-rank tests on per-trait Pearson's r "
+        "(Holm-adjusted α = 0.05). Models that share a letter are not significantly different."
+    )
+    if friedman_p is not None:
+        note = f"Friedman p = {friedman_p:.2e}. " + note
+    axis.text(
+        0.0,
+        -0.28,
+        note,
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=7.5,
+        color="#555555",
+        wrap=True,
+    )
+    figure.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
     save_figure(figure, output_dir / f"{cohort}.model_performance", dpi)
     return figure
 
@@ -730,6 +908,8 @@ def write_tables(
     long_df: pd.DataFrame,
     status_df: pd.DataFrame,
     top_df: pd.DataFrame,
+    pairwise_df: pd.DataFrame,
+    letters: Mapping[str, str],
     traits: Sequence[str],
     output_dir: Path,
     cohort: str,
@@ -761,6 +941,21 @@ def write_tables(
         index=False,
         na_rep="",
     )
+    if not pairwise_df.empty:
+        pairwise_df.to_csv(
+            output_dir / f"{cohort}.model_pairwise_wilcoxon.tsv",
+            sep="\t",
+            index=False,
+            na_rep="",
+        )
+    if letters:
+        pd.DataFrame(
+            [{"model": model, "cld_letter": letter} for model, letter in letters.items()]
+        ).to_csv(
+            output_dir / f"{cohort}.model_significance_letters.tsv",
+            sep="\t",
+            index=False,
+        )
 
 
 def print_summary(status_df: pd.DataFrame, output_dir: Path) -> None:
@@ -804,8 +999,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     long_df = make_long_table(results, traits)
     status_df = make_status_table(results, traits)
     order = model_order(status_df)
+    tested_models = [
+        model
+        for model in order
+        if int(status_df.loc[status_df["model"] == model, "traits_found"].iloc[0]) > 0
+    ]
+    pairwise_df = pairwise_wilcoxon_tests(long_df, tested_models)
+    letters = compact_letter_display(tested_models, pairwise_df)
+    friedman_p = friedman_pvalue(long_df, tested_models)
     top_df = calculate_top_k(long_df, order, traits, args.top_k)
-    write_tables(long_df, status_df, top_df, traits, output_dir, args.cohort)
+    write_tables(
+        long_df,
+        status_df,
+        top_df,
+        pairwise_df,
+        letters,
+        traits,
+        output_dir,
+        args.cohort,
+    )
 
     configure_style()
     figures = [
@@ -816,6 +1028,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.cohort,
             output_dir,
             args.dpi,
+            letters=letters,
+            friedman_p=friedman_p,
         ),
         plot_top_k(
             top_df,

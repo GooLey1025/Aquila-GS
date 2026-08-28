@@ -83,21 +83,28 @@ class CropARNet(nn.Module):
         weights_units: Sequence[int],
         regressor_units: Sequence[int],
         dropout: float,
+        attention_dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.attention = self._attention(num_markers, weights_units)
+        self.attention = self._attention(
+            num_markers, weights_units, attention_dropout
+        )
         self.regressor = self._regressor(
             num_markers, regressor_units, dropout
         )
 
     @staticmethod
-    def _attention(num_markers: int, units: Sequence[int]) -> nn.Sequential:
+    def _attention(
+        num_markers: int, units: Sequence[int], dropout: float
+    ) -> nn.Sequential:
         layers: list[nn.Module] = []
         previous = num_markers
         for index, width in enumerate(units):
             layers.append(nn.Linear(previous, int(width)))
             if index < len(units) - 1:
                 layers.append(nn.GELU())
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
             previous = int(width)
         layers.extend((nn.Linear(previous, num_markers), nn.Sigmoid()))
         return nn.Sequential(*layers)
@@ -236,6 +243,7 @@ def _model(num_markers: int, config: Mapping[str, Any]) -> CropARNet:
         model["weights_units"],
         model["regressor_units"],
         float(model["dropout"]),
+        float(model.get("attention_dropout", 0.0)),
     )
 
 
@@ -288,7 +296,9 @@ def train_model(
             predictions, _ = model(batch_x)
             loss = criterion(predictions, batch_y)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), float(training.get("grad_clip", 1.0))
+            )
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
         if not losses:
