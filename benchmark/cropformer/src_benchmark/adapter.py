@@ -269,7 +269,9 @@ def train_model(
         generator=torch.Generator().manual_seed(seed),
     )
     optimizer = torch.optim.Adam(
-        model.parameters(), lr=float(training["learning_rate"])
+        model.parameters(),
+        lr=float(training["learning_rate"]),
+        weight_decay=float(training.get("weight_decay", 0.0)),
     )
     criterion = nn.MSELoss()
     max_epochs = fixed_epochs or int(training["max_epochs"])
@@ -285,6 +287,9 @@ def train_model(
             optimizer.zero_grad(set_to_none=True)
             loss = criterion(model(batch_x), batch_y)
             loss.backward()
+            grad_clip = float(training.get("grad_clip", 0.0))
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
         if not losses:

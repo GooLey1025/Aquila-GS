@@ -145,12 +145,12 @@ def test_pipeline_round_trip_and_schema_validation() -> None:
         raise AssertionError("Expected variant schema mismatch")
 
 
-def test_grid_contains_exactly_32_candidates() -> None:
+def test_grid_contains_exactly_64_candidates() -> None:
     path = BENCHMARK_SOURCE.parent / "configs" / "BNNs_nested_cv.yaml"
     with path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     candidates = generate_grid_candidates(config["hpo"]["parameters"])
-    assert len(candidates) == 32
+    assert len(candidates) == 64
 
 
 def test_candidate_selection_epoch_and_metric_aggregation() -> None:

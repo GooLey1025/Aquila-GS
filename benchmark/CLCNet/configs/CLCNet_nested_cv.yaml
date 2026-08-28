@@ -40,3 +40,7 @@ hpo:
       values: [0.5, 1.0]
     train.scheduler_factor:
       values: [0.5, 0.8]
+    model.shared_dimensions:
+      values:
+        - [4096, 2048, 1024]
+        - [2048, 1024, 512]

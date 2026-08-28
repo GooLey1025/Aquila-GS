@@ -51,4 +51,6 @@ hpo:
     train.batch_size:
       values: [16, 32]
     train.dropout:
-      values: [0.1, 0.2]
+      values: [0.1, 0.3]
+    train.weight_decay:
+      values: [0.00001, 0.0001]

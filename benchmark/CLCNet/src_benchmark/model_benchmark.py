@@ -26,12 +26,10 @@ class CLCNetBenchmark(nn.Module):
         super().__init__()
         if input_dim < 1:
             raise ValueError("CLCNet input_dim must be positive")
-        if tuple(shared_dimensions) != ORIGINAL_SHARED_DIMENSIONS:
-            raise ValueError(
-                "The benchmark preserves the upstream hidden dimensions "
-                f"{ORIGINAL_SHARED_DIMENSIONS}"
-            )
-        first, second, third = shared_dimensions
+        dims = tuple(int(value) for value in shared_dimensions)
+        if len(dims) != 3 or any(value < 1 for value in dims):
+            raise ValueError("shared_dimensions must be three positive integers")
+        first, second, third = dims
         self.shared_layer = nn.Sequential(
             nn.Linear(input_dim, first),
             nn.ReLU(),
@@ -62,9 +60,12 @@ class CLCNetBenchmark(nn.Module):
         return prediction, representation
 
 
-def estimate_model_size(input_dim: int) -> dict[str, float | int]:
+def estimate_model_size(
+    input_dim: int,
+    shared_dimensions: tuple[int, int, int] = ORIGINAL_SHARED_DIMENSIONS,
+) -> dict[str, float | int]:
     """Estimate upstream model parameters without allocating the network."""
-    first, second, third = ORIGINAL_SHARED_DIMENSIONS
+    first, second, third = tuple(int(value) for value in shared_dimensions)
     parameter_count = (
         input_dim * first
         + first

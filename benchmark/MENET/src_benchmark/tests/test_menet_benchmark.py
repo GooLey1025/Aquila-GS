@@ -123,7 +123,7 @@ def test_grid_budget() -> None:
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     candidates = generate_grid_candidates(config["hpo"]["parameters"])
-    assert len(candidates) == 32
+    assert len(candidates) == 64
 
 
 def test_menet_training_loader_discards_incomplete_final_batch() -> None:

@@ -6,7 +6,9 @@ model:
   attention_dropout: 0.5
 training:
   learning_rate: 0.001
+  weight_decay: 0.0
   batch_size: 32
+  grad_clip: 1.0
   max_epochs: 100
   patience: 40
 hpo:
@@ -14,7 +16,8 @@ hpo:
     model.hidden_size: [64, 128]
     model.num_attention_heads: [4, 8]
     model.kernel_size: [3, 5]
-    model.hidden_dropout: [0.2, 0.5]
+    model.hidden_dropout: [0.2, 0.3, 0.4, 0.5]
+    model.attention_dropout: [0.2, 0.3, 0.4, 0.5]
     training.learning_rate: [0.0003, 0.001]
 output:
   directory: cropformer_nested_cv

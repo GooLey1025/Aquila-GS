@@ -366,6 +366,13 @@ def fit_feature_selector(
     )
 
 
+def _shared_dimensions(config: Mapping[str, Any]) -> tuple[int, int, int]:
+    values = tuple(int(value) for value in config["model"]["shared_dimensions"])
+    if len(values) != 3 or any(value < 1 for value in values):
+        raise ValueError("model.shared_dimensions must be three positive integers")
+    return values
+
+
 def _loader(
     genotypes: np.ndarray,
     targets: np.ndarray,
@@ -474,7 +481,9 @@ def train_clcnet(
     """Train CLCNet and select inner epochs only by validation Pearson."""
     set_seed(seed)
     training = config["train"]
-    model = CLCNetBenchmark(int(train_genotypes.shape[1])).to(device)
+    model = CLCNetBenchmark(
+        int(train_genotypes.shape[1]), _shared_dimensions(config)
+    ).to(device)
     optimizer = torch.optim.SGD(
         model.parameters(),
         lr=float(training["learning_rate"]),
@@ -547,7 +556,9 @@ def predict_clcnet(
     state_dict: Mapping[str, torch.Tensor],
     device: torch.device,
 ) -> np.ndarray:
-    model = CLCNetBenchmark(int(genotypes.shape[1])).to(device)
+    model = CLCNetBenchmark(
+        int(genotypes.shape[1]), _shared_dimensions(config)
+    ).to(device)
     model.load_state_dict(state_dict)
     predictions, _ = _predict(
         model,
@@ -662,7 +673,7 @@ def run_outer_fold(
             f"[INFO] CLCNet trait={trait_name} outer={outer_fold} inner={inner_fold} "
             f"selection={selection.method} "
             f"selected_variants={len(selection.selected_indices)} "
-            f"model={estimate_model_size(train_genotypes.shape[1])}"
+            f"model={estimate_model_size(train_genotypes.shape[1], _shared_dimensions(base_config))}"
         )
         for candidate_id, parameters in enumerate(candidates):
             candidate_config = merge_config(base_config, parameters)
@@ -720,7 +731,9 @@ def run_outer_fold(
     outer_train_genotypes, outer_test_genotypes = _selected_matrices(
         outer_train, outer_test, final_selection, missing_value
     )
-    size_estimate = estimate_model_size(outer_train_genotypes.shape[1])
+    size_estimate = estimate_model_size(
+        outer_train_genotypes.shape[1], _shared_dimensions(best_config)
+    )
     print(
         f"[INFO] CLCNet trait={trait_name} outer={outer_fold} final "
         f"selection={final_selection.method} "
@@ -766,7 +779,7 @@ def run_outer_fold(
             "trait": trait_name,
             "outer_fold": outer_fold,
             "input_dim": int(outer_train_genotypes.shape[1]),
-            "shared_dimensions": [4096, 2048, 1024],
+            "shared_dimensions": list(_shared_dimensions(best_config)),
             "variant_schema": [
                 outer_train.variants[int(index)]
                 for index in final_selection.selected_indices
