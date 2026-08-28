@@ -224,7 +224,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max-candidates",
         type=int,
         default=None,
-        help="Testing only: limit the 32-point grid.",
+        help="Testing only: limit the 64-point grid.",
     )
     parser.add_argument(
         "--max-inner-folds",

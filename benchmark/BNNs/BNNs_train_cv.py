@@ -575,8 +575,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)
     candidates = generate_grid_candidates(config["hpo"]["parameters"])
-    if len(candidates) != 32:
-        raise ValueError(f"BNN grid must contain 32 candidates, got {len(candidates)}")
+    if len(candidates) != 64:
+        raise ValueError(f"BNN grid must contain 64 candidates, got {len(candidates)}")
     if args.max_candidates is not None:
         candidates = candidates[: args.max_candidates]
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
