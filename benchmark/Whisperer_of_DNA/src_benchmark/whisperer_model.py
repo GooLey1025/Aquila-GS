@@ -367,12 +367,22 @@ def train_model(
                 observation_mask=observed,
             )
             loss = losses["total_loss"]
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                continue
             loss.backward()
+            if not all(
+                parameter.grad is None or torch.isfinite(parameter.grad).all()
+                for parameter in model.parameters()
+            ):
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
             optimizer.step()
             train_losses.append(float(loss.detach()))
         row: dict[str, Any] = {
             "epoch": epoch,
-            "train_loss": float(np.mean(train_losses)),
+            "train_loss": float(np.mean(train_losses)) if train_losses else float("nan"),
         }
         if valid_loader is None:
             best_state = _snapshot_state(model)
