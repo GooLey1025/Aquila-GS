@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from scipy.stats import friedmanchisquare, wilcoxon
+from scipy.stats import friedmanchisquare, ttest_rel
 
 
 MODEL_SPECS = (
@@ -33,8 +33,6 @@ MODEL_SPECS = (
     ("ElasticNet", "ElasticNet"),
     ("CLCNet", "CLCNet"),
     ("MENET", "MENET"),
-    ("DEM-SNP", "DEM/results/DEM-SNP"),
-    ("DEM-Vars", "DEM/results/DEM-Vars"),
     ("DNAwhisper", "Whisperer_of_DNA"),
     ("BNNs", "BNNs"),
     ("Aquila-SNP", "aquila-snp"),
@@ -50,8 +48,6 @@ MODEL_COLORS = {
     "ElasticNet": "#E9B985",
     "CLCNet": "#D2779E",
     "MENET": "#9B79C6",
-    "DEM-SNP": "#E2745B",
-    "DEM-Vars": "#B84A3A",
     "DNAwhisper": "#6D8F72",
     "BNNs": "#C28D62",
     "Aquila-SNP": "#DF6878",
@@ -497,11 +493,10 @@ def holm_adjust(pvalues: Sequence[float]) -> list[float]:
     return [float(value) for value in adjusted]
 
 
-def pairwise_wilcoxon_tests(long_df: pd.DataFrame, order: Sequence[str]) -> pd.DataFrame:
-    """Paired Wilcoxon tests of per-trait Pearson r between models."""
+def pairwise_paired_t_tests(long_df: pd.DataFrame, order: Sequence[str]) -> pd.DataFrame:
+    """Paired t-tests of per-trait Pearson r between model means."""
     wide = long_df.pivot(index="phenotype", columns="model", values="pearson_r")
     records: list[dict[str, Any]] = []
-    pairs: list[tuple[str, str]] = []
     raw_pvalues: list[float] = []
 
     available = [model for model in order if model in wide.columns]
@@ -513,23 +508,23 @@ def pairwise_wilcoxon_tests(long_df: pd.DataFrame, order: Sequence[str]) -> pd.D
             if left_values.size < 2:
                 continue
             try:
-                statistic, pvalue = wilcoxon(
+                statistic, pvalue = ttest_rel(
                     left_values,
                     right_values,
                     alternative="two-sided",
-                    zero_method="wilcox",
                 )
             except ValueError:
                 statistic, pvalue = float("nan"), 1.0
             pvalue = 1.0 if not math.isfinite(float(pvalue)) else float(pvalue)
-            pairs.append((left, right))
             raw_pvalues.append(pvalue)
+            differences = left_values - right_values
             records.append(
                 {
                     "model_a": left,
                     "model_b": right,
                     "n_paired_traits": int(left_values.size),
-                    "wilcoxon_statistic": (
+                    "mean_difference": float(np.mean(differences)),
+                    "t_statistic": (
                         float(statistic) if math.isfinite(float(statistic)) else np.nan
                     ),
                     "p_raw": pvalue,
@@ -775,7 +770,7 @@ def plot_performance_distribution(
         label.set_fontweight("bold")
     beautify_axes(axis)
     note = (
-        "Letters: paired Wilcoxon signed-rank tests on per-trait Pearson's r "
+        "Letters: paired t-tests on per-trait Pearson's r "
         "(Holm-adjusted α = 0.05). Models that share a letter are not significantly different."
     )
     if friedman_p is not None:
@@ -904,6 +899,237 @@ def plot_top_k(
     return figure
 
 
+def plot_performance_heatmap(
+    long_df: pd.DataFrame,
+    traits: Sequence[str],
+    cohort: str,
+    output_dir: Path,
+    dpi: int,
+    letters: Mapping[str, str] | None = None,
+    friedman_p: float | None = None,
+) -> mpl.figure.Figure:
+    """Plot a relative trait-by-model heatmap with aligned model boxplots."""
+    raw_df = long_df.pivot(
+        index="phenotype",
+        columns="model",
+        values="pearson_r",
+    ).reindex(index=list(traits))
+    model_means = raw_df.mean(axis=0, skipna=True)
+    model_order = (
+        pd.DataFrame(
+            {
+                "model": raw_df.columns,
+                "mean_pearson_r": model_means.to_numpy(),
+            }
+        )
+        .sort_values(
+            ["mean_pearson_r", "model"],
+            ascending=[False, True],
+            na_position="last",
+        )["model"]
+        .tolist()
+    )
+    model_order = [model for model in model_order if pd.notna(model_means[model])]
+    raw_df = raw_df.reindex(columns=model_order)
+    model_means = model_means.reindex(model_order)
+
+    # Colors represent within-trait relative performance (row-wise Min-Max);
+    # annotations retain the original Pearson correlations.
+    display_raw_df = pd.concat(
+        [
+            raw_df,
+            pd.DataFrame(
+                [model_means.to_numpy()],
+                index=["Mean"],
+                columns=model_order,
+            ),
+        ]
+    )
+    display_row_mins = display_raw_df.min(axis=1, skipna=True)
+    display_row_ranges = (
+        display_raw_df.max(axis=1, skipna=True) - display_row_mins
+    ).replace(0.0, np.nan)
+    display_relative_df = display_raw_df.sub(display_row_mins, axis=0).div(
+        display_row_ranges,
+        axis=0,
+    )
+    display_relative_df = display_relative_df.fillna(
+        display_raw_df.notna().astype(float).where(display_raw_df.notna(), np.nan) * 0.5
+    )
+    annotations = display_raw_df.map(
+        lambda value: f"{value:.3g}" if pd.notna(value) else ""
+    )
+
+    width = max(10.0, 0.82 * len(model_order) + 2.5)
+    height = max(7.5, 0.46 * len(display_raw_df) + 4.8)
+    figure = plt.figure(figsize=(width, height))
+    grid = figure.add_gridspec(
+        nrows=3,
+        ncols=1,
+        height_ratios=(2.3, max(2.7, 0.46 * len(display_raw_df)), 0.18),
+        hspace=0.56,
+    )
+    box_axis = figure.add_subplot(grid[0])
+    heatmap_axis = figure.add_subplot(grid[1])
+    colorbar_axis = figure.add_subplot(grid[2])
+
+    boxplot_df = long_df[
+        long_df["model"].isin(model_order) & np.isfinite(long_df["pearson_r"])
+    ].copy()
+    palette = {model: MODEL_COLORS[model] for model in model_order}
+    sns.boxplot(
+        data=boxplot_df,
+        x="model",
+        y="pearson_r",
+        order=model_order,
+        hue="model",
+        hue_order=model_order,
+        palette=palette,
+        dodge=False,
+        legend=False,
+        width=0.58,
+        fliersize=0,
+        linewidth=0.9,
+        boxprops={"edgecolor": "#222222"},
+        whiskerprops={"linewidth": 0.9, "color": "#222222"},
+        capprops={"linewidth": 0.9, "color": "#222222"},
+        medianprops={"color": "#111111", "linewidth": 1.25},
+        ax=box_axis,
+    )
+    sns.stripplot(
+        data=boxplot_df,
+        x="model",
+        y="pearson_r",
+        order=model_order,
+        color="#202020",
+        size=2.5,
+        alpha=0.28,
+        jitter=0.16,
+        ax=box_axis,
+    )
+
+    finite_values = boxplot_df["pearson_r"].to_numpy(dtype=float)
+    lower = (
+        max(-1.0, min(-0.05, float(np.nanmin(finite_values)) - 0.08))
+        if finite_values.size
+        else -0.05
+    )
+    upper = (
+        min(1.12, max(0.85, float(np.nanmax(finite_values)) + 0.20))
+        if finite_values.size
+        else 1.0
+    )
+    box_axis.set_ylim(lower, upper)
+    tops = boxplot_df.groupby("model")["pearson_r"].max()
+    for column_index, model in enumerate(model_order):
+        letter = letters.get(model) if letters else None
+        if letter and model in tops:
+            box_axis.text(
+                column_index,
+                float(tops[model]) + 0.025 * (upper - lower),
+                letter,
+                ha="center",
+                va="bottom",
+                fontsize=9.5,
+                fontweight="bold",
+                clip_on=False,
+                zorder=6,
+            )
+    box_axis.axhline(
+        0,
+        color="#777777",
+        linewidth=0.75,
+        linestyle=(0, (3, 3)),
+        zorder=1,
+    )
+    box_axis.set_title(
+        f"{cohort}: model performance across phenotypes",
+        pad=12,
+    )
+    box_axis.set_xlabel("")
+    box_axis.set_ylabel("Outer-test Pearson's r")
+    box_axis.set_xlim(-0.5, len(model_order) - 0.5)
+    box_axis.set_xticks(np.arange(len(model_order)))
+    box_axis.set_xticklabels(
+        model_order,
+        rotation=35,
+        ha="right",
+        fontsize=9,
+        fontweight="bold",
+    )
+    box_axis.tick_params(axis="x", pad=3)
+    beautify_axes(box_axis)
+    test_note = (
+        "Letters: paired t-tests of phenotype-level model means, "
+        "Holm-adjusted α = 0.05; "
+        "shared letters indicate no significant difference."
+    )
+    if friedman_p is not None:
+        test_note = f"Friedman p = {friedman_p:.2e}. " + test_note
+    box_axis.text(
+        0.0,
+        0.99,
+        test_note,
+        transform=box_axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=7.5,
+        color="#555555",
+    )
+
+    sns.heatmap(
+        display_relative_df,
+        mask=display_raw_df.isna(),
+        cmap="vlag",
+        vmin=0.0,
+        vmax=1.0,
+        center=0.5,
+        annot=annotations,
+        fmt="",
+        annot_kws={"fontsize": 7.5},
+        linewidths=0.45,
+        linecolor="white",
+        cbar_kws={
+            "label": "Relative performance within phenotype (Min-Max)",
+            "orientation": "horizontal",
+        },
+        cbar_ax=colorbar_axis,
+        ax=heatmap_axis,
+    )
+    heatmap_axis.set_facecolor("#E6E6E6")
+    heatmap_axis.set_title("")
+    heatmap_axis.set_ylabel("Phenotype")
+    heatmap_axis.set_xlabel("")
+    heatmap_axis.tick_params(
+        axis="x",
+        top=False,
+        bottom=False,
+        labeltop=False,
+        labelbottom=False,
+    )
+    heatmap_axis.tick_params(axis="y", labelrotation=0, labelsize=9)
+    heatmap_axis.axhline(
+        len(raw_df),
+        color="#202020",
+        linewidth=2.2,
+    )
+    heatmap_axis.get_yticklabels()[-1].set_fontweight("bold")
+    colorbar_axis.xaxis.set_ticks_position("bottom")
+    colorbar_axis.xaxis.set_label_position("bottom")
+    colorbar_axis.set_xticks([0.0, 1.0])
+    colorbar_axis.set_xticklabels(["Low", "High"])
+
+    figure.subplots_adjust(
+        left=0.10,
+        right=0.97,
+        top=0.94,
+        bottom=0.08,
+        hspace=0.56,
+    )
+    save_figure(figure, output_dir / f"{cohort}.model_trait_heatmap", dpi)
+    return figure
+
+
 def write_tables(
     long_df: pd.DataFrame,
     status_df: pd.DataFrame,
@@ -943,7 +1169,7 @@ def write_tables(
     )
     if not pairwise_df.empty:
         pairwise_df.to_csv(
-            output_dir / f"{cohort}.model_pairwise_wilcoxon.tsv",
+            output_dir / f"{cohort}.model_pairwise_paired_ttest.tsv",
             sep="\t",
             index=False,
             na_rep="",
@@ -1004,7 +1230,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         for model in order
         if int(status_df.loc[status_df["model"] == model, "traits_found"].iloc[0]) > 0
     ]
-    pairwise_df = pairwise_wilcoxon_tests(long_df, tested_models)
+    pairwise_df = pairwise_paired_t_tests(long_df, tested_models)
     letters = compact_letter_display(tested_models, pairwise_df)
     friedman_p = friedman_pvalue(long_df, tested_models)
     top_df = calculate_top_k(long_df, order, traits, args.top_k)
@@ -1038,6 +1264,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             len(traits),
             output_dir,
             args.dpi,
+        ),
+        plot_performance_heatmap(
+            long_df,
+            traits,
+            args.cohort,
+            output_dir,
+            args.dpi,
+            letters=letters,
+            friedman_p=friedman_p,
         ),
     ]
     print_summary(status_df, output_dir)
