@@ -3,16 +3,16 @@ PHENO_FILE=species_data/Maize1404/benchmark.pheno
 VCF_FILE=species_data/Maize1404/Maize1404.LD.rename.vcf.gz
 
 COHORT=Soybean2795
-PHENO_FILE=species_data/Soybean2795/benchmark.pheno
-VCF_FILE=species_data/Soybean2795/Soybean2795.LD.rename.vcf.gz
+PHENO_FILE=species_data/$COHORT/benchmark.pheno
+VCF_FILE=species_data/$COHORT/Soybean2795.LD.rename.vcf.gz
 
 COHORT=wheat850_Nature2024
-PHENO_FILE=species_data/Maize1404/benchmark.pheno
-VCF_FILE=species_data/Maize1404/Wheat850.LD.vcf.gz
+PHENO_FILE=species_data/$COHORT/benchmark.pheno
+VCF_FILE=species_data/$COHORT/Wheat850.LD.vcf.gz
 
 COHORT=Tomato706
-PHENO_FILE=species_data/Tomato706/benchmark.pheno
-VCF_FILE=species_data/Tomato706/Tomato706.LD.vcf.gz
+PHENO_FILE=species_data/$COHORT/benchmark.pheno
+VCF_FILE=species_data/$COHORT/Tomato706.LD.vcf.gz
 
 export PATH="$CONDA_PREFIX/bin:$PATH"
 

@@ -63,6 +63,9 @@ aquila-cv = "aquila.scripts.aquila_cv:main"
 aquila-data-cv = "aquila.scripts.aquila_data_cv:main"
 aquila-train-cv = "aquila.scripts.aquila_train_cv:main"
 aquila-predict-cv = "aquila.scripts.aquila_predict:main"
+aquila-gff-to-index = "aquila.scripts.aquila_gff_to_index:main"
+aquila-ig-gene-discovery = "aquila.scripts.aquila_ig_gene_discovery:main"
+aquila-ig-gene-plot = "aquila.scripts.aquila_ig_gene_plot:main"
 
 [project.urls]
 Homepage = "https://github.com/GooLey1025/aquila"

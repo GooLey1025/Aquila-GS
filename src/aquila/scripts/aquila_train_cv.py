@@ -211,6 +211,7 @@ def _trainer_kwargs(
         "device": device,
         "learning_rate": float(train.get("learning_rate", 1e-4)),
         "weight_decay": float(train.get("weight_decay", 1e-5)),
+        "l2_scale": float(config.get("model", {}).get("l2_scale", 0.0) or 0.0),
         "loss_type": str(train.get("loss_type", "mse")),
         "uncertainty_weighting": bool(
             train.get("uncertainty_weighting", False)
@@ -982,9 +983,13 @@ def _finalize_outer_fold(
             training_seed,
         ),
     )
+    scheduler_epochs = int(
+        selected_config.get("train", {}).get("num_epochs", final_epoch)
+    )
     final_training = final_trainer.train_fixed_epochs(
         final_train_loader,
         epochs=final_epoch,
+        scheduler_epochs=scheduler_epochs,
     )
     normalized = final_trainer.evaluate(outer_test_loader)
     n_regression = len(regression_tasks)
@@ -1028,6 +1033,7 @@ def _finalize_outer_fold(
         "outer_fold": fold_id,
         "selected_hyperparameters": dict(hpo_result.best.parameters),
         "final_epoch": final_epoch,
+        "scheduler_epochs": scheduler_epochs,
     }
     torch.save(checkpoint, fold_directory / "best_model.pt")
     final_processor.save_json(fold_directory / "preprocessing.json")
@@ -1085,6 +1091,7 @@ def _finalize_outer_fold(
         ),
         "worker_seed": worker_seed,
         "training_seed": training_seed,
+        "scheduler_epochs": scheduler_epochs,
         "elapsed_seconds": time.time() - started,
         "python": platform.python_version(),
         "torch": torch.__version__,
@@ -1098,6 +1105,7 @@ def _finalize_outer_fold(
         "selected_hyperparameters": dict(hpo_result.best.parameters),
         "inner_best_epochs": list(hpo_result.best.best_epochs),
         "final_epoch": final_epoch,
+        "scheduler_epochs": scheduler_epochs,
         "metrics": metrics,
         "runtime": runtime,
     }

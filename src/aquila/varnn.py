@@ -478,6 +478,63 @@ class MultiBranchNeuralNetwork(VariantsNeuralNetwork):
         return outputs
 
 
+def _apply_model_d_model(model_params: dict) -> None:
+    """Keep embedder / tower / transformer / pool width in sync with ``d_model``.
+
+    Nested-CV HPO cannot independently set ``multi_head_pool.d_model`` to 512
+    while the trunk still emits 256. One ``model.d_model`` value rewrites the
+    matching channel fields. Transformer ``d_ff`` follows when it currently
+    equals ``d_model``.
+    """
+    if "d_model" not in model_params or model_params["d_model"] is None:
+        return
+    width = int(model_params["d_model"])
+    conv_names = {
+        "conv_block",
+        "std_down_conv_tower",
+        "down_conv_tower",
+    }
+    width_names = {
+        "transformer",
+        "transformer_mqa",
+        "transformer_mha",
+        "multi_head_pool",
+    }
+    width_keys = ("in_channels", "out_channels", "d_model", "d_ff")
+
+    def _rewrite(block: dict) -> None:
+        name = str(block.get("name") or "")
+        for key in width_keys:
+            if block.get(key) == "d_model" and not (
+                name == "conv_block" and key == "in_channels"
+            ):
+                block[key] = width
+        if name in conv_names:
+            if name != "conv_block":
+                block["in_channels"] = width
+            block["out_channels"] = width
+            return
+        if name in width_names or "d_model" in block:
+            old = block.get("d_model")
+            block["d_model"] = width
+            d_ff = block.get("d_ff")
+            if d_ff == "d_model":
+                block["d_ff"] = width
+            elif d_ff is not None and old not in (None, "d_model") and int(d_ff) == int(old):
+                block["d_ff"] = width
+
+    embedder = model_params.get("embedder")
+    blocks = embedder if isinstance(embedder, list) else (
+        [embedder] if isinstance(embedder, dict) else []
+    )
+    for block in blocks:
+        if isinstance(block, dict):
+            _rewrite(block)
+    for block in model_params.get("trunk") or []:
+        if isinstance(block, dict):
+            _rewrite(block)
+
+
 def create_model_from_config(
     config: dict,
     seq_length: int,
@@ -503,6 +560,7 @@ def create_model_from_config(
 
     # Deep copy to avoid modifying original config
     model_params = copy.deepcopy(config.get('model', {}))
+    _apply_model_d_model(model_params)
     train_config = config.get('train', {})
 
     # Check for multi-branch architecture

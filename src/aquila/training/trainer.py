@@ -89,6 +89,7 @@ class NestedCVTrainer:
         device: torch.device | str | None = None,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-5,
+        l2_scale: float = 0.0,
         loss_type: str = "mse",
         uncertainty_weighting: bool = False,
         huber_delta: float = 1.0,
@@ -118,6 +119,7 @@ class NestedCVTrainer:
         self.gradient_clip_norm = gradient_clip_norm
         self.use_bf16 = bool(use_bf16 and supports_bf16(self.device))
         self.learning_rate = float(learning_rate)
+        self.l2_scale = float(l2_scale)
         self.scheduler_type = _normalize_scheduler_type(scheduler_type)
         self.scheduler_params = dict(scheduler_params or {})
         self.scheduler: Any | None = None
@@ -252,12 +254,22 @@ class NestedCVTrainer:
         train_loader: DataLoader,
         *,
         epochs: int,
+        scheduler_epochs: int | None = None,
     ) -> TrainingResult:
-        """Train for exactly ``epochs`` passes without validation or stopping."""
+        """Train for ``epochs`` while preserving the source LR schedule horizon.
+
+        ``scheduler_epochs`` should match the maximum epoch count used when
+        selecting ``epochs`` (for example, during inner-fold early stopping).
+        This keeps epoch N on the same learning-rate trajectory during refit.
+        """
         if epochs < 1:
             raise ValueError("epochs must be positive")
-        # Schedule over the actual refit length so cosine reaches min_lr at end.
-        self._configure_scheduler(train_loader, num_epochs=int(epochs))
+        schedule_horizon = (
+            int(epochs) if scheduler_epochs is None else int(scheduler_epochs)
+        )
+        if schedule_horizon < int(epochs):
+            raise ValueError("scheduler_epochs must be greater than or equal to epochs")
+        self._configure_scheduler(train_loader, num_epochs=schedule_horizon)
         history = []
         for epoch in range(1, int(epochs) + 1):
             history.append(
@@ -457,6 +469,15 @@ class NestedCVTrainer:
                     return_details=False,
                 )
                 loss = loss_value[0] if isinstance(loss_value, tuple) else loss_value
+            if self.l2_scale > 0:
+                l2 = None
+                for param in self.model.parameters():
+                    if not param.requires_grad:
+                        continue
+                    term = param.square().sum()
+                    l2 = term if l2 is None else l2 + term
+                if l2 is not None:
+                    loss = loss + self.l2_scale * l2
             # Do not torch.isfinite(loss) per step — that forces a device sync
             # every batch and caps sustained GPU utilization.
             loss.backward()

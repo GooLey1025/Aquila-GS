@@ -33,7 +33,7 @@ import shutil
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Hashable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -132,6 +132,41 @@ class RoundResult:
             self.snp_mc_details = {}
         if self.gain == 0.0 and self.si_gain != 0.0:
             self.gain = self.si_gain
+
+
+@dataclass
+class ParetoCandidate:
+    """A sparsely represented genotype evaluated during Pareto-beam search."""
+    key: Hashable
+    edits: Dict[int, torch.Tensor]
+    preds_norm: np.ndarray
+    embedding: np.ndarray
+    depth: int
+    parent_key: Optional[Hashable] = None
+    last_snp_idx: int = -1
+
+
+@dataclass
+class ParetoRoundResult:
+    """Compact diagnostics for one Pareto-beam iteration."""
+    round_num: int
+    generated: int
+    evaluated: int
+    admissible: int
+    beam_size: int
+    archive_size: int
+    archive_changed: bool
+    front_sizes: List[int] = field(default_factory=list)
+
+
+@dataclass
+class ParetoSearchResult:
+    """Result of a complete Pareto-beam search."""
+    beam: List[ParetoCandidate]
+    archive: List[ParetoCandidate]
+    representatives: List[ParetoCandidate]
+    rounds: List[ParetoRoundResult]
+    evaluated_count: int
 
 
 ###############################################################################
@@ -343,6 +378,45 @@ def predict_all_phenos(
                 preds = torch.sigmoid(outputs['classification']).cpu().numpy()
             all_preds.append(preds)
     return np.concatenate(all_preds, axis=0)
+
+
+def predict_phenos_and_embeddings(
+    model, genotype_batch, device: str, is_multi_branch: bool,
+    batch_size: int = 16,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Predict phenotypes and extract a fixed-length shared-trunk representation."""
+    if is_multi_branch:
+        n = next(iter(genotype_batch.values())).shape[0]
+    else:
+        n = genotype_batch.shape[0]
+
+    all_preds, all_embeddings = [], []
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            if is_multi_branch:
+                sub_batch = {k: v[start:end].to(device) for k, v in genotype_batch.items()}
+            else:
+                sub_batch = genotype_batch[start:end].to(device)
+            outputs = model(sub_batch, return_embeddings=True)
+            if 'regression' in outputs:
+                preds = outputs['regression']
+            else:
+                preds = torch.sigmoid(outputs['classification'])
+            embedding = outputs.get('embeddings')
+            if embedding is None:
+                raise ValueError(
+                    "Model did not return shared embeddings required by Pareto-beam pruning"
+                )
+            # Some trunks retain a sequence axis. Mean pooling gives one stable
+            # representation per genotype without involving trait-head outputs.
+            if embedding.ndim > 2:
+                embedding = embedding.flatten(start_dim=1, end_dim=-2).mean(dim=1)
+            elif embedding.ndim == 1:
+                embedding = embedding.unsqueeze(0)
+            all_preds.append(preds.detach().cpu().numpy())
+            all_embeddings.append(embedding.detach().float().cpu().numpy())
+    return np.concatenate(all_preds, axis=0), np.concatenate(all_embeddings, axis=0)
 
 
 def denormalize_predictions(
@@ -1174,6 +1248,375 @@ def build_mutation_candidates_for_snp(
         return candidates
 
     return []
+
+
+###############################################################################
+# Pareto-beam multi-trait optimization
+###############################################################################
+
+def oriented_objectives(
+    preds_norm: np.ndarray, direction: DirectionModes,
+) -> np.ndarray:
+    """Return maximize-oriented objectives for maximize/minimize traits."""
+    modes = np.asarray(direction.modes)
+    objective_indices = np.where(np.isin(modes, ['maximize', 'minimize']))[0]
+    if objective_indices.size == 0:
+        raise ValueError(
+            "Pareto-beam search requires at least one maximize or minimize trait"
+        )
+    signs = np.where(modes[objective_indices] == 'maximize', 1.0, -1.0)
+    return np.asarray(preds_norm)[:, objective_indices] * signs
+
+
+def neutral_guardrail_mask(
+    preds_norm: np.ndarray,
+    reference_preds_norm: np.ndarray,
+    direction: DirectionModes,
+    tolerances: np.ndarray,
+) -> np.ndarray:
+    """Test neutral/maintain traits against absolute Z-score tolerances."""
+    neutral_indices = np.where(np.isin(direction.modes, ['neutral', 'maintain']))[0]
+    if neutral_indices.size == 0:
+        return np.ones(len(preds_norm), dtype=bool)
+    refs = np.asarray(reference_preds_norm)
+    if refs.ndim == 1:
+        refs = np.broadcast_to(refs, np.asarray(preds_norm).shape)
+    deltas = np.abs(
+        np.asarray(preds_norm)[:, neutral_indices] - refs[:, neutral_indices]
+    )
+    return np.all(deltas <= tolerances[neutral_indices] + 1e-12, axis=1)
+
+
+def pareto_nondominated_sort(objectives: np.ndarray) -> List[List[int]]:
+    """Partition maximize-oriented objective rows into nondominated fronts."""
+    values = np.asarray(objectives, dtype=float)
+    n = len(values)
+    dominates_set: List[List[int]] = [[] for _ in range(n)]
+    domination_count = np.zeros(n, dtype=int)
+    fronts: List[List[int]] = [[]]
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            i_dom_j = bool(np.all(values[i] >= values[j]) and np.any(values[i] > values[j]))
+            j_dom_i = bool(np.all(values[j] >= values[i]) and np.any(values[j] > values[i]))
+            if i_dom_j:
+                dominates_set[i].append(j)
+                domination_count[j] += 1
+            elif j_dom_i:
+                dominates_set[j].append(i)
+                domination_count[i] += 1
+    fronts[0] = np.where(domination_count == 0)[0].tolist()
+
+    rank = 0
+    while rank < len(fronts) and fronts[rank]:
+        next_front = []
+        for i in fronts[rank]:
+            for j in dominates_set[i]:
+                domination_count[j] -= 1
+                if domination_count[j] == 0:
+                    next_front.append(j)
+        if next_front:
+            fronts.append(next_front)
+        rank += 1
+    return fronts
+
+
+def _standardize_representations(representations: np.ndarray) -> np.ndarray:
+    reps = np.asarray(representations, dtype=float)
+    means = reps.mean(axis=0, keepdims=True)
+    stds = reps.std(axis=0, keepdims=True)
+    stds[stds < 1e-12] = 1.0
+    return (reps - means) / stds
+
+
+def representation_farthest_sampling(
+    candidates: Sequence[ParetoCandidate],
+    n_select: int,
+    already_selected: Optional[Sequence[ParetoCandidate]] = None,
+) -> List[ParetoCandidate]:
+    """Select latent-space representatives by deterministic farthest-point sampling."""
+    candidates = list(candidates)
+    selected = list(already_selected or [])
+    if n_select <= 0 or not candidates:
+        return []
+    if len(candidates) <= n_select:
+        return candidates
+
+    combined = selected + candidates
+    reps = _standardize_representations(
+        np.stack([np.asarray(c.embedding).ravel() for c in combined])
+    )
+    selected_indices = list(range(len(selected)))
+    remaining = list(range(len(selected), len(combined)))
+    chosen: List[int] = []
+
+    while remaining and len(chosen) < n_select:
+        anchors = selected_indices + chosen
+        if anchors:
+            distances = np.linalg.norm(
+                reps[remaining, None, :] - reps[np.asarray(anchors)][None, :, :],
+                axis=2,
+            )
+            scores = distances.min(axis=1)
+        else:
+            centroid = reps[remaining].mean(axis=0)
+            scores = np.linalg.norm(reps[remaining] - centroid, axis=1)
+        next_pos = int(np.argmax(scores))
+        chosen_idx = remaining.pop(next_pos)
+        chosen.append(chosen_idx)
+    return [combined[i] for i in chosen]
+
+
+def select_pareto_beam(
+    candidates: Sequence[ParetoCandidate],
+    direction: DirectionModes,
+    beam_width: int,
+) -> Tuple[List[ParetoCandidate], List[List[int]]]:
+    """Fill a finite beam by Pareto rank and latent-space diversity."""
+    candidates = list(candidates)
+    if not candidates or beam_width <= 0:
+        return [], []
+    objectives = oriented_objectives(
+        np.stack([c.preds_norm for c in candidates]), direction
+    )
+    fronts = pareto_nondominated_sort(objectives)
+    selected: List[ParetoCandidate] = []
+    for front in fronts:
+        front_candidates = [candidates[i] for i in front]
+        remaining = beam_width - len(selected)
+        if remaining <= 0:
+            break
+        if len(front_candidates) <= remaining:
+            selected.extend(front_candidates)
+        else:
+            selected.extend(
+                representation_farthest_sampling(
+                    front_candidates, remaining, already_selected=selected
+                )
+            )
+            break
+    return selected, fronts
+
+
+def update_pareto_archive(
+    archive: Sequence[ParetoCandidate],
+    candidates: Sequence[ParetoCandidate],
+    direction: DirectionModes,
+) -> List[ParetoCandidate]:
+    """Merge candidates into a cumulative nondominated archive."""
+    merged_by_key = {candidate.key: candidate for candidate in archive}
+    merged_by_key.update({candidate.key: candidate for candidate in candidates})
+    merged = list(merged_by_key.values())
+    if not merged:
+        return []
+    objectives = oriented_objectives(
+        np.stack([c.preds_norm for c in merged]), direction
+    )
+    first_front = pareto_nondominated_sort(objectives)[0]
+    return [merged[i] for i in first_front]
+
+
+def select_pareto_compromise(
+    candidates: Sequence[ParetoCandidate],
+    direction: DirectionModes,
+) -> ParetoCandidate:
+    """Select a deterministic balanced solution nearest the normalized ideal point."""
+    candidates = list(candidates)
+    if not candidates:
+        raise ValueError("Cannot select a compromise from an empty Pareto set")
+    objectives = oriented_objectives(
+        np.stack([candidate.preds_norm for candidate in candidates]), direction
+    )
+    minima = objectives.min(axis=0)
+    ranges = objectives.max(axis=0) - minima
+    ranges[ranges < 1e-12] = 1.0
+    normalized = (objectives - minima) / ranges
+    distances = np.linalg.norm(1.0 - normalized, axis=1)
+    return candidates[int(np.argmin(distances))]
+
+
+def _candidate_key(edits: Dict[int, torch.Tensor]) -> Tuple[Tuple[int, bytes], ...]:
+    return tuple(
+        (idx, np.asarray(encoding.detach().cpu(), dtype=np.float32).tobytes())
+        for idx, encoding in sorted(edits.items())
+    )
+
+
+def _materialize_candidate_batch(
+    baseline_tensors,
+    candidates: Sequence[ParetoCandidate],
+    is_multi_branch: bool,
+):
+    if is_multi_branch:
+        batch = {
+            key: tensor[0:1].repeat(len(candidates), *([1] * (tensor.ndim - 1)))
+            for key, tensor in baseline_tensors.items()
+        }
+        snp_batch = batch['snp']
+    else:
+        batch = baseline_tensors[0:1].repeat(
+            len(candidates), *([1] * (baseline_tensors.ndim - 1))
+        )
+        snp_batch = batch
+    for row, candidate in enumerate(candidates):
+        for snp_idx, encoding in candidate.edits.items():
+            snp_batch[row, snp_idx] = encoding.to(snp_batch.dtype)
+    return batch
+
+
+def _snp_tensor(genotype_tensors, is_multi_branch: bool) -> torch.Tensor:
+    return genotype_tensors['snp'] if is_multi_branch else genotype_tensors
+
+
+def pareto_beam_search(
+    model,
+    baseline_tensors,
+    variant_info: dict,
+    direction: DirectionModes,
+    evolvable_indices: Sequence[int],
+    encoding_dim: int,
+    device: str,
+    is_multi_branch: bool,
+    beam_width: int,
+    max_iterations: int,
+    neutral_tolerances: np.ndarray,
+    neutral_reference: str = 'initial',
+    panel_genotypes: Optional[List[set]] = None,
+    homozygous_only: bool = False,
+    batch_size: int = 16,
+    archive_limit: Optional[int] = None,
+    no_improvement_patience: int = 1,
+) -> ParetoSearchResult:
+    """Run iterative single-QTN Pareto-beam search with prediction caching."""
+    if beam_width < 1:
+        raise ValueError("beam_width must be >= 1")
+    if neutral_reference not in {'initial', 'parent'}:
+        raise ValueError("neutral_reference must be 'initial' or 'parent'")
+
+    baseline_batch = (
+        {k: v[0:1] for k, v in baseline_tensors.items()}
+        if is_multi_branch else baseline_tensors[0:1]
+    )
+    baseline_preds, baseline_embeddings = predict_phenos_and_embeddings(
+        model, baseline_batch, device, is_multi_branch, batch_size
+    )
+    baseline = ParetoCandidate(
+        key=(), edits={}, preds_norm=baseline_preds[0],
+        embedding=baseline_embeddings[0], depth=0,
+    )
+    cache: Dict[Hashable, ParetoCandidate] = {baseline.key: baseline}
+    beam = [baseline]
+    archive = [baseline]
+    round_results: List[ParetoRoundResult] = []
+    stale_rounds = 0
+    snp_info = variant_info.get('snp', {})
+    refs = snp_info.get('refs', [])
+    alts = snp_info.get('alts', [])
+    baseline_snp = _snp_tensor(baseline_tensors, is_multi_branch)[0]
+
+    for round_num in range(1, max_iterations + 1):
+        generated: Dict[Hashable, ParetoCandidate] = {}
+        for parent in beam:
+            for snp_idx in evolvable_indices:
+                current_encoding = parent.edits.get(snp_idx, baseline_snp[snp_idx])
+                available_gts = (
+                    panel_genotypes[snp_idx]
+                    if panel_genotypes is not None and snp_idx < len(panel_genotypes)
+                    else None
+                )
+                ref = refs[snp_idx] if snp_idx < len(refs) else ''
+                alt = alts[snp_idx] if snp_idx < len(alts) else ''
+                encodings = build_mutation_candidates_for_snp(
+                    current_encoding, encoding_dim, ref, alt,
+                    available_gts=available_gts,
+                    homozygous_only=homozygous_only,
+                )
+                for encoding in encodings:
+                    edits = dict(parent.edits)
+                    if torch.equal(
+                        encoding.detach().cpu().to(baseline_snp.dtype),
+                        baseline_snp[snp_idx].detach().cpu(),
+                    ):
+                        edits.pop(snp_idx, None)
+                    else:
+                        edits[snp_idx] = encoding.detach().cpu()
+                    key = _candidate_key(edits)
+                    if key in cache or key in generated:
+                        continue
+                    generated[key] = ParetoCandidate(
+                        key=key, edits=edits,
+                        preds_norm=np.empty(0), embedding=np.empty(0),
+                        depth=round_num, parent_key=parent.key,
+                        last_snp_idx=snp_idx,
+                    )
+
+        new_candidates = list(generated.values())
+        for start in range(0, len(new_candidates), batch_size):
+            chunk = new_candidates[start:start + batch_size]
+            genotype_batch = _materialize_candidate_batch(
+                baseline_tensors, chunk, is_multi_branch
+            )
+            preds, embeddings = predict_phenos_and_embeddings(
+                model, genotype_batch, device, is_multi_branch, batch_size
+            )
+            for candidate, pred, embedding in zip(chunk, preds, embeddings):
+                candidate.preds_norm = pred
+                candidate.embedding = embedding
+                cache[candidate.key] = candidate
+
+        if not new_candidates:
+            break
+        candidate_preds = np.stack([c.preds_norm for c in new_candidates])
+        if neutral_reference == 'parent':
+            reference_preds = np.stack([
+                cache[c.parent_key].preds_norm for c in new_candidates
+            ])
+        else:
+            reference_preds = baseline.preds_norm
+        admissible_mask = neutral_guardrail_mask(
+            candidate_preds, reference_preds, direction, neutral_tolerances
+        )
+        admissible = [
+            candidate for candidate, keep in zip(new_candidates, admissible_mask) if keep
+        ]
+        old_archive_keys = {candidate.key for candidate in archive}
+        archive = update_pareto_archive(archive, admissible, direction)
+        archive_changed = {candidate.key for candidate in archive} != old_archive_keys
+
+        beam, fronts = select_pareto_beam(admissible, direction, beam_width)
+        round_results.append(ParetoRoundResult(
+            round_num=round_num,
+            generated=len(generated),
+            evaluated=len(new_candidates),
+            admissible=len(admissible),
+            beam_size=len(beam),
+            archive_size=len(archive),
+            archive_changed=archive_changed,
+            front_sizes=[len(front) for front in fronts],
+        ))
+        if not beam:
+            break
+        stale_rounds = 0 if archive_changed else stale_rounds + 1
+        if stale_rounds >= max(1, no_improvement_patience):
+            break
+
+    n_representatives = archive_limit if archive_limit is not None else len(archive)
+    representatives = representation_farthest_sampling(
+        archive, min(n_representatives, len(archive))
+    )
+    if representatives:
+        compromise = select_pareto_compromise(representatives, direction)
+        representatives = [
+            compromise,
+            *(candidate for candidate in representatives if candidate.key != compromise.key),
+        ]
+    return ParetoSearchResult(
+        beam=beam,
+        archive=archive,
+        representatives=representatives,
+        rounds=round_results,
+        evaluated_count=len(cache),
+    )
 
 
 ###############################################################################

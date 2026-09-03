@@ -11,6 +11,7 @@ Supports QTN gene annotation on the smoothed importance panel.
 """
 
 import argparse
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -87,6 +88,11 @@ def parse_args():
     parser.add_argument("--importance", type=str, required=True, help="Path to importance ranking file (mean)")
     parser.add_argument("-o", "--output", type=str, default="gwas_ig_comparison_v3.png",
                         help="Output image path (.png or .pdf, suffix determines format)")
+    parser.add_argument(
+        "--also-png",
+        action="store_true",
+        help="Also save a PNG copy alongside the primary output",
+    )
     parser.add_argument("--sig-threshold", type=float, default=4.259270e-06,
                         help="GWAS significance threshold (default: 4.259270e-06)")
     parser.add_argument("--show-std", action="store_true", help="Show standard deviation error band")
@@ -328,6 +334,7 @@ def create_comparison_plot(
     gwas_df,
     importance_df,
     output_path,
+    also_png=False,
     sig_threshold=4.259270e-06,
     show_std=False,
     smooth_sigma=0,
@@ -587,6 +594,12 @@ def create_comparison_plot(
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"Saved: {output_path}")
 
+    if also_png:
+        png_path = str(Path(output_path).with_suffix(".png"))
+        if Path(png_path) != Path(output_path):
+            plt.savefig(png_path, dpi=300, bbox_inches="tight")
+            print(f"Saved: {png_path}")
+
     plt.close()
 
 
@@ -615,6 +628,7 @@ def main():
         gwas_df=gwas_df,
         importance_df=importance_df,
         output_path=args.output,
+        also_png=args.also_png,
         sig_threshold=args.sig_threshold,
         show_std=args.show_std,
         smooth_sigma=args.smooth,

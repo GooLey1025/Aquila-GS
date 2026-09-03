@@ -30,6 +30,7 @@ from tqdm import tqdm
 from aquila.evolve import (
     DirectionModes,
     RoundResult,
+    apply_multi_snp_mutations,
     clone_genotype_tensors,
     compute_selection_index_normalized,
     create_model,
@@ -38,6 +39,7 @@ from aquila.evolve import (
     load_checkpoint,
     load_model_and_config,
     load_vcf_data,
+    pareto_beam_search,
     predict_all_phenos,
     strategy_combinatorial,
     strategy_screening,
@@ -123,9 +125,34 @@ def parse_args():
     )
     parser.add_argument(
         '--strategy', type=str, default='screening',
-        choices=['screening', 'combinatorial'],
+        choices=['screening', 'combinatorial', 'pareto-beam'],
         help='Evolution strategy: screening (MC interaction-aware SNP screening), '
-             'combinatorial (random+combo)'
+             'combinatorial (random+combo), or pareto-beam '
+             '(multi-trait nondominated beam search)'
+    )
+    parser.add_argument(
+        '--beam-width', type=int, default=16,
+        help='Maximum active genotypes retained by pareto-beam (default: %(default)s)'
+    )
+    parser.add_argument(
+        '--archive-size', type=int, default=None,
+        help='Number of representative final Pareto genotypes to write. '
+             'Default: write the full nondominated archive'
+    )
+    parser.add_argument(
+        '--neutral-tolerance', type=float, default=0.5,
+        help='Default absolute Z-score tolerance for neutral/maintain traits '
+             'in pareto-beam search (default: %(default)s)'
+    )
+    parser.add_argument(
+        '--neutral-tolerance-file', type=str, default=None,
+        help='Optional whitespace-separated file: <trait> <z_tolerance>. '
+             'Overrides --neutral-tolerance per trait'
+    )
+    parser.add_argument(
+        '--neutral-reference', choices=['initial', 'parent'], default='initial',
+        help='Neutral guardrail reference in pareto-beam: initial genotype '
+             'or each candidate parent (default: %(default)s)'
     )
     parser.add_argument(
         '--iterations', type=int, default=None,
@@ -721,6 +748,149 @@ def write_combinatorial_snp_gains(out_dir: str, round_results: List[RoundResult]
             f.write('\n'.join(mc_lines) + '\n')
 
 
+def load_neutral_tolerances(
+    regression_tasks: List[str], default_tolerance: float,
+    tolerance_file: Optional[str],
+) -> np.ndarray:
+    """Build per-trait neutral guardrail tolerances in Z-score space."""
+    if default_tolerance < 0:
+        raise ValueError("--neutral-tolerance must be non-negative")
+    tolerances = np.full(len(regression_tasks), default_tolerance, dtype=float)
+    if tolerance_file is None:
+        return tolerances
+    overrides = {}
+    with open(tolerance_file) as handle:
+        for line_num, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                raise ValueError(
+                    f"{tolerance_file}:{line_num}: expected <trait> <z_tolerance>"
+                )
+            tolerance = float(parts[1])
+            if tolerance < 0:
+                raise ValueError(
+                    f"{tolerance_file}:{line_num}: tolerance must be non-negative"
+                )
+            overrides[parts[0]] = tolerance
+    unknown = sorted(set(overrides) - set(regression_tasks))
+    if unknown:
+        raise ValueError(
+            "Unknown traits in neutral tolerance file: " + ", ".join(unknown)
+        )
+    for index, trait in enumerate(regression_tasks):
+        if trait in overrides:
+            tolerances[index] = overrides[trait]
+    return tolerances
+
+
+def write_pareto_outputs(
+    args, result, baseline_tensors, sample_id: str,
+    regression_tasks: List[str], direction: DirectionModes,
+    norm_stats, log_tasks: List[str], is_multi_branch: bool,
+) -> None:
+    """Write the Pareto archive, trace, representative VCFs, and primary result."""
+    out_dir = Path(args.output_dir) if args.output_dir else Path(args.vcf).parent
+    archive_dir = out_dir / "pareto_archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    input_path = Path(args.vcf)
+    suffix = '.vcf.gz' if input_path.suffix == '.gz' else '.vcf'
+
+    representative_ranks = {
+        candidate.key: i + 1 for i, candidate in enumerate(result.representatives)
+    }
+    rows = []
+    for archive_index, candidate in enumerate(result.archive, start=1):
+        denorm = denormalize_predictions(
+            candidate.preds_norm.reshape(1, -1),
+            norm_stats, regression_tasks, log_tasks,
+        )[0]
+        row = {
+            'archive_index': archive_index,
+            'representative_index': representative_ranks.get(candidate.key, ''),
+            'depth': candidate.depth,
+            'n_qtn_changes': len(candidate.edits),
+            'qtn_indices': ','.join(str(i) for i in sorted(candidate.edits)),
+        }
+        for task_index, task in enumerate(regression_tasks):
+            row[f'{task}_mode'] = direction.modes[task_index]
+            row[f'{task}_pred_z'] = candidate.preds_norm[task_index]
+            row[f'{task}_pred'] = denorm[task_index]
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(out_dir / "pareto_archive.tsv", sep='\t', index=False)
+    pd.DataFrame([
+        {
+            'round': rr.round_num,
+            'generated': rr.generated,
+            'evaluated': rr.evaluated,
+            'admissible': rr.admissible,
+            'beam_size': rr.beam_size,
+            'archive_size': rr.archive_size,
+            'archive_changed': int(rr.archive_changed),
+            'front_sizes': ','.join(map(str, rr.front_sizes)),
+        }
+        for rr in result.rounds
+    ]).to_csv(out_dir / "pareto_search_trace.tsv", sep='\t', index=False)
+
+    for rep_index, candidate in enumerate(result.representatives, start=1):
+        evolved = apply_multi_snp_mutations(
+            baseline_tensors, list(candidate.edits.items()), is_multi_branch
+        )
+        evolved_genotypes = {}
+        if is_multi_branch:
+            for variant_type, tensor in evolved.items():
+                evolved_genotypes[variant_type] = tensor[0].cpu().numpy()
+        else:
+            evolved_genotypes['snp'] = evolved[0].cpu().numpy()
+        write_evolved_vcf(
+            original_vcf_path=args.vcf,
+            output_vcf_path=str(archive_dir / f"pareto_{rep_index:03d}{suffix}"),
+            evolved_genotypes=evolved_genotypes,
+            evolved_sample_name=f"{sample_id}_pareto_{rep_index:03d}",
+            phased=args.phased,
+            verbose=False,
+        )
+
+    if not result.representatives:
+        return
+    primary = result.representatives[0]
+    primary_tensors = apply_multi_snp_mutations(
+        baseline_tensors, list(primary.edits.items()), is_multi_branch
+    )
+    output_vcf = args.output_vcf
+    if output_vcf is None:
+        stem = input_path.stem.replace('.vcf', '')
+        output_vcf = str(out_dir / f"{stem}_evolve{suffix}")
+    evolved_genotypes = {}
+    if is_multi_branch:
+        for variant_type, tensor in primary_tensors.items():
+            evolved_genotypes[variant_type] = tensor[0].cpu().numpy()
+    else:
+        evolved_genotypes['snp'] = primary_tensors[0].cpu().numpy()
+    write_evolved_vcf(
+        original_vcf_path=args.vcf,
+        output_vcf_path=output_vcf,
+        evolved_genotypes=evolved_genotypes,
+        evolved_sample_name=f"{sample_id}_evolve",
+        phased=args.phased,
+        verbose=True,
+    )
+    output_pred = args.output_pred or str(
+        out_dir / f"{Path(output_vcf).stem}_predictions.tsv"
+    )
+    denorm = denormalize_predictions(
+        primary.preds_norm.reshape(1, -1),
+        norm_stats, regression_tasks, log_tasks,
+    )[0]
+    prediction_row = {'Sample_ID': [f"{sample_id}_evolve"]}
+    for task_index, task in enumerate(regression_tasks):
+        prediction_row[f'{task}_Pred'] = [denorm[task_index]]
+        prediction_row[f'{task}_Pred_Z'] = [primary.preds_norm[task_index]]
+    pd.DataFrame(prediction_row).to_csv(output_pred, sep='\t', index=False)
+
+
 ###############################################################################
 # Main evolution orchestrator
 ###############################################################################
@@ -931,11 +1101,19 @@ def run_evolution(args):
                 print(f"  {t}: {m} (weight={w})")
 
     if direction is None:
-        direction = DirectionModes(
-            modes=np.array(['maximize'] * len(regression_tasks)),
-            weights=np.ones(len(regression_tasks)),
-        )
-        print(f"\n[Target] Direction: all traits maximize (default)")
+        if args.strategy == 'pareto-beam' and args.pheno is not None:
+            modes = np.array(['neutral'] * len(regression_tasks))
+            modes[pheno_idx] = args.mode
+            weights = np.zeros(len(regression_tasks))
+            weights[pheno_idx] = 1.0 if args.mode == 'maximize' else -1.0
+            direction = DirectionModes(modes=modes, weights=weights)
+            print(f"\n[Target] Pareto objective: {regression_tasks[pheno_idx]} {args.mode}")
+        else:
+            direction = DirectionModes(
+                modes=np.array(['maximize'] * len(regression_tasks)),
+                weights=np.ones(len(regression_tasks)),
+            )
+            print(f"\n[Target] Direction: all traits maximize (default)")
 
     encoding_dim = get_encoding_dim(variant_tensors)
     print(f"[Encoding] Dimension: {encoding_dim}")
@@ -960,6 +1138,64 @@ def run_evolution(args):
         print(f"\n[Ref panel] Loading from {args.ref_vcf}...")
         panel_genotypes = load_panel_genotypes(args.ref_vcf, n_snps)
         print(f"  Loaded panel genotypes for {n_snps} SNPs")
+
+    if args.strategy == 'pareto-beam':
+        unsupported = sorted(set(direction.modes) - {
+            'maximize', 'minimize', 'neutral', 'maintain'
+        })
+        if unsupported:
+            raise ValueError(
+                "Pareto-beam supports maximize, minimize, neutral, and maintain; "
+                f"unsupported modes: {', '.join(unsupported)}"
+            )
+        n_snps = (
+            variant_tensors.shape[1]
+            if not is_multi_branch else variant_tensors['snp'].shape[1]
+        )
+        pareto_sites = (
+            evolvable_indices if evolvable_indices is not None else list(range(n_snps))
+        )
+        neutral_tolerances = load_neutral_tolerances(
+            regression_tasks, args.neutral_tolerance,
+            args.neutral_tolerance_file,
+        )
+        max_pareto_rounds = args.iterations or args.max_iterations
+        print("\n[Pareto-beam] Starting multi-objective search")
+        print(f"  Beam width: {args.beam_width}")
+        print(f"  QTN sites: {len(pareto_sites)}")
+        print(f"  Max rounds: {max_pareto_rounds}")
+        print(f"  Neutral reference: {args.neutral_reference}")
+        result = pareto_beam_search(
+            model=model,
+            baseline_tensors=current_tensors,
+            variant_info=variant_info,
+            direction=direction,
+            evolvable_indices=pareto_sites,
+            encoding_dim=encoding_dim,
+            device=device,
+            is_multi_branch=is_multi_branch,
+            beam_width=args.beam_width,
+            max_iterations=max_pareto_rounds,
+            neutral_tolerances=neutral_tolerances,
+            neutral_reference=args.neutral_reference,
+            panel_genotypes=panel_genotypes,
+            homozygous_only=args.homozygous,
+            batch_size=args.batch_size,
+            archive_limit=args.archive_size,
+            no_improvement_patience=args.patience,
+        )
+        write_pareto_outputs(
+            args, result, current_tensors, sample_ids[0],
+            regression_tasks, direction, norm_stats, log_tasks,
+            is_multi_branch,
+        )
+        print(f"\n[Pareto-beam] Evaluated genotypes: {result.evaluated_count}")
+        print(f"  Final archive: {len(result.archive)}")
+        print(f"  Representative VCFs: {len(result.representatives)}")
+        print(f"  Archive table: {out_dir}/pareto_archive.tsv")
+        print(f"  Search trace: {out_dir}/pareto_search_trace.tsv")
+        print(f"  Representative VCF directory: {out_dir}/pareto_archive")
+        return
 
     # --- SNP priority order (target-VCF mode) ---
     snp_priority_order: Optional[List[int]] = None
