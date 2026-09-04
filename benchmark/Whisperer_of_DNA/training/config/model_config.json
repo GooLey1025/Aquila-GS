@@ -1,6 +1,9 @@
 {
     "random_seed": 42,
     "precision": "float32",
+    "gradient_checkpointing": {
+        "enabled": false
+    },
     "embedding": {
         "input_type": "SNP",
         "input_dims": 10,

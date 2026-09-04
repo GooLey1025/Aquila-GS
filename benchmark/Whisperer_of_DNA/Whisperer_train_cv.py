@@ -43,6 +43,7 @@ from aquila.training.distributed import (
     detect_gpu_ids,
     execute_gpu_jobs,
 )
+from aquila.training.cuda_runtime import configure_cuda_runtime
 from aquila.training.evaluator import evaluate_regression
 from aquila.training.hpo import (
     CandidateResult,
@@ -79,6 +80,7 @@ class OuterFoldContext:
     trait_names: tuple[str, ...]
     max_epochs: int
     budget: dict[str, Any]
+    live_metrics_log: bool
 
 
 def positive_int(value: str) -> int:
@@ -93,20 +95,14 @@ def expand_gpu_workers(gpu_ids: Sequence[int], jobs_per_gpu: int) -> list[int]:
 
     if jobs_per_gpu < 1:
         raise ValueError("--jobs-per-gpu must be at least 1")
-    return [
-        gpu_id
-        for gpu_id in gpu_ids
-        for _ in range(jobs_per_gpu)
-    ]
+    return [gpu_id for gpu_id in gpu_ids for _ in range(jobs_per_gpu)]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run leakage-safe nested CV for joint multi-trait DNA Whisper."
     )
-    parser.add_argument(
-        "--data-dir", default=str(PROJECT_ROOT / "benchmark" / "test")
-    )
+    parser.add_argument("--data-dir", default=str(PROJECT_ROOT / "benchmark" / "test"))
     parser.add_argument(
         "--config",
         default=str(SCRIPT_DIRECTORY / "configs" / "Whisperer_nested_cv.yaml"),
@@ -136,6 +132,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-inner-folds", type=int, default=None)
     parser.add_argument("--max-candidates", type=int, default=None)
     parser.add_argument("--max-epochs", type=int, default=None)
+    parser.add_argument(
+        "--live-metrics-log",
+        action="store_true",
+        help=(
+            "Append per-epoch metrics JSONL under "
+            "{output}/fold_*/candidate_*/inner_*/metrics.jsonl and "
+            "{output}/fold_*/outer_refit/metrics.jsonl."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -152,11 +157,12 @@ def _candidate_parameters(raw: Mapping[str, Any]) -> dict[str, Any]:
     aliases = {
         "optimizer.learning_rate": "learning_rate",
         "optimizer.weight_decay": "weight_decay",
-        "data.batch_size": "batch_size",
         "model.dropout": "dropout",
         "model.encoder_layers": "encoder_layers",
     }
-    return {aliases.get(key, key.rsplit(".", 1)[-1]): value for key, value in raw.items()}
+    return {
+        aliases.get(key, key.rsplit(".", 1)[-1]): value for key, value in raw.items()
+    }
 
 
 def _select_traits(
@@ -165,9 +171,7 @@ def _select_traits(
 ) -> list[str]:
     regression = [
         name
-        for name, task in zip(
-            benchmark.trait_names, benchmark.metadata["trait_tasks"]
-        )
+        for name, task in zip(benchmark.trait_names, benchmark.metadata["trait_tasks"])
         if task == "regression"
     ]
     selected = list(requested) if requested else regression
@@ -253,6 +257,7 @@ def run_outer_fold(
     device: torch.device,
     max_epochs: int,
     budget: Mapping[str, Any],
+    live_metrics_log: bool = False,
 ) -> dict[str, Any]:
     started = time.time()
     names = tuple(str(name) for name in trait_names)
@@ -288,14 +293,21 @@ def run_outer_fold(
         )
         for candidate_id, raw_parameters in enumerate(candidates):
             parameters = _candidate_parameters(raw_parameters)
+            parameters["batch_size"] = int(config["training"]["batch_size"])
             training_seed = derive_seed(
                 int(config["seed"]),
                 outer_fold,
                 candidate_id,
                 inner_fold,
             )
-            model_config = apply_candidate_overrides(
-                config["model"], parameters, names
+            model_config = apply_candidate_overrides(config["model"], parameters, names)
+            metrics_log_path = (
+                fold_path
+                / f"candidate_{candidate_id}"
+                / f"inner_{inner_fold}"
+                / "metrics.jsonl"
+                if live_metrics_log
+                else None
             )
             result = train_model(
                 train.genotypes,
@@ -311,6 +323,7 @@ def run_outer_fold(
                 train_mask=train.observed_mask,
                 valid_mask=valid.observed_mask,
                 trait_names=names,
+                metrics_log_path=metrics_log_path,
             )
             inner_results[candidate_id].append(
                 InnerFoldResult(
@@ -327,11 +340,15 @@ def run_outer_fold(
     for candidate_id, raw_parameters in enumerate(candidates):
         results = tuple(inner_results[candidate_id])
         metrics = np.asarray([result.metric for result in results], dtype=float)
-        objective = float(metrics.mean()) if np.isfinite(metrics).all() else float("nan")
+        objective = (
+            float(metrics.mean()) if np.isfinite(metrics).all() else float("nan")
+        )
+        parameters = _candidate_parameters(raw_parameters)
+        parameters["batch_size"] = int(config["training"]["batch_size"])
         candidate_results.append(
             CandidateResult(
                 candidate_id,
-                _candidate_parameters(raw_parameters),
+                parameters,
                 objective,
                 results,
             )
@@ -340,9 +357,7 @@ def run_outer_fold(
     best = hpo.best
     final_epoch = half_up_median_epoch(best.best_epochs)
     final_parameters = dict(best.parameters)
-    final_config = apply_candidate_overrides(
-        config["model"], final_parameters, names
-    )
+    final_config = apply_candidate_overrides(config["model"], final_parameters, names)
     final_seed = derive_seed(
         int(config["seed"]),
         outer_fold,
@@ -372,6 +387,9 @@ def run_outer_fold(
         fixed_epochs=final_epoch,
         train_mask=outer_train.observed_mask,
         trait_names=names,
+        metrics_log_path=(
+            fold_path / "outer_refit" / "metrics.jsonl" if live_metrics_log else None
+        ),
     )
     predictions, observed, test_loss = predict_model(
         final_result.state_dict,
@@ -454,9 +472,7 @@ def run_outer_fold(
         fold_path / "sample_audit.json",
         {
             "outer": {
-                **build_sample_audit(
-                    outer_train, outer_test, held_out_name="test"
-                ),
+                **build_sample_audit(outer_train, outer_test, held_out_name="test"),
                 "train_observations_per_trait": _observation_counts(outer_train),
                 "test_observations_per_trait": _observation_counts(outer_test),
             },
@@ -512,7 +528,7 @@ def _run_outer_fold(
 ) -> dict[str, Any]:
     device = torch.device(device_name)
     if device.type == "cuda":
-        torch.cuda.set_device(device)
+        configure_cuda_runtime(device_name, deterministic=False)
     benchmark = WhispererPreparedBenchmark(Path(context.data_directory))
     print(
         f"[INFO] traits={list(context.trait_names)} outer_fold={job.outer_fold} "
@@ -530,6 +546,7 @@ def _run_outer_fold(
         device,
         context.max_epochs,
         context.budget,
+        context.live_metrics_log,
     )
 
 
@@ -554,9 +571,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         inner_count = min(inner_count, args.max_inner_folds)
     inner_folds = list(range(inner_count))
     raw_candidates = generate_grid_candidates(config["hpo"]["parameters"])
-    if len(raw_candidates) != 32:
-        raise ValueError(f"DNA Whisper grid must contain 32 candidates, got {len(raw_candidates)}")
-    candidates = raw_candidates[: args.max_candidates] if args.max_candidates else raw_candidates
+    if not raw_candidates:
+        raise ValueError("DNA Whisper grid must contain at least one candidate")
+    candidates = (
+        raw_candidates[: args.max_candidates] if args.max_candidates else raw_candidates
+    )
     max_epochs = int(config["training"]["max_epochs"])
     if args.max_epochs is not None:
         max_epochs = min(max_epochs, args.max_epochs)
@@ -594,6 +613,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         trait_names=tuple(traits),
         max_epochs=max_epochs,
         budget=budget,
+        live_metrics_log=args.live_metrics_log,
     )
     work_results = execute_gpu_jobs(
         jobs,
@@ -647,9 +667,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "traits": traits,
             "actual_budget": budget,
             "folds": results,
-            "metrics": aggregate_outer_folds(
-                [result["metrics"] for result in results]
-            ),
+            "metrics": aggregate_outer_folds([result["metrics"] for result in results]),
             "runs": run_index,
         },
     )

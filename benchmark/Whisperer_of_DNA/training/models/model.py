@@ -383,8 +383,11 @@ class GFIFormer(nn.Module):
 
         self.final_output_dim = current_block_input_dim 
 
-        print(f"梯度检查点启用状态: {self.use_gradient_checkpointing}")
-        print(f"GFIFormer 最终输出维度 (E*D_moe_last): {self.final_output_dim}")
+        logging.debug(
+            "GFIFormer gradient_checkpointing=%s final_output_dim=%s",
+            self.use_gradient_checkpointing,
+            self.final_output_dim,
+        )
 
     def _forward_block(self, block_input):
         block, x, mask, batch_size, num_blocks = block_input

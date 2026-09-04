@@ -26,13 +26,35 @@ except ImportError:
     unpad_input = None
     warnings.warn("未安装flash-attn。FlashAttention将回退到标准注意力。安装方法: pip install flash-attn")
 
-# 尝试导入 xformers
+
+def _unpack_unpad_input(hidden_states: Tensor, attention_mask: Tensor):
+    """兼容 flash-attn 新旧 API：unpad_input 可能返回 4 或 5 个值。"""
+    result = unpad_input(hidden_states, attention_mask)
+    if len(result) < 4:
+        raise ValueError(f"Unexpected unpad_input return length: {len(result)}")
+    hidden, indices, cu_seqlens, max_seqlen = result[:4]
+    return hidden, indices, cu_seqlens, max_seqlen
+
+
+def _prepare_flash_qkv(q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor, Tensor, torch.dtype]:
+    """FlashAttention kernels require fp16/bf16 inputs."""
+    source_dtype = q.dtype
+    if source_dtype in (torch.float16, torch.bfloat16):
+        return q, k, v, source_dtype
+    amp_dtype = (
+        torch.bfloat16
+        if q.is_cuda and torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
+    return q.to(amp_dtype), k.to(amp_dtype), v.to(amp_dtype), source_dtype
+
+# 尝试导入 xformers（仅 xformers 注意力类型需要；导入失败不告警）
 try:
     import xformers.ops
     HAS_XFORMERS = True
 except ImportError:
     HAS_XFORMERS = False
-    warnings.warn("未安装xformers。高效注意力变体将回退到标准实现。安装方法: pip install xformers")
+    xformers = None
 
 # 基类 - 保持API兼容性
 class BaseAttention(nn.Module):
@@ -282,13 +304,16 @@ class FlashAttention(BaseAttention):
 
         if HAS_FLASH_ATTN and mask is None:
             try:
+                flash_q, flash_k, flash_v, source_dtype = _prepare_flash_qkv(
+                    q_input, k_proj, v_proj
+                )
                 output = flash_attn_func(
-                    q_input, k_proj, v_proj,
+                    flash_q, flash_k, flash_v,
                     dropout_p=self.dropout.p if self.training else 0.0,
                     softmax_scale=final_softmax_scale,
                     causal=self.causal
                 )
-                output = output.reshape(B, Nq, self.dim)
+                output = output.to(source_dtype).reshape(B, Nq, self.dim)
                 # 忽略API不一致，返回 None
                 return self.out_proj(output), None
 
@@ -387,9 +412,12 @@ class FlashAttention2(BaseAttention):
 
         if HAS_FLASH_ATTN:
             try:
+                flash_q, flash_k, flash_v, source_dtype = _prepare_flash_qkv(
+                    q_input, k_proj, v_proj
+                )
                 if mask is None:
                     output = flash_attn_func(
-                        q_input, k_proj, v_proj,
+                        flash_q, flash_k, flash_v,
                         dropout_p=self.dropout.p if self.training else 0.0,
                         softmax_scale=final_softmax_scale,
                         causal=self.causal,
@@ -405,9 +433,9 @@ class FlashAttention2(BaseAttention):
                              warnings.warn(f"查询序列长度 ({Nq}) 大于掩码/键序列长度 ({Nk})，FlashAttention2变长模式将只考虑掩码覆盖的键。")
                         mask_q = mask_bool[:, :Nq]
 
-                        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q_ = unpad_input(q_input, mask_q)
-                        k_unpad, indices_k, cu_seqlens_k, max_seqlen_k_ = unpad_input(k_proj, mask_bool)
-                        v_unpad, _, _, _ = unpad_input(v_proj, mask_bool)
+                        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q_ = _unpack_unpad_input(flash_q, mask_q)
+                        k_unpad, indices_k, cu_seqlens_k, max_seqlen_k_ = _unpack_unpad_input(flash_k, mask_bool)
+                        v_unpad, _, _, _ = _unpack_unpad_input(flash_v, mask_bool)
 
                         if q_unpad is None or k_unpad is None or v_unpad is None:
                              warnings.warn("FlashAttention2 unpad_input 返回 None (可能由于全零掩码)，回退到标准实现。")
@@ -427,7 +455,7 @@ class FlashAttention2(BaseAttention):
                         warnings.warn(f"FlashAttention2接收到不支持的掩码形状 (dim={mask.dim()}, shape={mask.shape}) 或与输入不匹配，期望 [B={B}, Nk={Nk}]。回退到标准实现。")
                         raise NotImplementedError("FlashAttention2目前只支持[B, Nk]形状的2D掩码")
 
-                output = output.reshape(B, Nq, self.dim)
+                output = output.to(source_dtype).reshape(B, Nq, self.dim)
                 # 忽略API不一致，返回 None
                 return self.out_proj(output), None
 

@@ -11,8 +11,10 @@ import copy
 import importlib
 import importlib.machinery
 import importlib.util
+import json
 import random
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -228,40 +230,83 @@ def _as_mask_matrix(mask: np.ndarray | None, targets: np.ndarray) -> np.ndarray:
     return array & np.isfinite(targets)
 
 
+def _mixed_precision_context(device: torch.device):
+    """Match upstream Lightning ``bf16-mixed`` so FlashAttention can run."""
+    if device.type != "cuda" or not torch.cuda.is_bf16_supported():
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+
+def _to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    return tensor.to(device, non_blocking=device.type == "cuda")
+
+
 def _loader(
     genotypes: np.ndarray,
     targets: np.ndarray,
     batch_size: int,
     shuffle: bool,
     mask: np.ndarray | None = None,
+    device: torch.device | None = None,
 ) -> DataLoader:
     target_matrix = _as_target_matrix(targets)
     mask_matrix = _as_mask_matrix(mask, target_matrix)
-    dataset = TensorDataset(
-        torch.from_numpy(np.asarray(genotypes, dtype=np.float32)),
-        torch.from_numpy(target_matrix),
-        torch.from_numpy(mask_matrix),
-    )
+    features = torch.from_numpy(np.asarray(genotypes, dtype=np.float32))
+    phenotype = torch.from_numpy(target_matrix)
+    observed = torch.from_numpy(mask_matrix)
+    pin_memory = False
+    if device is not None and device.type == "cuda":
+        features = features.to(device, non_blocking=True)
+        phenotype = phenotype.to(device, non_blocking=True)
+        observed = observed.to(device, non_blocking=True)
+    dataset = TensorDataset(features, phenotype, observed)
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=shuffle,
+        pin_memory=pin_memory,
+        num_workers=0,
     )
 
 
 def _snapshot_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     """Copy trainable weights to CPU so the live GPU graph is not duplicated."""
-    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+    return {
+        key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+    }
 
 
-def _masked_mse(predictions: np.ndarray, targets: np.ndarray, mask: np.ndarray) -> float:
-    valid = np.asarray(mask, dtype=bool) & np.isfinite(predictions) & np.isfinite(targets)
+def _append_metrics_log(
+    path: str | Path | None,
+    record: Mapping[str, Any],
+) -> None:
+    """Append and flush one JSONL row for live progress inspection."""
+    if path is None:
+        return
+    log_path = Path(path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        key: (None if isinstance(value, float) and not np.isfinite(value) else value)
+        for key, value in record.items()
+    }
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        handle.flush()
+
+
+def _masked_mse(
+    predictions: np.ndarray, targets: np.ndarray, mask: np.ndarray
+) -> float:
+    valid = (
+        np.asarray(mask, dtype=bool) & np.isfinite(predictions) & np.isfinite(targets)
+    )
     if not valid.any():
         return float("nan")
-    residual = np.asarray(predictions, dtype=np.float64)[valid] - np.asarray(
-        targets, dtype=np.float64
-    )[valid]
+    residual = (
+        np.asarray(predictions, dtype=np.float64)[valid]
+        - np.asarray(targets, dtype=np.float64)[valid]
+    )
     return float(np.mean(np.square(residual)))
 
 
@@ -283,12 +328,12 @@ def _predict(
     predictions = []
     targets = []
     masks = []
-    with torch.no_grad():
+    with torch.no_grad(), _mixed_precision_context(device):
         for features, phenotype, observed in loader:
-            output = model(features.to(device))["final_pred"]
-            predictions.append(output.detach().cpu())
-            targets.append(phenotype)
-            masks.append(observed)
+            output = model(_to_device(features, device))["final_pred"]
+            predictions.append(output.float().detach().cpu())
+            targets.append(phenotype.cpu())
+            masks.append(observed.cpu())
     prediction_array = torch.cat(predictions).numpy()
     target_array = torch.cat(targets).numpy()
     mask_array = torch.cat(masks).numpy().astype(bool)
@@ -320,6 +365,7 @@ def train_model(
     train_mask: np.ndarray | None = None,
     valid_mask: np.ndarray | None = None,
     trait_names: Sequence[str] | None = None,
+    metrics_log_path: str | Path | None = None,
 ) -> TrainingResult:
     """Train with validation-only selection or a fixed outer-refit duration."""
     names = tuple(trait_names or config["output_layer"]["phenotype_name"])
@@ -331,17 +377,21 @@ def train_model(
         device,
         random_seed=seed,
     )
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(parameters["learning_rate"]),
-        weight_decay=float(parameters["weight_decay"]),
-    )
+    optimizer_kwargs: dict[str, Any] = {
+        "lr": float(parameters["learning_rate"]),
+        "weight_decay": float(parameters["weight_decay"]),
+    }
+    if device.type == "cuda":
+        optimizer_kwargs["fused"] = True
+    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
     batch_size = int(parameters["batch_size"])
     train_loader = _loader(
-        train_genotypes, train_targets, batch_size, True, train_mask
+        train_genotypes, train_targets, batch_size, True, train_mask, device
     )
     valid_loader = (
-        _loader(valid_genotypes, valid_targets, batch_size, False, valid_mask)
+        _loader(
+            valid_genotypes, valid_targets, batch_size, False, valid_mask, device
+        )
         if valid_genotypes is not None and valid_targets is not None
         else None
     )
@@ -354,39 +404,48 @@ def train_model(
     stale = 0
     for epoch in range(1, epoch_count + 1):
         model.train()
-        train_losses = []
+        train_loss_sum = torch.zeros((), device=device)
+        train_batch_count = 0
         for features, phenotype, observed in train_loader:
             optimizer.zero_grad(set_to_none=True)
-            features = features.to(device)
-            phenotype = phenotype.to(device)
-            observed = observed.to(device)
-            outputs = model(features)
-            losses = model.compute_loss(
-                outputs,
-                phenotype,
-                observation_mask=observed,
-            )
-            loss = losses["total_loss"]
-            if not torch.isfinite(loss):
-                optimizer.zero_grad(set_to_none=True)
-                continue
+            features = _to_device(features, device)
+            phenotype = _to_device(phenotype, device)
+            observed = _to_device(observed, device)
+            with _mixed_precision_context(device):
+                outputs = model(features)
+                losses = model.compute_loss(
+                    outputs,
+                    phenotype,
+                    observation_mask=observed,
+                )
+                loss = losses["total_loss"]
             loss.backward()
-            if not all(
-                parameter.grad is None or torch.isfinite(parameter.grad).all()
-                for parameter in model.parameters()
-            ):
-                optimizer.zero_grad(set_to_none=True)
-                continue
             torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
             optimizer.step()
-            train_losses.append(float(loss.detach()))
+            train_loss_sum += loss.detach().float()
+            train_batch_count += 1
+        train_loss = (
+            float((train_loss_sum / train_batch_count).item())
+            if train_batch_count
+            else float("nan")
+        )
         row: dict[str, Any] = {
             "epoch": epoch,
-            "train_loss": float(np.mean(train_losses)) if train_losses else float("nan"),
+            "train_loss": train_loss,
         }
         if valid_loader is None:
-            best_state = _snapshot_state(model)
             history.append(row)
+            _append_metrics_log(
+                metrics_log_path,
+                {
+                    "epoch": epoch,
+                    "train_loss": row["train_loss"],
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                    "fixed_epochs": True,
+                    "early_stop": False,
+                    "seed": seed,
+                },
+            )
             continue
         predictions, targets, mask, valid_loss = _predict(model, valid_loader, device)
         metrics = evaluate_regression(predictions, targets, mask, names).metrics
@@ -399,6 +458,7 @@ def train_model(
             }
         )
         history.append(row)
+        early_stop = False
         if np.isfinite(metric) and metric > best_metric:
             best_metric = metric
             best_epoch = epoch
@@ -408,7 +468,25 @@ def train_model(
         else:
             stale += 1
             if stale >= patience:
-                break
+                early_stop = True
+        _append_metrics_log(
+            metrics_log_path,
+            {
+                "epoch": epoch,
+                "train_loss": row["train_loss"],
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "valid_loss": valid_loss,
+                "valid_r": metric,
+                "best_epoch": best_epoch,
+                "best_valid_r": best_metric if np.isfinite(best_metric) else None,
+                "early_stop": early_stop,
+                "seed": seed,
+            },
+        )
+        if early_stop:
+            break
+    if valid_loader is None:
+        best_state = _snapshot_state(model)
     return TrainingResult(
         best_state,
         best_epoch,
@@ -437,7 +515,14 @@ def predict_model(
     model.load_state_dict(state_dict)
     predictions, _, observed, loss = _predict(
         model,
-        _loader(genotypes, targets, int(parameters["batch_size"]), False, mask),
+        _loader(
+            genotypes,
+            targets,
+            int(parameters["batch_size"]),
+            False,
+            mask,
+            device,
+        ),
         device,
     )
     return predictions, observed, loss

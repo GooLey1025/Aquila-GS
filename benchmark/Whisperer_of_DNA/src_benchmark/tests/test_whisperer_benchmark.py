@@ -44,8 +44,10 @@ from whisperer_data import (
     retained_variant_indices,
 )
 from whisperer_model import (
+    _append_metrics_log,
     _fill_missing_targets,
     _loader,
+    _mixed_precision_context,
     apply_candidate_overrides,
     import_dna_whisper,
 )
@@ -59,6 +61,8 @@ def test_gpu_cli_default_selection_and_cpu() -> None:
     assert default.gpus is None
     assert default.jobs_per_gpu == 1
     assert default.traits is None
+    assert default.live_metrics_log is False
+    assert parse_args([*base, "--live-metrics-log"]).live_metrics_log is True
     assert selected.gpus == [1, 3]
     assert cpu.gpus == []
 
@@ -93,9 +97,7 @@ def test_vcf_reader_and_schema_validation(tmp_path: Path) -> None:
     path = tmp_path / "tiny.vcf.gz"
     with gzip.open(path, "wt", encoding="utf-8") as handle:
         handle.write("##fileformat=VCFv4.2\n")
-        handle.write(
-            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tB\tA\n"
-        )
+        handle.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tB\tA\n")
         handle.write("1\t1\tchr1.s_1\tA\tG\t.\tPASS\t.\tGT\t1/1\t0/0\n")
         handle.write("1\t2\tSNP-rs2\tC\tT\t.\tPASS\t.\tGT:DP\t./.:0\t0/1:4\n")
         handle.write("1\t3\tSNP-rs3\tA\t*\t.\tPASS\t.\tGT\t0/0\t0/1\n")
@@ -167,7 +169,6 @@ def test_adapter_does_not_use_supervised_marker_selection() -> None:
     assert np.array_equal(keep, np.arange(96, dtype=np.int64))
 
 
-
 def test_split_local_missing_filter_contract() -> None:
     mask = np.array([True, False, True])
     sample_ids = np.array(["A", "B", "C"], dtype=object)
@@ -182,12 +183,8 @@ def test_multi_trait_partition_keeps_partially_observed_samples() -> None:
         "Prepared",
         (),
         {
-            "targets": torch.tensor(
-                [[1.0, -999.0], [-999.0, -999.0], [-999.0, 3.0]]
-            ),
-            "target_mask": torch.tensor(
-                [[True, False], [False, False], [False, True]]
-            ),
+            "targets": torch.tensor([[1.0, -999.0], [-999.0, -999.0], [-999.0, 3.0]]),
+            "target_mask": torch.tensor([[True, False], [False, False], [False, True]]),
         },
     )()
     genotypes = np.zeros((3, 2, 10), dtype=np.float32)
@@ -242,12 +239,27 @@ def test_prepared_partition_filters_missing_trait_samples() -> None:
     assert split.processed_targets.tolist() == [0.0, 1.0]
 
 
-def test_grid_contains_exactly_32_candidates() -> None:
+def test_grid_uses_training_batch_size_32() -> None:
     config_path = SOURCE_DIRECTORY.parent / "configs" / "Whisperer_nested_cv.yaml"
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     candidates = generate_grid_candidates(config["hpo"]["parameters"])
-    assert len(candidates) == 32
+    assert len(candidates) == 16
+    assert config["training"]["batch_size"] == 32
+    assert all("data.batch_size" not in candidate for candidate in candidates)
+
+
+def test_model_config_disables_gradient_checkpointing() -> None:
+    model_path = WHISPERER_DIRECTORY / "training" / "config" / "model_config.json"
+    config = json.loads(model_path.read_text(encoding="utf-8"))
+    assert config["gradient_checkpointing"]["enabled"] is False
+
+
+def test_mixed_precision_stays_off_on_cpu() -> None:
+    context = _mixed_precision_context(torch.device("cpu"))
+    with context:
+        value = torch.ones(1, dtype=torch.float32)
+    assert value.dtype == torch.float32
 
 
 def test_dropout_and_encoder_override_are_uniform() -> None:
@@ -260,7 +272,10 @@ def test_dropout_and_encoder_override_are_uniform() -> None:
     assert updated["output_layer"]["phenotype_dim"] == 2
     assert updated["output_layer"]["phenotype_name"] == ["TraitA", "TraitB"]
     assert updated["output_layer"]["dropout_rate"] == 0.2
-    assert updated["loss_config"]["auxiliary_losses"]["Deep_Supervision"]["enabled"] is True
+    assert (
+        updated["loss_config"]["auxiliary_losses"]["Deep_Supervision"]["enabled"]
+        is True
+    )
     assert updated["loss_config"]["auxiliary_losses"]["PWCosSim"]["enabled"] is False
     assert updated["loss_config"]["auxiliary_losses"]["correlation"]["enabled"] is False
     for block in updated["GFI_FormerBLOCKS"]["blocks"][:2]:
@@ -325,6 +340,19 @@ def test_evaluation_loader_keeps_incomplete_final_batch() -> None:
     targets = np.zeros(17, dtype=np.float32)
     loader = _loader(genotypes, targets, batch_size=8, shuffle=False)
     assert sum(batch[0].shape[0] for batch in loader) == 17
+
+
+def test_live_metrics_log_appends_jsonl_and_sanitizes_nan(tmp_path: Path) -> None:
+    log_path = tmp_path / "fold_0" / "candidate_0" / "inner_0" / "metrics.jsonl"
+    _append_metrics_log(log_path, {"epoch": 1, "train_loss": float("nan")})
+    _append_metrics_log(log_path, {"epoch": 2, "train_loss": 0.25})
+    rows = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows == [
+        {"epoch": 1, "train_loss": None},
+        {"epoch": 2, "train_loss": 0.25},
+    ]
 
 
 def test_loader_keeps_two_dimensional_targets_and_observation_mask() -> None:
@@ -403,15 +431,43 @@ def test_trait_metric_slice_keeps_per_trait_pearson() -> None:
     metrics = {
         "normalized": {
             "per_trait": {
-                "TraitA": {"n": 4, "pearson": 0.8, "r2": 0.5, "mse": 0.2, "rmse": 0.45, "mae": 0.3},
-                "TraitB": {"n": 3, "pearson": 0.4, "r2": 0.1, "mse": 0.9, "rmse": 0.95, "mae": 0.7},
+                "TraitA": {
+                    "n": 4,
+                    "pearson": 0.8,
+                    "r2": 0.5,
+                    "mse": 0.2,
+                    "rmse": 0.45,
+                    "mae": 0.3,
+                },
+                "TraitB": {
+                    "n": 3,
+                    "pearson": 0.4,
+                    "r2": 0.1,
+                    "mse": 0.9,
+                    "rmse": 0.95,
+                    "mae": 0.7,
+                },
             },
             "avg_pearson": 0.6,
         },
         "original": {
             "per_trait": {
-                "TraitA": {"n": 4, "pearson": 0.7, "r2": 0.4, "mse": 1.2, "rmse": 1.1, "mae": 0.8},
-                "TraitB": {"n": 3, "pearson": 0.3, "r2": 0.0, "mse": 2.0, "rmse": 1.4, "mae": 1.1},
+                "TraitA": {
+                    "n": 4,
+                    "pearson": 0.7,
+                    "r2": 0.4,
+                    "mse": 1.2,
+                    "rmse": 1.1,
+                    "mae": 0.8,
+                },
+                "TraitB": {
+                    "n": 3,
+                    "pearson": 0.3,
+                    "r2": 0.0,
+                    "mse": 2.0,
+                    "rmse": 1.4,
+                    "mae": 1.1,
+                },
             },
             "avg_pearson": 0.5,
         },

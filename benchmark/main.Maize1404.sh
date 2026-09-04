@@ -6,15 +6,9 @@ COHORT=Soybean2795
 PHENO_FILE=species_data/$COHORT/benchmark.pheno
 VCF_FILE=species_data/$COHORT/Soybean2795.LD.rename.vcf.gz
 
-<<<<<<< HEAD
-COHORT=wheat850_Nature2024
-PHENO_FILE=species_data/$COHORT/benchmark.pheno
-VCF_FILE=species_data/$COHORT/Wheat850.LD.vcf.gz
-=======
 COHORT=wheat994
 PHENO_FILE=species_data/wheat994/benchmark.pheno
 VCF_FILE=species_data/wheat994/wheat994.LD.vcf.gz
->>>>>>> 1c80d47 (a)
 
 COHORT=Tomato706
 PHENO_FILE=species_data/$COHORT/benchmark.pheno

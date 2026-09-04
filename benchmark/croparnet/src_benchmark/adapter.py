@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import yaml
 from sklearn.preprocessing import MinMaxScaler
+from threadpoolctl import threadpool_limits
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -384,6 +385,14 @@ def _run_trait_fold(
 ) -> dict[str, Any]:
     """Tune and refit one single-trait outer fold on one device."""
 
+    # One process already represents one independent training job. Limit each
+    # process to one CPU thread to avoid BLAS/PyTorch oversubscription.
+    thread_limiter = threadpool_limits(limits=1)
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
     if device_name.startswith("cuda:"):
         torch.cuda.set_device(int(device_name.split(":", 1)[1]))
         torch.backends.cudnn.benchmark = True
@@ -393,28 +402,44 @@ def _run_trait_fold(
     trait = job.trait
     outer_fold = job.outer_fold
     started = time.time()
+    print(
+        f"[INFO] trait={trait} outer_fold={outer_fold} "
+        f"candidates={len(worker_context.candidates)} "
+        f"inner_folds={worker_context.inner_count} device={device}",
+        flush=True,
+    )
+    # Loading and train-only scaling depend on the fold, not the HPO candidate.
+    # Cache each inner split once while preserving the original leakage policy.
+    inner_data = []
+    for inner_fold in range(worker_context.inner_count):
+        train = _split(load_split(context, trait, outer_fold, inner_fold, "train"))
+        valid = _split(load_split(context, trait, outer_fold, inner_fold, "valid"))
+        if train.variants != valid.variants:
+            raise ValueError("Inner train/valid variant schemas differ")
+        train_x, valid_x, _ = fit_train_only_scaler(
+            train.genotypes,
+            valid.genotypes,
+            train.missing_mask,
+            valid.missing_mask,
+        )
+        inner_data.append((inner_fold, train_x, train.targets, valid_x, valid.targets))
+    print(
+        f"[INFO] trait={trait} outer_fold={outer_fold} "
+        f"prepared_inner_folds={len(inner_data)}",
+        flush=True,
+    )
     candidate_records = []
     for candidate_id, candidate in enumerate(worker_context.candidates):
         config = copy.deepcopy(worker_context.base_config)
         config["model"].update(candidate.get("model", {}))
         config["training"].update(candidate.get("training", {}))
         inner_records = []
-        for inner_fold in range(worker_context.inner_count):
-            train = _split(load_split(context, trait, outer_fold, inner_fold, "train"))
-            valid = _split(load_split(context, trait, outer_fold, inner_fold, "valid"))
-            if train.variants != valid.variants:
-                raise ValueError("Inner train/valid variant schemas differ")
-            train_x, valid_x, _ = fit_train_only_scaler(
-                train.genotypes,
-                valid.genotypes,
-                train.missing_mask,
-                valid.missing_mask,
-            )
+        for inner_fold, train_x, train_y, valid_x, valid_y in inner_data:
             fit = train_model(
                 train_x,
-                train.targets,
+                train_y,
                 valid_x,
-                valid.targets,
+                valid_y,
                 config,
                 device,
                 _seed(
@@ -445,6 +470,12 @@ def _run_trait_fold(
                 ),
                 "inner_results": inner_records,
             }
+        )
+        print(
+            f"[INFO] trait={trait} outer_fold={outer_fold} "
+            f"candidate={candidate_id + 1}/{len(worker_context.candidates)} "
+            f"mean_pearson={candidate_records[-1]['mean_pearson']:.6f}",
+            flush=True,
         )
     best = max(
         candidate_records,
@@ -524,6 +555,7 @@ def _run_trait_fold(
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(("sample_id", "observed_processed", "predicted_processed"))
         writer.writerows(zip(test.sample_ids, test.targets, predictions, strict=True))
+    thread_limiter.restore_original_limits()
     return {
         "trait": trait,
         "outer_fold": outer_fold,

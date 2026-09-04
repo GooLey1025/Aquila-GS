@@ -28,6 +28,15 @@ except ImportError:
     warnings.warn("未安装flash-attn。FlashAttention将回退到标准注意力。安装方法: pip install flash-attn")
 
 
+def _unpack_unpad_input(hidden_states: Tensor, attention_mask: Tensor):
+    """兼容 flash-attn 新旧 API：unpad_input 可能返回 4 或 5 个值。"""
+    result = unpad_input(hidden_states, attention_mask)
+    if len(result) < 4:
+        raise ValueError(f"Unexpected unpad_input return length: {len(result)}")
+    hidden, indices, cu_seqlens, max_seqlen = result[:4]
+    return hidden, indices, cu_seqlens, max_seqlen
+
+
 class BaseCrossAttention(nn.Module):
     """注意力机制基类"""
     def __init__(self,
@@ -183,9 +192,9 @@ class FlashCrossAttention(BaseCrossAttention):
                              warnings.warn(f"查询序列长度 ({seq_len_q}) 大于掩码/键序列长度 ({seq_len_kv})，FlashAttention变长模式将只考虑掩码覆盖的键。")
                         mask_q = mask_bool[:, :seq_len_q]
 
-                        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q_ = unpad_input(q_flash, mask_q)
-                        k_unpad, indices_k, cu_seqlens_k, max_seqlen_k_ = unpad_input(k_flash, mask_bool)
-                        v_unpad, _, _, _ = unpad_input(v_flash, mask_bool)
+                        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q_ = _unpack_unpad_input(q_flash, mask_q)
+                        k_unpad, indices_k, cu_seqlens_k, max_seqlen_k_ = _unpack_unpad_input(k_flash, mask_bool)
+                        v_unpad, _, _, _ = _unpack_unpad_input(v_flash, mask_bool)
 
                         if q_unpad is None or k_unpad is None or v_unpad is None:
                              warnings.warn("FlashCrossAttention unpad_input 返回 None (可能由于全零掩码)，回退到标准实现。")
