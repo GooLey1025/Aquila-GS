@@ -82,48 +82,6 @@ conda activate aquila
 $CONDA_PREFIX/bin/Rscript -e 'install.packages("hibayes", repos="https://cloud.r-project.org")'
 ```
 
-Environment: NVIDIA-GPU-4090 x3, Driver Version: 580.105.08, CUDA Version: 12.2
-
-DNA Whisper uses a dedicated Conda environment because its upstream runtime is
-tested with Python 3.10, PyTorch 2.8 with CUDA 12.8, and FlashAttention. Keeping
-it separate prevents the compiled FlashAttention extension from conflicting
-with Aquila's main PyTorch installation.
-
-```sh
-cd Whisperer_of_DNA
-
-# Create the Python 3.10 / PyTorch 2.8 / CUDA 12.8 build environment.
-conda env create -f environment.yml
-conda activate aquila_dnawhisperer
-
-# Install this Aquila checkout without replacing the pinned PyTorch stack.
-python -m pip install -e ../.. --no-deps
-
-# FlashAttention must be installed after PyTorch and the CUDA compiler.
-# Keep TMPDIR on the same filesystem as the pip cache so the official
-# prebuilt wheel is not renamed across /tmp and /data.
-# Limit parallel compilation if a source build is required.
-TMPDIR=$HOME/.cache/pip MAX_JOBS=8 python -m pip install "flash-attn>=2.7.4" --no-build-isolation
-
-# Verify that CUDA and the compiled FlashAttention extension are available.
-python -c 'import torch, flash_attn; print(torch.__version__, torch.version.cuda, flash_attn.__version__, torch.cuda.is_available())'
-```
-
-Run DNA Whisper from this environment. The nested-CV adapter now uses
-bfloat16 autocast (same as upstream Lightning ``bf16-mixed``) so
-FlashAttention-2 can run, and keeps the small Soybean tensors on GPU to
-avoid per-batch host copies. Restart any job that started before these
-changes; the running process will not pick them up.
-
-If the environment already exists, update it before reinstalling
-FlashAttention:
-
-```sh
-conda env update -n aquila_dnawhisperer -f Whisperer_of_DNA/environment.yml
-```
-
-
-
 ## Reproduce of 705rice dataset
 
 ### [Aquila](https://github.com/GooLey1025/Aquila-GS)
