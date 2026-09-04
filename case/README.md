@@ -1,14 +1,23 @@
-## Exmaple: Train a final model
+## Train a production genomic prediction model
+
+Nested CV is used for retrospective, unbiased model evaluation. Once the modeling strategy has been established, a production genomic prediction model can be trained for prospective breeding applications. It uses K-fold cross-validation across the complete reference population to select hyperparameters and the training epoch, then retrains the final model on all available samples. This maximizes the reference information available for predicting new breeding materials or selection candidates.
+
+### 1. Prepare the full reference dataset
+
 ```sh
-yaml=705rice_conv_mha.aquila-snp.hpo.yaml
+aquila_data_cv_production.py \
+  --genotype input.vcf.gz \
+  --phenotype phenotype.tsv \
+  --encoding diploid_onehot \
+  --folds 5 \
+  -o dataset.production.data
+```
 
-aquila_train_multi.py --config params/$yaml --n-folds 5 --n-seeds 10 -o ${yaml%.hpo.yaml}.best_fold_find
+### 2. Train the production model
 
-BEST_DS=$(python parse_best_fold.py ${yaml%.hpo.yaml}.best_fold_find/results_summary.tsv --print-only-path)
-
-aquila_train_hpo.py --config params/$yaml -o ${yaml%.yaml} -dsf $BEST_DS > ${yaml%.yaml}.log 2>&1
-
-BEST_TRIAL=$(awk -F': ' '/Best trial number/ {print $2}' ${yaml%.yaml}/optuna_summary.txt)
-
-cp -rf ${yaml%.yaml}/trial_$BEST_TRIAL ${yaml%.hpo.yaml}.best_model
+```sh
+aquila_train_cv_production.py \
+  --data-dir dataset.production.data \
+  --config config.yaml \
+  -o results/production
 ```
