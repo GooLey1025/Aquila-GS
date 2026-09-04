@@ -22,6 +22,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 import yaml
+from threadpoolctl import threadpool_limits
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 BNN_DIRECTORY = SCRIPT_DIRECTORY
@@ -32,6 +33,7 @@ for import_path in (str(SOURCE_ROOT), str(BENCHMARK_SOURCE)):
     if import_path not in sys.path:
         sys.path.insert(0, import_path)
 
+from aquila.benchmark import sanitize_json
 from aquila.data import load_prepared_data
 from aquila.data.preprocessing import PerTraitPreprocessor
 from aquila.training.distributed import (
@@ -47,7 +49,13 @@ from aquila.training.hpo import (
     half_up_median_epoch,
     merge_config,
 )
-from bnn_data_benchmark import MarkerPipeline, PreparedPair, load_trait_split, prepare_pair
+from bnn_data_benchmark import (
+    BNNSplit,
+    MarkerPipeline,
+    PreparedPair,
+    load_trait_split,
+    prepare_pair,
+)
 from bnn_model_benchmark import build_model, predict_bnn, train_bnn
 
 
@@ -134,7 +142,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def _write_json(path: Path, values: Mapping[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(values, handle, indent=2, allow_nan=True)
+        json.dump(sanitize_json(values), handle, indent=2, allow_nan=False)
         handle.write("\n")
 
 
@@ -289,6 +297,39 @@ def _load_pair(
     )
 
 
+def _load_splits(
+    data_directory: Path,
+    prepared: Any,
+    raw_targets: torch.Tensor,
+    trait_index: int,
+    outer_fold: int,
+    inner_fold: int,
+) -> tuple[BNNSplit, BNNSplit]:
+    """Load one inner train/validation split without fitting marker selection."""
+
+    train = load_trait_split(
+        data_directory,
+        prepared.metadata,
+        prepared.target_mask,
+        raw_targets,
+        trait_index,
+        outer_fold,
+        inner_fold,
+        "train",
+    )
+    valid = load_trait_split(
+        data_directory,
+        prepared.metadata,
+        prepared.target_mask,
+        raw_targets,
+        trait_index,
+        outer_fold,
+        inner_fold,
+        "valid",
+    )
+    return train, valid
+
+
 def run_outer_fold(
     data_directory: Path,
     output_directory: Path,
@@ -309,31 +350,51 @@ def run_outer_fold(
     inner_results: dict[int, list[InnerFoldResult]] = {
         index: [] for index in range(len(candidates))
     }
-    split_audit = []
+    inner_splits = []
     for inner_fold in range(inner_count):
-        for candidate_id, parameters in enumerate(candidates):
-            config = merge_config(base_config, parameters)
-            candidate_seed = derive_seed(seed, outer_fold, candidate_id, inner_fold)
-            pair = _load_pair(
-                data_directory,
-                prepared,
-                raw_targets,
-                trait_index,
-                outer_fold,
-                inner_fold,
-                config,
-                candidate_seed,
-            )
-            if candidate_id == 0:
-                split_audit.append(
-                    {
-                        "inner_fold": inner_fold,
-                        "train_observed": len(pair.train.sample_ids),
-                        "train_discarded": list(pair.train.discarded_sample_ids),
-                        "valid_observed": len(pair.held_out.sample_ids),
-                        "valid_discarded": list(pair.held_out.discarded_sample_ids),
-                    }
+        train, valid = _load_splits(
+            data_directory,
+            prepared,
+            raw_targets,
+            trait_index,
+            outer_fold,
+            inner_fold,
+        )
+        inner_splits.append((inner_fold, train, valid))
+    split_audit = [
+        {
+            "inner_fold": inner_fold,
+            "train_observed": len(train.sample_ids),
+            "train_discarded": list(train.discarded_sample_ids),
+            "valid_observed": len(valid.sample_ids),
+            "valid_discarded": list(valid.discarded_sample_ids),
+        }
+        for inner_fold, train, valid in inner_splits
+    ]
+    print(
+        f"[INFO] BNN trait={trait_name} outer_fold={outer_fold} "
+        f"loaded_inner_folds={len(inner_splits)}",
+        flush=True,
+    )
+    pair_cache: dict[tuple[int, float, int], PreparedPair] = {}
+    for candidate_id, parameters in enumerate(candidates):
+        config = merge_config(base_config, parameters)
+        alpha = float(config["data"]["lasso_alpha"])
+        max_features = int(config["data"]["max_features"])
+        for inner_fold, train, valid in inner_splits:
+            cache_key = (inner_fold, alpha, max_features)
+            pair = pair_cache.get(cache_key)
+            if pair is None:
+                pipeline_seed = derive_seed(seed, outer_fold, inner_fold, int(alpha * 1e8))
+                pair = prepare_pair(
+                    train,
+                    valid,
+                    alpha,
+                    max_features,
+                    pipeline_seed,
                 )
+                pair_cache[cache_key] = pair
+            candidate_seed = derive_seed(seed, outer_fold, candidate_id, inner_fold)
             fit = train_bnn(
                 pair.train_features,
                 pair.train.targets,
@@ -353,6 +414,20 @@ def run_outer_fold(
                     fit.metrics,
                 )
             )
+        candidate_values = np.asarray(
+            [result.metric for result in inner_results[candidate_id]], dtype=float
+        )
+        candidate_mean = (
+            float(candidate_values.mean())
+            if np.isfinite(candidate_values).all()
+            else float("nan")
+        )
+        print(
+            f"[INFO] BNN trait={trait_name} outer_fold={outer_fold} "
+            f"candidate={candidate_id + 1}/{len(candidates)} "
+            f"mean_pearson={candidate_mean:.6f}",
+            flush=True,
+        )
     candidate_results = []
     for candidate_id, parameters in enumerate(candidates):
         results = tuple(inner_results[candidate_id])
@@ -507,6 +582,12 @@ def _run_trait_fold(
     device_name: str,
     context: TraitFoldContext,
 ) -> dict[str, Any]:
+    thread_limiter = threadpool_limits(limits=1)
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
     device = torch.device(device_name)
     if device.type == "cuda":
         torch.cuda.set_device(device)
@@ -516,9 +597,10 @@ def _run_trait_fold(
     print(
         f"[INFO] BNN trait={job.trait_name} outer_fold={job.outer_fold} "
         f"candidates={len(context.candidates)} "
-        f"inner_folds={context.inner_count} device={device}"
+        f"inner_folds={context.inner_count} device={device}",
+        flush=True,
     )
-    return run_outer_fold(
+    result = run_outer_fold(
         Path(context.data_directory),
         Path(context.output_directory),
         prepared,
@@ -532,6 +614,8 @@ def _run_trait_fold(
         device,
         context.seed,
     )
+    thread_limiter.restore_original_limits()
+    return result
 
 
 def main(argv: Sequence[str] | None = None) -> None:

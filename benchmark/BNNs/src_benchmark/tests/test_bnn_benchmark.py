@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gzip
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -151,6 +152,15 @@ def test_grid_contains_exactly_64_candidates() -> None:
         config = yaml.safe_load(handle)
     candidates = generate_grid_candidates(config["hpo"]["parameters"])
     assert len(candidates) == 64
+
+
+def test_json_writer_sanitizes_non_finite_values(tmp_path: Path) -> None:
+    path = tmp_path / "metrics.json"
+    RUNNER._write_json(path, {"finite": 1.0, "nan": float("nan")})
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "finite": 1.0,
+        "nan": None,
+    }
 
 
 def test_candidate_selection_epoch_and_metric_aggregation() -> None:
