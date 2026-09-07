@@ -9,6 +9,7 @@ from .cv import (
     generate_nested_folds_from_assignments,
     load_fold_indices,
     parse_fold_selector,
+    resolve_outer_folds,
     save_nested_folds,
     validate_outer_fold_observations,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "load_fold_indices",
     "load_prepared_data",
     "parse_fold_selector",
+    "resolve_outer_folds",
     "save_nested_folds",
     "validate_outer_fold_observations",
 ]

@@ -5,7 +5,7 @@
 """Deterministic nested cross-validation split utilities."""
 
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
 from sklearn.model_selection import KFold
@@ -248,5 +248,58 @@ def parse_fold_selector(
     if invalid:
         raise ValueError(
             f"Fold numbers must be in 0..{fold_count - 1}; got {invalid}"
+        )
+    return selected
+
+
+def resolve_outer_folds(
+    requested_folds: Sequence[int] | None,
+    metadata: Mapping[str, Any],
+    *,
+    option_name: str = "--outer-folds",
+) -> List[int]:
+    """Resolve outer folds while enforcing prepared-data feature binding."""
+    fold_count = int(metadata["outer_folds"])
+    bindings = (
+        ("fold_specific_features", "split-local markers"),
+        ("fold_specific_gwas", "fold-specific GWAS markers"),
+    )
+    binding_name = ""
+    selection_label = ""
+    binding: Any = None
+    for name, label in bindings:
+        if metadata.get(name) is not None:
+            binding_name = name
+            selection_label = label
+            binding = metadata[name]
+            break
+    if binding is None:
+        return (
+            list(range(fold_count))
+            if requested_folds is None
+            else parse_fold_selector(requested_folds, fold_count)
+        )
+    if not isinstance(binding, Mapping):
+        raise ValueError(f"metadata {binding_name} must be an object")
+    if binding.get("enabled") is not True:
+        raise ValueError(f"metadata {binding_name}.enabled must be true")
+    bound_fold = binding.get("outer_fold")
+    if isinstance(bound_fold, bool) or not isinstance(bound_fold, int):
+        raise ValueError(
+            f"metadata {binding_name}.outer_fold must be an integer"
+        )
+    if bound_fold < 0 or bound_fold >= fold_count:
+        raise ValueError(
+            f"metadata {binding_name}.outer_fold is outside the prepared "
+            f"fold range: {bound_fold}"
+        )
+    if requested_folds is None:
+        return [bound_fold]
+    selected = parse_fold_selector(requested_folds, fold_count)
+    if selected != [bound_fold]:
+        raise ValueError(
+            f"This prepared dataset contains {selection_label} for outer fold "
+            f"{bound_fold}; requested folds were {selected}. Use {option_name} "
+            f"{bound_fold} or omit {option_name}."
         )
     return selected

@@ -45,6 +45,7 @@ from aquila.benchmark.common import (
     write_json,
     write_predictions_csv,
 )
+from aquila.data import resolve_outer_folds
 from aquila.training.distributed import derive_seed
 from aquila.training.distributed import detect_gpu_ids, execute_gpu_jobs
 from aquila.training.evaluator import evaluate_regression
@@ -932,11 +933,7 @@ def main() -> None:
     invalid_traits = [trait for trait in traits if trait not in benchmark.regression_traits]
     if invalid_traits:
         raise ValueError(f"Unknown traits: {invalid_traits}")
-    outer_folds = args.outer_folds or list(range(benchmark.outer_fold_count))
-    if any(fold < 0 or fold >= benchmark.outer_fold_count for fold in outer_folds):
-        raise ValueError(
-            f"Outer folds must be in 0..{benchmark.outer_fold_count - 1}"
-        )
+    outer_folds = resolve_outer_folds(args.outer_folds, benchmark.metadata)
     inner_folds = list(range(benchmark.inner_fold_count))
     if args.max_inner_folds is not None:
         inner_folds = inner_folds[: args.max_inner_folds]

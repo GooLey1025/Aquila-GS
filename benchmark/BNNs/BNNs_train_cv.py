@@ -34,7 +34,7 @@ for import_path in (str(SOURCE_ROOT), str(BENCHMARK_SOURCE)):
         sys.path.insert(0, import_path)
 
 from aquila.benchmark import sanitize_json
-from aquila.data import load_prepared_data
+from aquila.data import load_prepared_data, resolve_outer_folds
 from aquila.data.preprocessing import PerTraitPreprocessor
 from aquila.training.distributed import (
     derive_seed,
@@ -651,11 +651,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     invalid = [trait for trait in traits if trait not in regression_traits]
     if invalid:
         raise ValueError(f"Unknown traits: {invalid}")
-    outer_count = int(prepared.metadata["outer_folds"])
     inner_count = int(prepared.metadata["inner_folds"])
-    outer_folds = args.outer_folds or list(range(outer_count))
-    if any(fold < 0 or fold >= outer_count for fold in outer_folds):
-        raise ValueError(f"Outer folds must be in 0..{outer_count - 1}")
+    outer_folds = resolve_outer_folds(args.outer_folds, prepared.metadata)
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)
     candidates = generate_grid_candidates(config["hpo"]["parameters"])

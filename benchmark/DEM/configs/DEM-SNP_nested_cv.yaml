@@ -6,7 +6,7 @@ benchmark:
 
 data:
   modalities: [snp]
-  rf_enabled: false
+  rf_enabled: true
   selected_markers:
     snp: 1000
   rf_estimators: 500

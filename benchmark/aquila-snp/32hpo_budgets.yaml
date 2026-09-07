@@ -1,0 +1,96 @@
+hpo:
+  enabled: true
+  method: grid_search
+  metric: best/val_r
+  direction: maximize
+  seed: 42
+  parameters:
+    train.weight_decay:
+      type: categorical
+      choices: [1e-3, 1e-4]
+    model.trunk.0.kernel_size:
+      type: categorical
+      choices: [5, 9]
+    model.dropout:
+      type: categorical
+      choices: [0.4, 0.5]
+    model.heads.regression.0.hidden_features:
+      type: categorical
+      choices: [128, 256]
+    model.d_model:
+      type: categorical
+      choices: [256, 512]
+
+train:
+  batch_size: 32
+  optimizer_type: adamw
+  weight_decay: 1e-4
+  loss_type: mse
+  normalize_regression: true
+  uncertainty_weighting: true
+  early_stopping_patience: 40
+  # Ignore tiny valid_r gains; still consume early-stopping patience.
+  early_stopping_min_delta: 0.0001
+  # clip_grad_norm_ syncs each step (~1–2pp util); null favors sustained ~99%.
+  gradient_clip_norm: null
+  scheduler_type: cosine_warmup
+  learning_rate: 1e-3
+  num_epochs: 200
+  scheduler_params:
+    warmup_epochs: 20
+    warmup_start_factor: 0.01
+    min_lr: 1e-5
+  val_split: 0.1
+  test_split: 0.0
+  # Keep fold subsets on GPU. If your batch is large, keep this false.
+  gpu_resident: true
+  # AMP dtype: bf16 enables autocast; fp32 disables it.
+  precision: bf16
+  # CUDA deterministic algorithms. Default off. CLI: --use-deterministic
+  deterministic: false
+  # Shared init + dropout + shuffle seed for every inner/final fit.
+  seed: 42
+
+model:
+  architecture_type: single
+  activation: gelu
+  dropout: 0.4
+  d_model: 256
+  l2_scale: 1.0e-05
+  verbose: false
+  embedder:
+  - name: conv_block
+    in_channels: 8
+    out_channels: d_model
+    kernel_size: 15
+    activation: gelu
+    norm_type: layer
+    residual: false
+  trunk:
+  - name: std_down_conv_tower
+    in_channels: d_model
+    out_channels: d_model
+    kernel_size: 5
+    residual: true
+    seq_len_threshold: 1500
+    gain: 1.0
+    bn_momentum: 0.1
+  - name: transformer_mqa
+    d_model: d_model
+    num_query_heads: 8
+    qk_head_dim: 32
+    v_head_dim: 32
+    activation: gelu
+    use_rope: false
+    d_ff: d_model
+  - name: multi_head_pool
+    d_model: d_model
+    num_heads: 4
+    pool_axis: 2
+
+  heads:
+    regression:
+    - name: regression_head
+      in_features: null
+      hidden_features: 256
+      activation: gelu

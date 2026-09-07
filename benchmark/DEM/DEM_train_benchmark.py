@@ -46,6 +46,7 @@ from aquila.training.hpo import (
     half_up_median_epoch,
     merge_config,
 )
+from aquila.data import resolve_outer_folds
 from data_ncv_benchmark import (
     CHANNELS_PER_MODALITY,
     ENCODING_NAMES,
@@ -258,7 +259,16 @@ def _split_audit(split: Any) -> dict[str, Any]:
     }
 
 
-def _selection_metadata(selected: SelectedSplits, rf_enabled: bool) -> dict[str, Any]:
+def _selection_metadata(
+    selected: SelectedSplits,
+    rf_enabled: bool,
+    *,
+    trait: str | None = None,
+    outer_fold: int | None = None,
+    inner_fold: int | None = None,
+    selection_scope: str | None = None,
+    data_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     branches = {}
     variants = _selected_variant_payload(selected)
     for index, name in enumerate(selected.modality_names):
@@ -270,11 +280,35 @@ def _selection_metadata(selected: SelectedSplits, rf_enabled: bool) -> dict[str,
             "input_dim": selected.train.modalities[index].shape[1],
             "variants": variants[name],
         }
-    return {
+    payload = {
+        "schema": "dem_rf_marker_selection",
+        "schema_version": 1,
         "rf_enabled": rf_enabled,
         "modality_order": list(selected.modality_names),
         "branches": branches,
+        "fit_sample_ids": list(selected.train.sample_ids),
+        "discarded_missing_target_sample_ids": list(
+            selected.train.discarded_sample_ids
+        ),
     }
+    if trait is not None:
+        payload["trait"] = trait
+    if outer_fold is not None:
+        payload["outer_fold"] = int(outer_fold)
+    if inner_fold is not None:
+        payload["inner_fold"] = int(inner_fold)
+    if selection_scope is not None:
+        payload["selection_scope"] = selection_scope
+    if data_config is not None:
+        payload["rf_parameters"] = {
+            "selected_markers": dict(data_config["selected_markers"]),
+            "n_estimators": int(data_config["rf_estimators"]),
+            "random_states": [
+                int(value) for value in data_config["rf_random_states"]
+            ],
+            "n_jobs": int(data_config["rf_n_jobs"]),
+        }
+    return payload
 
 
 def _load_pair(
@@ -371,14 +405,25 @@ def run_outer_fold(
         selected = _load_pair(
             context, job.trait_index, job.outer_fold, inner_fold, context.base_config
         )
+        inner_selection = _selection_metadata(
+            selected,
+            bool(context.base_config["data"].get("rf_enabled", True)),
+            trait=job.trait_name,
+            outer_fold=job.outer_fold,
+            inner_fold=inner_fold,
+            selection_scope="inner_train",
+            data_config=context.base_config["data"],
+        )
+        _write_json(
+            fold_path / "rf_selection" / f"inner_fold_{inner_fold}.json",
+            inner_selection,
+        )
         inner_audit.append(
             {
                 "inner_fold": inner_fold,
                 "train": _split_audit(selected.train),
                 "valid": _split_audit(selected.held_out),
-                "selection": _selection_metadata(
-                    selected, bool(context.base_config["data"].get("rf_enabled", True))
-                ),
+                "selection": inner_selection,
             }
         )
         for candidate_id, parameters in enumerate(context.candidates):
@@ -467,8 +512,14 @@ def run_outer_fold(
         [job.trait_name],
     )
     selection = _selection_metadata(
-        selected, bool(best_config["data"].get("rf_enabled", True))
+        selected,
+        bool(best_config["data"].get("rf_enabled", True)),
+        trait=job.trait_name,
+        outer_fold=job.outer_fold,
+        selection_scope="outer_train",
+        data_config=best_config["data"],
     )
+    _write_json(fold_path / "rf_selection" / "final.json", selection)
     torch.save(
         {
             "model_state_dict": final_fit.state_dict,
@@ -574,11 +625,8 @@ def main() -> None:
     metadata = load_metadata(data_directory)
     raw_targets, target_mask = load_target_tensors(data_directory)
     traits = resolve_traits(metadata, args.traits)
-    outer_count = int(metadata["outer_folds"])
     inner_count = int(metadata["inner_folds"])
-    outer_folds = args.outer_folds or list(range(outer_count))
-    if any(fold < 0 or fold >= outer_count for fold in outer_folds):
-        raise ValueError(f"Outer folds must be in 0..{outer_count - 1}")
+    outer_folds = resolve_outer_folds(args.outer_folds, metadata)
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)
     candidates = generate_grid_candidates(config["hpo"]["parameters"])

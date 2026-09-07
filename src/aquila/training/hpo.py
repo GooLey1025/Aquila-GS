@@ -128,9 +128,28 @@ def merge_config(
     base_config: Mapping[str, Any],
     parameters: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """Deep-copy a config and apply dot-path candidate parameters."""
+    """Deep-copy a config and apply candidate parameters.
+
+    ``branches_downconv_kernel_size`` is a grouped Aquila-Vars parameter:
+    it keeps the first trunk block's kernel size synchronized across every
+    variant-type branch.
+    """
     merged = copy.deepcopy(dict(base_config))
     for path, value in parameters.items():
+        if path == "branches_downconv_kernel_size":
+            branches = merged.get("train", {}).get("branches", {})
+            if not branches:
+                raise KeyError(
+                    "branches_downconv_kernel_size requires train.branches"
+                )
+            for branch_name, branch_config in branches.items():
+                trunk = branch_config.get("trunk", [])
+                if not trunk:
+                    raise KeyError(
+                        f"Branch {branch_name!r} has no trunk block to update"
+                    )
+                trunk[0]["kernel_size"] = copy.deepcopy(value)
+            continue
         set_config_path(merged, str(path), copy.deepcopy(value))
     return merged
 

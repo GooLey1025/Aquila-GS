@@ -27,6 +27,13 @@ import numpy as np
 import torch
 import yaml
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = PROJECT_ROOT / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+from aquila.data import resolve_outer_folds
+
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -714,11 +721,8 @@ def cli(spec: ModelSpec, default_config: Path) -> None:
         raise ValueError(
             f"{spec.name} only supports regression traits: {non_regression}"
         )
-    outer_count = int(metadata["outer_folds"])
     inner_count = int(metadata["inner_folds"])
-    outer_folds = args.outer_folds or list(range(outer_count))
-    if any(fold < 0 or fold >= outer_count for fold in outer_folds):
-        raise ValueError(f"Outer folds must be in 0..{outer_count - 1}")
+    outer_folds = resolve_outer_folds(args.outer_folds, metadata)
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)
     candidates = expand_grid(spec, config)

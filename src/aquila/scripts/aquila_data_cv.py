@@ -50,6 +50,7 @@ class PreparationConfig:
     inner_folds: int = 4
     seed: int = 42
     fold_mapping: Path | None = None
+    fold_specific_gwas_fold: int | None = None
     save_raw_genotype: bool = False
     min_observed_per_fold: int = 10
     skew_threshold: float = 2.0
@@ -106,6 +107,7 @@ class NestedCVDataPreparer:
             )
         else:
             folds = self._load_fold_mapping(aligned["sample_ids"])
+        self._validate_fold_specific_gwas(folds)
         observed_counts = validate_outer_fold_observations(
             aligned["target_mask"].numpy(),
             folds,
@@ -131,6 +133,23 @@ class NestedCVDataPreparer:
             "epsilon": self.config.preprocessing_epsilon,
             "fit_scope": "inner_train_and_outer_train_only",
         }
+        if self.config.fold_specific_gwas_fold is not None:
+            metadata["fold_specific_gwas"] = {
+                "enabled": True,
+                "outer_fold": self.config.fold_specific_gwas_fold,
+                "selection_scope": "outer_train_only",
+                "source_vcf": str(self.config.genotype_file.resolve()),
+                "source_vcf_sha256": metadata["source_checksums"][
+                    "genotype_sha256"
+                ],
+                "fold_mapping_file": str(self.config.fold_mapping.resolve()),
+                "fold_mapping_sha256": self._sha256(self.config.fold_mapping),
+                "variant_counts": {
+                    name: len(values)
+                    for name, values in genotypes.variant_ids.items()
+                },
+                "feature_shapes": metadata["feature_shapes"],
+            }
         self._save_artifacts(aligned, metadata, folds)
         if self.config.save_raw_genotype:
             self._save_raw_genotype_subsets(aligned["sample_ids"], folds)
@@ -153,6 +172,15 @@ class NestedCVDataPreparer:
             raise ValueError("preprocessing_epsilon must be positive")
         if self.config.min_observed_per_fold < 10:
             raise ValueError("min_observed_per_fold must be at least 10")
+        if self.config.fold_specific_gwas_fold is not None:
+            if self.config.fold_specific_gwas_fold < 0:
+                raise ValueError(
+                    "--fold-specific-gwas-fold must be a nonnegative integer"
+                )
+            if self.config.fold_mapping is None:
+                raise ValueError(
+                    "--fold-specific-gwas-fold requires --fold-mapping"
+                )
         if (
             self.config.fold_mapping is not None
             and not self.config.fold_mapping.is_file()
@@ -169,6 +197,21 @@ class NestedCVDataPreparer:
                 raise ValueError(
                     "--save-raw-genotype requires a .vcf or .vcf.gz input"
                 )
+
+    def _validate_fold_specific_gwas(
+        self,
+        folds: Sequence[Dict[str, object]],
+    ) -> None:
+        selected = self.config.fold_specific_gwas_fold
+        if selected is None:
+            return
+        available = {int(fold["fold"]) for fold in folds}
+        if selected not in available:
+            raise ValueError(
+                "--fold-specific-gwas-fold must identify an outer fold in "
+                f"the mapping; got {selected}, available folds are "
+                f"{sorted(available)}"
+            )
 
     def _prepare_output_directory(self) -> None:
         output = self.config.output_directory
@@ -488,6 +531,16 @@ class NestedCVDataPreparer:
                 )
             assignments[sample_id] = fold_id
 
+        if self.config.fold_specific_gwas_fold is not None:
+            missing_from_genotype = sorted(
+                set(assignments) - set(aligned_sample_ids)
+            )
+            if missing_from_genotype:
+                raise ValueError(
+                    "Fold-specific GWAS genotype must contain every sample in "
+                    "the fold mapping; missing genotype samples: "
+                    + ", ".join(missing_from_genotype[:10])
+                )
         missing_samples = [
             sample_id
             for sample_id in aligned_sample_ids
@@ -534,6 +587,14 @@ class NestedCVDataPreparer:
         }
         aligned_set = set(positions)
         mapped_samples = {str(value) for value in payload.get("sample_ids", [])}
+        if self.config.fold_specific_gwas_fold is not None:
+            missing_from_genotype = sorted(mapped_samples - aligned_set)
+            if missing_from_genotype:
+                raise ValueError(
+                    "Fold-specific GWAS genotype must contain every sample in "
+                    "the nested-CV mapping; missing genotype samples: "
+                    + ", ".join(missing_from_genotype[:10])
+                )
         missing = sorted(aligned_set - mapped_samples)
         if missing:
             raise ValueError(
@@ -1040,6 +1101,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fold-specific-gwas-fold",
+        type=int,
+        default=None,
+        metavar="FOLD",
+        help=(
+            "Bind this prepared dataset to one zero-based outer fold whose "
+            "GWAS marker panel was selected from that fold's training samples. "
+            "Requires --fold-mapping. Omission preserves the standard shared-"
+            "genotype nested-CV behavior."
+        ),
+    )
+    parser.add_argument(
         "--min-observed-per-fold",
         type=int,
         default=10,
@@ -1098,6 +1171,7 @@ def main() -> None:
         inner_folds=args.inner_folds if args.inner_folds is not None else 4,
         seed=args.seed,
         fold_mapping=Path(args.fold_mapping) if args.fold_mapping else None,
+        fold_specific_gwas_fold=args.fold_specific_gwas_fold,
         save_raw_genotype=args.save_raw_genotype,
         min_observed_per_fold=args.min_observed_per_fold,
         skew_threshold=args.skew_threshold,

@@ -255,6 +255,112 @@ def test_mqa_d_ff_is_configurable() -> None:
     assert narrow(x).shape == x.shape
 
 
+def test_multi_branch_d_model_and_dropout_are_global() -> None:
+    from aquila.blocks import GatedFusionBlock, MLPBlock, RegressionHead
+    from aquila.blocks_v2 import AdaptiveDownsampleTower
+    from aquila.varnn import create_model_from_config
+
+    branch = {
+        "embedder": [
+            {
+                "name": "conv_block",
+                "in_channels": 8,
+                "out_channels": 256,
+                "kernel_size": 15,
+            }
+        ],
+        "trunk": [
+            {
+                "name": "std_down_conv_tower",
+                "in_channels": 256,
+                "out_channels": 256,
+                "kernel_size": 9,
+                "seq_len_threshold": 16,
+            },
+            {
+                "name": "transformer_mqa",
+                "d_model": 256,
+                "num_query_heads": 4,
+                "qk_head_dim": 8,
+                "v_head_dim": 8,
+                "d_ff": 256,
+            },
+            {
+                "name": "multi_head_pool",
+                "d_model": 256,
+                "num_heads": 4,
+                "pool_axis": 2,
+            },
+        ],
+    }
+    config = {
+        "model": {
+            "architecture_type": "multi_branch",
+            "d_model": 32,
+            "dropout": 0.5,
+        },
+        "train": {
+            "branches": {
+                "snp": branch,
+                "indel": {
+                    **branch,
+                    "embedder": [{**branch["embedder"][0], "in_channels": 4}],
+                },
+                "sv": {
+                    **branch,
+                    "embedder": [{**branch["embedder"][0], "in_channels": 4}],
+                },
+            },
+            "fusion": [
+                {
+                    "name": "gated_fusion",
+                    "fusion_dim": 256,
+                    "num_branches": 3,
+                }
+            ],
+            "shared_trunk": [
+                {
+                    "name": "mlp_block",
+                    "in_features": 256,
+                    "hidden_features": 64,
+                    "out_features": 256,
+                    "num_layers": 2,
+                }
+            ],
+            "heads": {
+                "regression": [
+                    {
+                        "name": "regression_head",
+                        "in_features": None,
+                        "hidden_features": 16,
+                    }
+                ]
+            },
+        },
+    }
+
+    model = create_model_from_config(
+        config,
+        seq_length={"snp": 32, "indel": 32, "sv": 32},
+        regression_tasks=["trait"],
+    )
+
+    tower = model.branch_trunks["snp"][0]
+    fusion = model.fusion_blocks[0]
+    shared = model.shared_trunk_blocks[0]
+    head = model.head_blocks["regression"][0]
+    assert isinstance(tower, AdaptiveDownsampleTower)
+    assert isinstance(fusion, GatedFusionBlock)
+    assert isinstance(shared, MLPBlock)
+    assert isinstance(head, RegressionHead)
+    assert tower.blocks[0].feat.conv.out_channels == 32
+    assert fusion.fusion_dim == 32
+    assert fusion.dropout.p == 0.5
+    assert shared.network[0].in_features == 32
+    assert shared.network[3].p == 0.5
+    assert head.network[3].p == 0.5
+
+
 def test_v5_transformer_ablation_configs_forward() -> None:
     import yaml
     from pathlib import Path

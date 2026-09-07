@@ -183,6 +183,11 @@ def load_prepared_data(directory: str | Path) -> PreparedData:
                 "sample_fold_mapping.txt"
             )
         _validate_cv_artifacts(data_path, metadata, sample_count)
+        _validate_split_local_marker_artifacts(
+            data_path,
+            metadata,
+            features,
+        )
     elif data_mode == "deployment":
         _validate_deployment_artifacts(data_path, metadata, sample_count)
     else:
@@ -197,6 +202,36 @@ def load_prepared_data(directory: str | Path) -> PreparedData:
         metadata=metadata,
         directory=data_path,
     )
+
+
+def load_split_marker_indices(
+    prepared_data: PreparedData,
+    outer_fold: int,
+    inner_fold: int | None = None,
+) -> Dict[str, np.ndarray] | None:
+    """Load optional marker-axis indices fitted on the matching train split."""
+    if prepared_data.metadata.get("feature_storage") != (
+        "split_local_marker_indices"
+    ):
+        return None
+    split_path = (
+        prepared_data.directory
+        / "cv"
+        / f"outer_fold_{outer_fold}"
+        / (
+            "final"
+            if inner_fold is None
+            else f"inner_fold_{inner_fold}"
+        )
+    )
+    path = split_path / "marker_indices.npz"
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing split-local marker indices: {path}")
+    with np.load(path, allow_pickle=False) as payload:
+        return {
+            str(name): np.asarray(payload[name], dtype=np.int64)
+            for name in payload.files
+        }
 
 
 def _validate_deployment_artifacts(
@@ -518,6 +553,93 @@ def _validate_cv_artifacts(
 
     if observed_test_indices != all_indices:
         raise ValueError("Outer test folds do not cover every prepared sample")
+
+
+def _validate_split_local_marker_artifacts(
+    data_path: Path,
+    metadata: Dict[str, Any],
+    features: FeatureTensor,
+) -> None:
+    storage = metadata.get("feature_storage")
+    if storage is None:
+        return
+    if storage != "split_local_marker_indices":
+        raise ValueError(f"Unsupported metadata feature_storage: {storage!r}")
+    binding = metadata.get("fold_specific_features")
+    if not isinstance(binding, dict) or binding.get("enabled") is not True:
+        raise ValueError(
+            "split-local marker data require enabled fold_specific_features"
+        )
+    outer_fold = binding.get("outer_fold")
+    trait = binding.get("trait")
+    if isinstance(outer_fold, bool) or not isinstance(outer_fold, int):
+        raise ValueError("fold_specific_features.outer_fold must be an integer")
+    if metadata.get("trait_names") != [trait]:
+        raise ValueError(
+            "split-local marker data must contain its single bound trait"
+        )
+    outer_count = int(metadata["outer_folds"])
+    inner_count = int(metadata["inner_folds"])
+    if outer_fold < 0 or outer_fold >= outer_count:
+        raise ValueError("fold_specific_features.outer_fold is out of range")
+    feature_lengths = (
+        {"main": int(features.shape[1])}
+        if isinstance(features, torch.Tensor)
+        else {name: int(tensor.shape[1]) for name, tensor in features.items()}
+    )
+    split_paths = [
+        data_path
+        / "cv"
+        / f"outer_fold_{outer_fold}"
+        / f"inner_fold_{inner_fold}"
+        for inner_fold in range(inner_count)
+    ]
+    split_paths.append(
+        data_path / "cv" / f"outer_fold_{outer_fold}" / "final"
+    )
+    for split_path in split_paths:
+        indices_path = split_path / "marker_indices.npz"
+        metadata_path = split_path / "marker_indices.json"
+        if not indices_path.is_file() or not metadata_path.is_file():
+            raise FileNotFoundError(
+                f"Missing split-local marker artifacts in {split_path}"
+            )
+        with np.load(indices_path, allow_pickle=False) as payload:
+            if set(payload.files) != set(feature_lengths):
+                raise ValueError(
+                    f"Split-local marker branches do not match X.pt: {indices_path}"
+                )
+            for branch, length in feature_lengths.items():
+                values = np.asarray(payload[branch])
+                if values.ndim != 1 or not np.issubdtype(
+                    values.dtype, np.integer
+                ):
+                    raise ValueError(
+                        f"Marker indices must be a 1D integer array: {indices_path}"
+                    )
+                if values.size == 0:
+                    raise ValueError(
+                        f"Marker indices must not be empty: {indices_path}"
+                    )
+                if values.min() < 0 or values.max() >= length:
+                    raise IndexError(
+                        f"Marker index is out of range for {branch}: {indices_path}"
+                    )
+                if np.unique(values).size != values.size:
+                    raise ValueError(
+                        f"Marker indices contain duplicates: {indices_path}"
+                    )
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            selection = json.load(handle)
+        if (
+            selection.get("schema")
+            != "aquila_split_local_marker_indices"
+            or selection.get("trait") != trait
+            or int(selection.get("outer_fold", -1)) != outer_fold
+        ):
+            raise ValueError(
+                f"Invalid split-local marker metadata: {metadata_path}"
+            )
 
 
 def _load_index_file(path: Path, sample_count: int) -> np.ndarray:

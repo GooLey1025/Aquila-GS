@@ -6,7 +6,7 @@ benchmark:
 
 data:
   modalities: [snp, indel, sv]
-  rf_enabled: false
+  rf_enabled: true
   selected_markers:
     snp: 1000
     indel: 1000

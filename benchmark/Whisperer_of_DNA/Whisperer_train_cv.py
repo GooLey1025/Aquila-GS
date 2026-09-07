@@ -38,6 +38,7 @@ from aquila.benchmark.common import (
     write_json,
     write_predictions_csv,
 )
+from aquila.data import resolve_outer_folds
 from aquila.training.distributed import (
     derive_seed,
     detect_gpu_ids,
@@ -563,9 +564,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = _load_config(config_path)
     benchmark = WhispererPreparedBenchmark(data_directory)
     traits = _select_traits(benchmark, args.traits)
-    outer_folds = args.outer_folds or list(range(benchmark.outer_fold_count))
-    if any(fold < 0 or fold >= benchmark.outer_fold_count for fold in outer_folds):
-        raise ValueError("Requested outer fold is outside the prepared fold range")
+    outer_folds = resolve_outer_folds(args.outer_folds, benchmark.metadata)
     inner_count = benchmark.inner_fold_count
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)

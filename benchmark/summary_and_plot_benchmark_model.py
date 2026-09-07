@@ -36,6 +36,9 @@ MODEL_SPECS = (
     ("DNAwhisper", "Whisperer_of_DNA"),
     ("BNNs", "BNNs"),
     ("Aquila-SNP", "aquila-snp"),
+    ("Aquila-Vars", "aquila-vars"),
+    ("DEM-SNP", "DEM/results/DEM-SNP"),
+    ("DEM-Vars", "DEM/results/DEM-Vars"),
 )
 
 MODEL_COLORS = {
@@ -51,9 +54,13 @@ MODEL_COLORS = {
     "DNAwhisper": "#6D8F72",
     "BNNs": "#C28D62",
     "Aquila-SNP": "#DF6878",
+    "Aquila-Vars": "#C94B62",
+    "DEM-SNP": "#5A7D9A",
+    "DEM-Vars": "#355C7D",
 }
 
 SCALE_NAMES = ("normalized", "processed", "standardized")
+PRIMARY_TRAIT_PEARSON = "within_trait_pearson"
 LINE_WIDTH = 1.05
 
 
@@ -304,13 +311,19 @@ def extract_aquila_fold_metrics(directory: Path) -> dict[str, float]:
 
 
 def cohort_matches(payload: Mapping[str, Any], cohort: str) -> bool:
+    declared = payload.get("cohort")
+    if declared is not None:
+        return str(declared) == cohort
     data_dir = payload.get("data_dir")
     if data_dir is None:
         return False
     normalized = str(data_dir).replace("\\", "/").rstrip("/")
+    path_names = [part.casefold() for part in Path(normalized).parts]
+    cohort_key = cohort.casefold()
     return (
         Path(normalized).name in {cohort, f"{cohort}.cv.data"}
         or f"/{cohort}/" in f"{normalized}/"
+        or any(name.startswith(cohort_key) for name in path_names)
     )
 
 
@@ -334,7 +347,85 @@ def summary_candidates(benchmark_dir: Path, model_dir: str, cohort: str) -> list
         candidates.append(root / "lasso" / "summary.json")
     elif model_dir == "ElasticNet":
         candidates.append(root / "elasticnet" / "summary.json")
+    elif model_dir in {"DEM/results/DEM-SNP", "DEM/results/DEM-Vars"}:
+        variant = Path(model_dir).name
+        candidates.append(
+            benchmark_dir
+            / "DEM"
+            / "results"
+            / f"{cohort}-rf-matched"
+            / variant
+            / "summary.json"
+        )
     return candidates
+
+
+def _values_from_summary(
+    summary_file: Path,
+    model_dir: str,
+) -> tuple[Mapping[str, Any], dict[str, float]]:
+    payload = read_json(summary_file)
+    values = extract_summary_values(payload)
+    if not values and model_dir == "Whisperer_of_DNA":
+        values = extract_trait_summary_files(summary_file.parent)
+    if not values and model_dir in {"aquila-snp", "aquila-vars"}:
+        values = extract_aquila_fold_metrics(summary_file.parent)
+    return payload, values
+
+
+def load_fold_sharded_result(
+    candidates: Sequence[Path],
+    cohort: str,
+    display_name: str,
+    model_dir: str,
+) -> ModelResult | None:
+    shard_files = sorted(
+        {
+            shard
+            for candidate in candidates
+            for shard in candidate.parent.glob("fold_*/summary.json")
+        }
+    )
+    if not shard_files:
+        return None
+    grouped: dict[str, list[float]] = {}
+    accepted: list[Path] = []
+    for shard in shard_files:
+        try:
+            payload, values = _values_from_summary(shard, model_dir)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        has_data_dir = payload.get("data_dir") is not None
+        if has_data_dir and not cohort_matches(payload, cohort):
+            continue
+        if not model_matches(payload, display_name):
+            continue
+        for trait, value in values.items():
+            number = finite_float(value)
+            if number is not None:
+                grouped.setdefault(trait, []).append(number)
+        if values:
+            accepted.append(shard)
+    if not accepted:
+        return ModelResult(
+            display_name,
+            shard_files[0],
+            {},
+            "mismatch",
+            f"Fold summaries do not identify {display_name} for cohort {cohort}",
+        )
+    values = {
+        trait: float(np.mean(numbers))
+        for trait, numbers in grouped.items()
+        if numbers
+    }
+    return ModelResult(
+        display_name,
+        accepted[0].parent.parent,
+        values,
+        "available",
+        f"Merged {len(accepted)} fold-specific summary shard(s)",
+    )
 
 
 def load_model_result(
@@ -346,10 +437,18 @@ def load_model_result(
     candidates = summary_candidates(benchmark_dir, model_dir, cohort)
     summary_file = next((path for path in candidates if path.is_file()), None)
     if summary_file is None:
+        sharded = load_fold_sharded_result(
+            candidates,
+            cohort,
+            display_name,
+            model_dir,
+        )
+        if sharded is not None:
+            return sharded
         return ModelResult(display_name, None, {}, "missing", "Final summary not found")
 
     try:
-        payload = read_json(summary_file)
+        payload, values = _values_from_summary(summary_file, model_dir)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         return ModelResult(display_name, summary_file, {}, "invalid", str(error))
 
@@ -374,12 +473,6 @@ def load_model_result(
             f"Summary model identifier does not match {display_name}",
         )
 
-    values = extract_summary_values(payload)
-    if not values and model_dir == "Whisperer_of_DNA":
-        values = extract_trait_summary_files(summary_file.parent)
-    if not values and model_dir == "aquila-snp":
-        values = extract_aquila_fold_metrics(summary_file.parent)
-
     if not values:
         return ModelResult(
             display_name,
@@ -392,17 +485,28 @@ def load_model_result(
 
 
 def load_expected_traits(benchmark_dir: Path, cohort: str) -> list[str]:
-    metadata_file = benchmark_dir / f"{cohort}.cv.data" / "metadata.json"
-    if not metadata_file.is_file():
-        return []
-    try:
-        payload = read_json(metadata_file)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return []
-    traits = payload.get("trait_names")
-    if not isinstance(traits, Sequence) or isinstance(traits, (str, bytes)):
-        return []
-    return [str(trait) for trait in traits]
+    candidates = (
+        benchmark_dir / f"{cohort}.cv.data" / "metadata.json",
+        benchmark_dir
+        / f"{cohort}.current_fold_GWAS.cv.data"
+        / "fold_0"
+        / "metadata.json",
+        benchmark_dir
+        / f"{cohort}.current_fold_GWAS.vars.cv.data"
+        / "fold_0"
+        / "metadata.json",
+    )
+    for metadata_file in candidates:
+        if not metadata_file.is_file():
+            continue
+        try:
+            payload = read_json(metadata_file)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        traits = payload.get("trait_names")
+        if isinstance(traits, Sequence) and not isinstance(traits, (str, bytes)):
+            return [str(trait) for trait in traits]
+    return []
 
 
 def collect_results(
@@ -434,6 +538,7 @@ def make_long_table(results: Sequence[ModelResult], traits: Sequence[str]) -> pd
                     "model": result.model,
                     "phenotype": trait,
                     "pearson_r": result.values.get(trait, np.nan),
+                    "metric": PRIMARY_TRAIT_PEARSON,
                     "status": result.status,
                     "source_file": (
                         str(result.source_file) if result.source_file is not None else ""

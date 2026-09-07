@@ -534,6 +534,41 @@ def _apply_model_d_model(model_params: dict) -> None:
         if isinstance(block, dict):
             _rewrite(block)
 
+    # Aquila-Vars keeps architecture blocks under train.* in legacy configs;
+    # create_model_from_config copies them into model_params before this helper
+    # is called for multi-branch models.
+    for branch in (model_params.get("branches") or {}).values():
+        branch_embedder = branch.get("embedder") or branch.get("embedding")
+        branch_blocks = (
+            branch_embedder
+            if isinstance(branch_embedder, list)
+            else [branch_embedder] if isinstance(branch_embedder, dict) else []
+        )
+        for block in branch_blocks:
+            if isinstance(block, dict):
+                _rewrite(block)
+        for block in branch.get("trunk") or []:
+            if isinstance(block, dict):
+                _rewrite(block)
+
+    for block in model_params.get("fusion") or []:
+        if isinstance(block, dict) and block.get("name") == "gated_fusion":
+            block["fusion_dim"] = width
+
+    for block in model_params.get("shared_trunk") or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("in_features") is not None:
+            block["in_features"] = width
+        if block.get("out_features") is not None:
+            block["out_features"] = width
+
+    for head_blocks in (model_params.get("heads") or {}).values():
+        blocks = head_blocks if isinstance(head_blocks, list) else [head_blocks]
+        for block in blocks:
+            if isinstance(block, dict) and block.get("in_features") not in (None, "null"):
+                block["in_features"] = width
+
 
 def create_model_from_config(
     config: dict,
@@ -560,7 +595,6 @@ def create_model_from_config(
 
     # Deep copy to avoid modifying original config
     model_params = copy.deepcopy(config.get('model', {}))
-    _apply_model_d_model(model_params)
     train_config = config.get('train', {})
 
     # Check for multi-branch architecture
@@ -586,6 +620,8 @@ def create_model_from_config(
         # Set architecture_type to multi_branch if using train.branches
         if 'branches' in model_params:
             architecture_type = 'multi_branch'
+
+    _apply_model_d_model(model_params)
 
     # Set tasks
     model_params['regression_tasks'] = regression_tasks or []

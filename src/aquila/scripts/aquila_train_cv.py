@@ -21,8 +21,12 @@ import pandas as pd
 import torch
 import yaml
 
-from aquila.data.cv import load_fold_indices, parse_fold_selector
-from aquila.data.dataset import PreparedData, load_prepared_data
+from aquila.data.cv import load_fold_indices, resolve_outer_folds
+from aquila.data.dataset import (
+    PreparedData,
+    load_prepared_data,
+    load_split_marker_indices,
+)
 from aquila.data.preprocessing import PerTraitPreprocessor
 from aquila.models.registry import create_model
 from aquila.training.cuda_runtime import (
@@ -133,6 +137,18 @@ def _inner_job_id(fold_id: int, candidate_id: int, inner_fold: int) -> int:
 
 def _final_job_id(fold_id: int) -> int:
     return int(fold_id) * 1_000_000 + 999_999
+
+
+def resolve_selected_folds(
+    requested_folds: Sequence[int] | None,
+    metadata: Mapping[str, Any],
+) -> list[int]:
+    """Resolve outer folds while enforcing fold-specific GWAS binding."""
+    return resolve_outer_folds(
+        requested_folds,
+        metadata,
+        option_name="--folds",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -314,10 +330,50 @@ def _subset_features(features: Any, indices: np.ndarray) -> Any:
     return features[indices].contiguous()
 
 
+def _select_markers(features: Any, marker_indices: Mapping[str, np.ndarray]) -> Any:
+    if isinstance(features, dict):
+        if set(features) != set(marker_indices):
+            raise ValueError("Marker-index branches do not match prepared features")
+        return {
+            name: tensor.index_select(
+                1,
+                torch.as_tensor(marker_indices[name], dtype=torch.long),
+            ).contiguous()
+            for name, tensor in features.items()
+        }
+    if set(marker_indices) != {"main"}:
+        raise ValueError("Single-branch features require marker indices named 'main'")
+    return features.index_select(
+        1,
+        torch.as_tensor(marker_indices["main"], dtype=torch.long),
+    ).contiguous()
+
+
+def _features_for_split(
+    prepared_data: PreparedData,
+    indices: np.ndarray,
+    outer_fold: int,
+    inner_fold: int | None,
+) -> Any:
+    features = _subset_features(prepared_data.features, indices)
+    marker_indices = load_split_marker_indices(
+        prepared_data,
+        outer_fold,
+        inner_fold,
+    )
+    return (
+        features
+        if marker_indices is None
+        else _select_markers(features, marker_indices)
+    )
+
+
 def _processed_view(
     prepared_data: PreparedData,
     indices: np.ndarray,
     target_path: Path,
+    *,
+    features: Any | None = None,
 ) -> PreparedData:
     processed_targets = torch.load(
         target_path,
@@ -337,7 +393,11 @@ def _processed_view(
         for index in indices
     ]
     return PreparedData(
-        features=_subset_features(prepared_data.features, indices),
+        features=(
+            _subset_features(prepared_data.features, indices)
+            if features is None
+            else features
+        ),
         targets=processed_targets,
         target_mask=prepared_data.target_mask[indices].contiguous(),
         metadata=metadata,
@@ -466,11 +526,23 @@ def _train_inner_fold(
         prepared,
         split["train"],
         inner_path / "Y_train_processed.pt",
+        features=_features_for_split(
+            prepared,
+            split["train"],
+            fold_id,
+            inner_fold,
+        ),
     )
     valid_data = _processed_view(
         prepared,
         split["valid"],
         inner_path / "Y_valid_processed.pt",
+        features=_features_for_split(
+            prepared,
+            split["valid"],
+            fold_id,
+            inner_fold,
+        ),
     )
     train_cfg = candidate_config.get("train", {})
     batch_size = int(train_cfg.get("batch_size", 32))
@@ -507,7 +579,7 @@ def _train_inner_fold(
     trainer = NestedCVTrainer(
         _make_seeded_model(
             candidate_config,
-            prepared,
+            train_data,
             regression_tasks,
             classification_tasks,
             training_seed,
@@ -933,11 +1005,23 @@ def _finalize_outer_fold(
         prepared,
         outer["train"],
         final_path / "Y_train_processed.pt",
+        features=_features_for_split(
+            prepared,
+            outer["train"],
+            fold_id,
+            None,
+        ),
     )
     final_test_data = _processed_view(
         prepared,
         outer["test"],
         final_path / "Y_test_processed.pt",
+        features=_features_for_split(
+            prepared,
+            outer["test"],
+            fold_id,
+            None,
+        ),
     )
     final_batch_size = int(
         selected_config.get("train", {}).get("batch_size", 32)
@@ -969,7 +1053,7 @@ def _finalize_outer_fold(
     final_trainer = NestedCVTrainer(
         _make_seeded_model(
             selected_config,
-            prepared,
+            final_train_data,
             regression_tasks,
             classification_tasks,
             training_seed,
@@ -1023,8 +1107,12 @@ def _finalize_outer_fold(
     )
     checkpoint_metadata = copy.deepcopy(prepared.metadata)
     checkpoint_metadata["sequence_lengths"] = _sequence_lengths(
-        prepared.features
+        final_train_data.features
     )
+    if prepared.metadata.get("feature_storage") == "split_local_marker_indices":
+        checkpoint_metadata["feature_selection"] = json.loads(
+            (final_path / "marker_indices.json").read_text(encoding="utf-8")
+        )
     checkpoint = {
         **final_training.checkpoint_state,
         "config": selected_config,
@@ -1343,12 +1431,7 @@ def main() -> None:
         # Prefer explicit precision; drop redundant legacy key.
         config["train"].pop("mixed_precision", None)
     _validate_preprocessing_cache(prepared, config)
-    fold_count = int(prepared.metadata["outer_folds"])
-    selected_folds = (
-        list(range(fold_count))
-        if args.folds is None
-        else parse_fold_selector(args.folds, fold_count)
-    )
+    selected_folds = resolve_selected_folds(args.folds, prepared.metadata)
     output_directory = Path(args.output_dir)
     _prepare_output(output_directory, selected_folds, args.overwrite)
     params_copy = _copy_params_yaml(Path(args.config), output_directory)

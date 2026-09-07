@@ -37,9 +37,14 @@ try:
         generate_grid_candidates,
         half_up_median_epoch,
         load_prepared_data,
+        resolve_outer_folds,
     )
 except ImportError:
-    from aquila.data import PerTraitPreprocessor, load_prepared_data
+    from aquila.data import (
+        PerTraitPreprocessor,
+        load_prepared_data,
+        resolve_outer_folds,
+    )
     from aquila.training.distributed import derive_seed
     from aquila.training.evaluator import evaluate_regression
     from aquila.training.hpo import (
@@ -676,13 +681,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     ]
     if non_regression:
         raise ValueError(f"XGBoost adapter supports regression traits only: {non_regression}")
-    outer_count = int(prepared.metadata["outer_folds"])
     inner_count = int(prepared.metadata["inner_folds"])
-    outer_folds = args.outer_folds or list(range(outer_count))
-    if any(fold < 0 or fold >= outer_count for fold in outer_folds):
-        raise ValueError(f"Outer folds must be in 0..{outer_count - 1}")
-    if len(set(outer_folds)) != len(outer_folds):
-        raise ValueError("Outer folds must be unique")
+    outer_folds = resolve_outer_folds(args.outer_folds, prepared.metadata)
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)
     candidates = generate_grid_candidates(config["hpo"]["parameters"])

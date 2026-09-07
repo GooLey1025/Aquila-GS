@@ -563,6 +563,7 @@ def run_nested_cv(args: argparse.Namespace) -> dict[str, Any]:
     """Run independent per-trait HPO and untouched outer-test evaluation."""
 
     load_context, _, _ = _resolve_api()
+    from aquila.data import resolve_outer_folds
     from aquila.benchmark import aggregate_outer_folds
     from aquila.training.distributed import detect_gpu_ids, execute_gpu_jobs
 
@@ -570,7 +571,7 @@ def run_nested_cv(args: argparse.Namespace) -> dict[str, Any]:
         base = yaml.safe_load(handle)
     context = load_context(args.data_dir)
     traits = args.traits or list(context.regression_traits)
-    outer_folds = args.outer_folds or list(range(int(context.outer_folds)))
+    outer_folds = resolve_outer_folds(args.outer_folds, context.metadata)
     inner_count = int(context.inner_folds)
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)

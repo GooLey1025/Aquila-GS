@@ -4,6 +4,8 @@
 
 """Common APIs for prepared nested-CV benchmark model runners."""
 
+from aquila.data import resolve_outer_folds
+
 from .common import (
     DosageVCF,
     FoldPaths,
@@ -42,6 +44,7 @@ __all__ = [
     "load_processed_targets",
     "load_trait_split",
     "load_vcf_dosage",
+    "resolve_outer_folds",
     "sanitize_json",
     "serialize_candidate",
     "serialize_hpo",
