@@ -20,6 +20,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 import yaml
+from threadpoolctl import threadpool_limits
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 WHISPERER_DIRECTORY = SCRIPT_DIRECTORY
@@ -334,6 +335,14 @@ def run_outer_fold(
                     {**result.best_metrics, "training_seed": training_seed},
                 )
             )
+            print(
+                f"[INFO] traits={list(names)} outer_fold={outer_fold} "
+                f"inner_fold={inner_fold} "
+                f"candidate={candidate_id + 1}/{len(candidates)} "
+                f"best_valid_pearson={result.best_metric:.6f} "
+                f"best_epoch={result.best_epoch}",
+                flush=True,
+            )
             histories[f"candidate_{candidate_id}/inner_{inner_fold}"] = list(
                 result.history
             )
@@ -527,6 +536,12 @@ def _run_outer_fold(
     device_name: str,
     context: OuterFoldContext,
 ) -> dict[str, Any]:
+    thread_limiter = threadpool_limits(limits=1)
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
     device = torch.device(device_name)
     if device.type == "cuda":
         configure_cuda_runtime(device_name, deterministic=False)
@@ -534,9 +549,10 @@ def _run_outer_fold(
     print(
         f"[INFO] traits={list(context.trait_names)} outer_fold={job.outer_fold} "
         f"candidates={len(context.candidates)} "
-        f"inner_folds={len(context.inner_folds)} device={device}"
+        f"inner_folds={len(context.inner_folds)} device={device}",
+        flush=True,
     )
-    return run_outer_fold(
+    result = run_outer_fold(
         benchmark,
         Path(context.output_directory),
         context.trait_names,
@@ -549,6 +565,8 @@ def _run_outer_fold(
         context.budget,
         context.live_metrics_log,
     )
+    thread_limiter.restore_original_limits()
+    return result
 
 
 def main(argv: Sequence[str] | None = None) -> None:

@@ -73,6 +73,19 @@ class ModelResult:
     message: str
 
 
+@dataclass(frozen=True)
+class WithinResult:
+    model: str
+    status: str
+    fold_values: Mapping[int, float]
+    fold_counts: Mapping[int, int]
+    pooled_value: float | None
+    pooled_count: int
+    traits_found: int
+    source: str
+    message: str
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -507,6 +520,311 @@ def load_expected_traits(benchmark_dir: Path, cohort: str) -> list[str]:
         if isinstance(traits, Sequence) and not isinstance(traits, (str, bytes)):
             return [str(trait) for trait in traits]
     return []
+
+
+def preprocessing_by_trait(
+    benchmark_dir: Path,
+    cohort: str,
+    outer_fold: int,
+) -> dict[str, Mapping[str, Any]]:
+    path = (
+        benchmark_dir
+        / f"{cohort}.cv.data"
+        / "cv"
+        / f"outer_fold_{outer_fold}"
+        / "final"
+        / "preprocessing.json"
+    )
+    payload = read_json(path)
+    traits = payload.get("traits")
+    if not isinstance(traits, Sequence) or isinstance(traits, (str, bytes)):
+        raise ValueError(f"Missing preprocessing traits in {path}")
+    return {
+        str(item["name"]): item
+        for item in traits
+        if isinstance(item, Mapping) and item.get("name") is not None
+    }
+
+
+def transform_original_values(
+    values: pd.Series,
+    parameters: Mapping[str, Any],
+) -> pd.Series:
+    transformed = pd.to_numeric(values, errors="coerce").astype(float)
+    if bool(parameters.get("use_log1p", False)):
+        transformed = np.log1p(transformed + float(parameters.get("log_shift", 0.0)))
+    std = float(parameters.get("std", 1.0))
+    if not math.isfinite(std) or std == 0.0:
+        std = 1.0
+    return (transformed - float(parameters.get("mean", 0.0))) / std
+
+
+def prediction_file_for_trait(
+    result_root: Path,
+    model_dir: str,
+    trait: str,
+    outer_fold: int,
+) -> tuple[Path, str, str, str] | None:
+    fold_dir = result_root / trait / f"fold_{outer_fold}"
+    formats = {
+        "croparnet": ("predictions.tsv", "\t", "predicted_processed", "observed_processed"),
+        "cropformer": ("predictions.tsv", "\t", "predicted_processed", "observed_processed"),
+        "xgboost": (
+            "predictions.csv",
+            ",",
+            "prediction_standardized",
+            "observed_standardized",
+        ),
+        "bayescpi": ("predictions.csv", ",", "PredictedNormalized", "ObservedNormalized"),
+        "rrBLUP": ("predictions.csv", ",", "PredictedNormalized", "ObservedNormalized"),
+        "Lasso": ("predictions.csv", ",", "PredictedNormalized", "ObservedNormalized"),
+        "ElasticNet": ("predictions.csv", ",", "PredictedNormalized", "ObservedNormalized"),
+        "CLCNet": ("predictions.csv", ",", "prediction_processed", "target_processed"),
+        "Whisperer_of_DNA": (
+            "predictions_original_scale.csv",
+            ",",
+            "prediction_processed",
+            "target_processed",
+        ),
+        "MENET": ("predictions_original_scale.csv", ",", "Prediction", "Observed"),
+        "BNNs": ("predictions_normalized_scale.csv", ",", "Prediction", "Observed"),
+    }
+    spec = formats.get(model_dir)
+    if spec is None:
+        return None
+    filename, separator, prediction_column, observed_column = spec
+    path = fold_dir / filename
+    if not path.is_file():
+        return None
+    return path, separator, prediction_column, observed_column
+
+
+def read_long_predictions(
+    benchmark_dir: Path,
+    cohort: str,
+    model_dir: str,
+    traits: Sequence[str],
+) -> tuple[pd.DataFrame, list[str]]:
+    result_root = benchmark_dir / model_dir / "results" / cohort
+    if model_dir == "aquila-snp":
+        records: list[pd.DataFrame] = []
+        sources: list[str] = []
+        for path in sorted(result_root.glob("fold_*/predictions_original_scale.csv")):
+            try:
+                outer_fold = int(path.parent.name.removeprefix("fold_"))
+            except ValueError:
+                continue
+            frame = pd.read_csv(path)
+            parameters = preprocessing_by_trait(benchmark_dir, cohort, outer_fold)
+            sample_column = "SampleID" if "SampleID" in frame.columns else "sample_id"
+            for trait in traits:
+                predicted_column = f"{trait}_prediction"
+                observed_column = f"{trait}_observed"
+                if predicted_column not in frame or observed_column not in frame:
+                    continue
+                trait_parameters = parameters.get(trait)
+                if trait_parameters is None:
+                    continue
+                records.append(
+                    pd.DataFrame(
+                        {
+                            "sample_id": frame[sample_column].astype(str),
+                            "trait": trait,
+                            "outer_fold": outer_fold,
+                            "prediction": transform_original_values(
+                                frame[predicted_column], trait_parameters
+                            ),
+                            "observed": transform_original_values(
+                                frame[observed_column], trait_parameters
+                            ),
+                        }
+                    )
+                )
+            sources.append(str(path))
+        return (
+            pd.concat(records, ignore_index=True) if records else pd.DataFrame(),
+            sources,
+        )
+
+    records = []
+    sources = []
+    for trait in traits:
+        for outer_fold in range(100):
+            file_spec = prediction_file_for_trait(
+                result_root, model_dir, trait, outer_fold
+            )
+            if file_spec is None:
+                if outer_fold >= 5:
+                    break
+                continue
+            path, separator, prediction_column, observed_column = file_spec
+            frame = pd.read_csv(path, sep=separator)
+            sample_column = "sample_id" if "sample_id" in frame else "SampleID"
+            required = {sample_column, prediction_column, observed_column}
+            if not required.issubset(frame.columns):
+                raise ValueError(f"Missing prediction columns in {path}: {required}")
+            predicted = pd.to_numeric(frame[prediction_column], errors="coerce")
+            observed = pd.to_numeric(frame[observed_column], errors="coerce")
+            if model_dir == "MENET":
+                parameters = preprocessing_by_trait(
+                    benchmark_dir, cohort, outer_fold
+                ).get(trait)
+                if parameters is None:
+                    raise ValueError(
+                        f"Missing preprocessing parameters for {trait}, fold {outer_fold}"
+                    )
+                predicted = transform_original_values(predicted, parameters)
+                observed = transform_original_values(observed, parameters)
+            records.append(
+                pd.DataFrame(
+                    {
+                        "sample_id": frame[sample_column].astype(str),
+                        "trait": trait,
+                        "outer_fold": outer_fold,
+                        "prediction": predicted,
+                        "observed": observed,
+                    }
+                )
+            )
+            sources.append(str(path))
+    return (
+        pd.concat(records, ignore_index=True) if records else pd.DataFrame(),
+        sources,
+    )
+
+
+def within_accession_values(
+    predictions: pd.DataFrame,
+) -> tuple[dict[int, float], dict[int, int], float | None, int]:
+    correlations: list[tuple[int, float]] = []
+    for (outer_fold, _sample_id), group in predictions.groupby(
+        ["outer_fold", "sample_id"], sort=False
+    ):
+        valid = group[["prediction", "observed"]].replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
+        if len(valid) < 2:
+            continue
+        predicted = valid["prediction"].to_numpy(dtype=float)
+        observed = valid["observed"].to_numpy(dtype=float)
+        if float(np.std(predicted)) <= 0.0 or float(np.std(observed)) <= 0.0:
+            continue
+        correlation = float(np.corrcoef(predicted, observed)[0, 1])
+        if math.isfinite(correlation):
+            correlations.append((int(outer_fold), correlation))
+
+    fold_values: dict[int, float] = {}
+    fold_counts: dict[int, int] = {}
+    for outer_fold in sorted({fold for fold, _value in correlations}):
+        values = [value for fold, value in correlations if fold == outer_fold]
+        fold_values[outer_fold] = float(np.mean(values))
+        fold_counts[outer_fold] = len(values)
+    all_values = [value for _fold, value in correlations]
+    pooled = float(np.mean(all_values)) if all_values else None
+    return fold_values, fold_counts, pooled, len(all_values)
+
+
+def collect_within_results(
+    benchmark_dir: Path,
+    cohort: str,
+    traits: Sequence[str],
+) -> list[WithinResult]:
+    results: list[WithinResult] = []
+    for display_name, model_dir in MODEL_SPECS:
+        try:
+            predictions, sources = read_long_predictions(
+                benchmark_dir, cohort, model_dir, traits
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            results.append(
+                WithinResult(
+                    display_name, "invalid", {}, {}, None, 0, 0, "", str(error)
+                )
+            )
+            continue
+        if predictions.empty:
+            results.append(
+                WithinResult(
+                    display_name,
+                    "missing",
+                    {},
+                    {},
+                    None,
+                    0,
+                    0,
+                    "",
+                    "No saved outer-test predictions found",
+                )
+            )
+            continue
+        duplicated = predictions.duplicated(["outer_fold", "sample_id", "trait"])
+        if duplicated.any():
+            predictions = predictions.loc[~duplicated].copy()
+        fold_values, fold_counts, pooled, pooled_count = within_accession_values(
+            predictions
+        )
+        traits_found = int(predictions["trait"].nunique())
+        status = "available" if pooled is not None else "invalid"
+        results.append(
+            WithinResult(
+                display_name,
+                status,
+                fold_values,
+                fold_counts,
+                pooled,
+                pooled_count,
+                traits_found,
+                ";".join(sources),
+                "OK" if pooled is not None else "No accession has two valid traits",
+            )
+        )
+    return results
+
+
+def make_within_tables(
+    results: Sequence[WithinResult],
+    traits_expected: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    summary_records: list[dict[str, Any]] = []
+    fold_records: list[dict[str, Any]] = []
+    for result in results:
+        fold_numbers = np.asarray(list(result.fold_values.values()), dtype=float)
+        summary_records.append(
+            {
+                "model": result.model,
+                "status": result.status,
+                "scale": "normalized",
+                "within_accession_pearson_r": result.pooled_value,
+                "outer_fold_mean": (
+                    float(np.mean(fold_numbers)) if fold_numbers.size else np.nan
+                ),
+                "outer_fold_std": (
+                    float(np.std(fold_numbers, ddof=1))
+                    if fold_numbers.size > 1
+                    else np.nan
+                ),
+                "folds_found": len(result.fold_values),
+                "traits_found": result.traits_found,
+                "traits_expected": traits_expected,
+                "n_accessions": result.pooled_count,
+                "source_files": result.source,
+                "message": result.message,
+            }
+        )
+        for outer_fold, value in result.fold_values.items():
+            fold_records.append(
+                {
+                    "model": result.model,
+                    "outer_fold": outer_fold,
+                    "scale": "normalized",
+                    "within_accession_pearson_r": value,
+                    "n_accessions": result.fold_counts[outer_fold],
+                }
+            )
+    return (
+        pd.DataFrame.from_records(summary_records),
+        pd.DataFrame.from_records(fold_records),
+    )
 
 
 def collect_results(
@@ -1244,6 +1562,8 @@ def write_tables(
     traits: Sequence[str],
     output_dir: Path,
     cohort: str,
+    within_summary_df: pd.DataFrame,
+    within_fold_df: pd.DataFrame,
 ) -> None:
     long_df.to_csv(
         output_dir / f"{cohort}.pearson_by_model_and_trait.long.tsv",
@@ -1287,9 +1607,25 @@ def write_tables(
             sep="\t",
             index=False,
         )
+    within_summary_df.to_csv(
+        output_dir / f"{cohort}.within_accession_pearson_by_model.tsv",
+        sep="\t",
+        index=False,
+        na_rep="",
+    )
+    within_fold_df.to_csv(
+        output_dir / f"{cohort}.within_accession_pearson_by_model_and_fold.tsv",
+        sep="\t",
+        index=False,
+        na_rep="",
+    )
 
 
-def print_summary(status_df: pd.DataFrame, output_dir: Path) -> None:
+def print_summary(
+    status_df: pd.DataFrame,
+    within_summary_df: pd.DataFrame,
+    output_dir: Path,
+) -> None:
     print("Model result discovery:")
     for row in status_df.itertuples(index=False):
         source = row.source_file or "-"
@@ -1302,6 +1638,18 @@ def print_summary(status_df: pd.DataFrame, output_dir: Path) -> None:
             f"  {row.model:<14} {row.status:<10} "
             f"traits={row.traits_found}/{row.traits_expected} "
             f"mean_r={mean_text} source={source}"
+        )
+    print("\nWithin-accession Pearson discovery (normalized scale):")
+    for row in within_summary_df.itertuples(index=False):
+        within_text = (
+            f"{row.within_accession_pearson_r:.4f}"
+            if finite_float(row.within_accession_pearson_r) is not None
+            else "-"
+        )
+        print(
+            f"  {row.model:<14} {row.status:<10} "
+            f"traits={row.traits_found}/{row.traits_expected} "
+            f"within_r={within_text} n={row.n_accessions}"
         )
     print(f"\nOutputs written to: {output_dir}")
 
@@ -1329,6 +1677,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     long_df = make_long_table(results, traits)
     status_df = make_status_table(results, traits)
+    within_results = collect_within_results(benchmark_dir, args.cohort, traits)
+    within_summary_df, within_fold_df = make_within_tables(
+        within_results, len(traits)
+    )
     order = model_order(status_df)
     tested_models = [
         model
@@ -1348,6 +1700,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         traits,
         output_dir,
         args.cohort,
+        within_summary_df,
+        within_fold_df,
     )
 
     configure_style()
@@ -1380,7 +1734,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             friedman_p=friedman_p,
         ),
     ]
-    print_summary(status_df, output_dir)
+    print_summary(status_df, within_summary_df, output_dir)
 
     if args.show:
         plt.show()

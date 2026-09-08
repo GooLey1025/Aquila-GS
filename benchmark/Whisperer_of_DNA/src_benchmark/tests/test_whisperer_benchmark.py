@@ -427,6 +427,28 @@ def test_mse_loss_averages_only_observed_entries() -> None:
     assert float(loss) == pytest.approx(0.0)
 
 
+def test_mse_loss_missing_nan_has_finite_zero_gradient() -> None:
+    whisper_cls = import_dna_whisper()
+    whisper = whisper_cls.__new__(whisper_cls)
+    predictions = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32, requires_grad=True
+    )
+    targets = torch.tensor(
+        [[1.0, float("nan")], [2.0, 4.0]], dtype=torch.float32
+    )
+    mask = torch.tensor([[True, False], [True, True]])
+    loss = whisper._mse_loss(
+        predictions,
+        targets,
+        reduction="mean",
+        observation_mask=mask,
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(predictions.grad).all()
+    assert predictions.grad[0, 1].item() == 0.0
+
+
 def test_trait_metric_slice_keeps_per_trait_pearson() -> None:
     metrics = {
         "normalized": {

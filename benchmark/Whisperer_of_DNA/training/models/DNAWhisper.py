@@ -473,13 +473,16 @@ class DNAWhisper(pl.LightningModule):
         y_true: torch.Tensor,
         observation_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        diff = y_pred - y_true
-        loss = torch.log(torch.cosh(diff) + 1e-12)
         if observation_mask is None:
+            diff = y_pred - y_true
+            loss = torch.log(torch.cosh(diff) + 1e-12)
             return torch.mean(loss)
         valid = observation_mask.bool()
         if not valid.any():
             return self._zero_like_loss(y_pred)
+        safe_targets = torch.where(valid, y_true, y_pred.detach())
+        diff = y_pred - safe_targets
+        loss = torch.log(torch.cosh(diff) + 1e-12)
         return loss[valid].mean()
 
     def _mse_loss(
@@ -493,12 +496,17 @@ class DNAWhisper(pl.LightningModule):
         if y_pred.shape != y_true.shape:
              raise ValueError(f"MSE Loss: Shape mismatch between prediction {y_pred.shape} and target {y_true.shape}")
 
-        loss = F.mse_loss(y_pred, y_true, reduction='none') # Calculate element-wise loss first
         valid = None if observation_mask is None else observation_mask.bool()
-        if valid is not None and valid.shape != loss.shape:
+        if valid is not None and valid.shape != y_pred.shape:
             raise ValueError(
-                f"MSE Loss: Observation mask shape {valid.shape} does not match {loss.shape}"
+                f"MSE Loss: Observation mask shape {valid.shape} does not match {y_pred.shape}"
             )
+        # Masking a loss after subtracting NaN labels leaves NaN gradients at
+        # missing positions. Replace them before the element-wise operation.
+        safe_targets = (
+            y_true if valid is None else torch.where(valid, y_true, y_pred.detach())
+        )
+        loss = F.mse_loss(y_pred, safe_targets, reduction='none')
 
         if reduction == "minimax":
             per_phenotype = []
