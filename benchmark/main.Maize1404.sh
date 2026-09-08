@@ -59,13 +59,13 @@ cd ../Lasso
 python lasso_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
-  -o results/lasso
+  -o results/$COHORT
 
 cd ../ElasticNet
 python elasticnet_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
-  -o results/elasticnet
+  -o results/$COHORT
 
 cd ../CLCNet
 /usr/bin/time -v -o $COHORT.time.txt python CLCNet_train_cv.py \
