@@ -1,0 +1,174 @@
+hpo:
+  enabled: true
+  method: grid_search
+  metric: best/val_r
+  direction: maximize
+  seed: 42
+  # 2^5 = 32 candidates. Training and branch settings follow the
+  # Aquila-SNP 32-budget configuration wherever applicable.
+  parameters:
+    # HPO alias for model.downconv_kernel_size. This changes the global
+    # fallback only; an explicit train.branches.*.trunk.0.kernel_size wins.
+    branches_downconv_kernel_size:
+      type: categorical
+      choices: [5, 9]
+    model.dropout:
+      type: categorical
+      choices: [0.3, 0.4, 0.5]
+    train.shared_trunk.0.hidden_features:
+      type: categorical
+      choices: [256, 512]
+    model.d_model:
+      type: categorical
+      choices: [256, 512]
+
+
+train:
+  batch_size: 16
+  optimizer_type: adamw
+  weight_decay: 8e-5
+  loss_type: mse
+  normalize_regression: true
+  uncertainty_weighting: true
+  early_stopping_patience: 40
+  early_stopping_min_delta: 0.0001
+  gradient_clip_norm: null
+  scheduler_type: cosine_warmup
+  learning_rate: 1e-3
+  num_epochs: 200
+  scheduler_params:
+    warmup_epochs: 20
+    warmup_start_factor: 0.01
+    min_lr: 1e-5
+  val_split: 0.1
+  test_split: 0.0
+  gpu_resident: true
+  precision: bf16
+  deterministic: false
+  seed: 42
+
+  branches:
+    snp:
+      embedder:
+      - name: conv_block
+        in_channels: 8
+        out_channels: 256
+        kernel_size: 15
+        activation: gelu
+        norm_type: layer
+        residual: false
+      trunk:
+      - name: std_down_conv_tower
+        in_channels: 256
+        out_channels: 256
+        residual: true
+        seq_len_threshold: 1500
+        gain: 1.0
+        bn_momentum: 0.1
+      - name: transformer_mqa
+        d_model: 256
+        num_query_heads: 8
+        qk_head_dim: 32
+        v_head_dim: 32
+        activation: gelu
+        use_rope: false
+        d_ff: 256
+      - name: multi_head_pool
+        d_model: 256
+        num_heads: 4
+        pool_axis: 2
+
+    indel:
+      embedder:
+      - name: conv_block
+        in_channels: 4
+        out_channels: 256
+        kernel_size: 15
+        activation: gelu
+        norm_type: layer
+        residual: false
+      trunk:
+      - name: std_down_conv_tower
+        in_channels: 256
+        out_channels: 256
+        residual: true
+        seq_len_threshold: 1500
+        gain: 1.0
+        bn_momentum: 0.1
+      - name: transformer_mqa
+        d_model: 256
+        num_query_heads: 8
+        qk_head_dim: 32
+        v_head_dim: 32
+        activation: gelu
+        use_rope: false
+        d_ff: 256
+      - name: multi_head_pool
+        d_model: 256
+        num_heads: 4
+        pool_axis: 2
+
+    sv:
+      embedder:
+      - name: conv_block
+        in_channels: 4
+        out_channels: 256
+        kernel_size: 15
+        activation: gelu
+        norm_type: layer
+        residual: false
+      trunk:
+      - name: std_down_conv_tower
+        in_channels: 256
+        out_channels: 256
+        residual: true
+        seq_len_threshold: 1500
+        gain: 1.0
+        bn_momentum: 0.1
+      - name: transformer_mqa
+        d_model: 256
+        num_query_heads: 8
+        qk_head_dim: 32
+        v_head_dim: 32
+        activation: gelu
+        use_rope: false
+        d_ff: 256
+      - name: multi_head_pool
+        d_model: 256
+        num_heads: 4
+        pool_axis: 2
+
+  fusion:
+  - name: gated_fusion
+    fusion_dim: 256
+    num_branches: 3
+    which_branch_to_add: null
+
+  shared_trunk:
+  - name: mlp_block
+    in_features: 256
+    hidden_features: 512
+    out_features: 256
+    num_layers: 2
+    activation: gelu
+    norm_type: layer
+
+  heads:
+    regression:
+    - name: regression_head
+      in_features: null
+      num_targets: null
+      hidden_features: 256
+      activation: gelu
+
+model:
+  architecture_type: multi_branch
+  # Global block defaults. Explicit values inside train.branches, fusion,
+  # shared_trunk, or heads have higher priority.
+  activation: gelu
+  dropout: 0.4
+  d_model: 256
+  l2_scale: 1.0e-05
+  # Used only when a branch down-conv tower omits kernel_size.
+  downconv_kernel_size: 5
+  verbose: false
