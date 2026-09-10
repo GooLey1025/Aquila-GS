@@ -913,6 +913,7 @@ def _run_pipelined_grid_cv(
         while len(fold_summaries) < len(selected_folds):
             work = pool.get()
             if not work.succeeded:
+                pool.abort(wait=True)
                 raise RuntimeError(
                     f"Nested CV GPU job {work.job_id} failed on {work.device}: "
                     f"{work.error}\n{work.traceback or ''}"

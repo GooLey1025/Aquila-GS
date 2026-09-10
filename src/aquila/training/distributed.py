@@ -11,6 +11,7 @@ import multiprocessing as mp
 import traceback
 from dataclasses import dataclass
 from queue import Empty
+from time import monotonic
 from typing import Any, Callable, Iterable, Sequence
 
 
@@ -418,6 +419,7 @@ class PersistentGPUPool:
         self._devices = [f"cuda:{int(gpu_id)}" for gpu_id in gpu_ids]
         self._workers: list[Any] = []
         self._closed = False
+        self._aborted = False
         for device in self._devices:
             process = self._context.Process(
                 target=_gpu_job_worker,
@@ -452,20 +454,52 @@ class PersistentGPUPool:
             return self._result_queue.get()
         return self._result_queue.get(timeout=timeout)
 
+    def abort(self, *, wait: bool = True, timeout: float = 5.0) -> None:
+        """Cancel pending work and terminate workers without draining the queue."""
+        if not self._closed:
+            self._closed = True
+            self._aborted = True
+            for process in self._workers:
+                if process.is_alive():
+                    process.terminate()
+        if wait:
+            deadline = monotonic() + max(0.0, float(timeout))
+            for process in self._workers:
+                process.join(timeout=max(0.0, deadline - monotonic()))
+                if process.is_alive() and hasattr(process, "kill"):
+                    process.kill()
+                    process.join()
+        self._close_queues()
+
     def shutdown(self, *, wait: bool = True) -> None:
         if not self._closed:
             self._closed = True
             for _ in self._workers:
                 self._task_queue.put(None)
-        if wait:
+        if wait and not self._aborted:
             for process in self._workers:
                 process.join()
+        self._close_queues()
+
+    def _close_queues(self) -> None:
+        for queue in (self._task_queue, self._result_queue):
+            try:
+                queue.cancel_join_thread()
+            except (AttributeError, ValueError):
+                pass
+            try:
+                queue.close()
+            except (AttributeError, ValueError):
+                pass
 
     def __enter__(self) -> "PersistentGPUPool":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.shutdown(wait=True)
+        if exc_type is None:
+            self.shutdown(wait=True)
+        else:
+            self.abort(wait=True)
 
 
 def _fold_worker(

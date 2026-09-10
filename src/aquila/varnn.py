@@ -570,6 +570,32 @@ def _apply_model_d_model(model_params: dict) -> None:
                 block["in_features"] = width
 
 
+def _apply_global_downconv_kernel_size(model_params: dict) -> None:
+    """Fill missing branch down-convolution kernels from the global default.
+
+    A branch-local ``kernel_size`` is an explicit override and must remain
+    unchanged. The global value applies only to the first trunk block when it
+    is a supported down-convolution tower.
+    """
+    kernel_size = model_params.get("downconv_kernel_size")
+    if kernel_size is None:
+        return
+
+    downconv_names = {
+        "std_down_conv_tower",
+        "down_conv_tower",
+        "convnext_down_conv_tower",
+        "dilated_down_conv_tower",
+    }
+    for branch in (model_params.get("branches") or {}).values():
+        trunk = branch.get("trunk") or []
+        if not trunk or not isinstance(trunk[0], dict):
+            continue
+        downconv = trunk[0]
+        if downconv.get("name") in downconv_names:
+            downconv.setdefault("kernel_size", kernel_size)
+
+
 def create_model_from_config(
     config: dict,
     seq_length: int,
@@ -621,6 +647,7 @@ def create_model_from_config(
         if 'branches' in model_params:
             architecture_type = 'multi_branch'
 
+    _apply_global_downconv_kernel_size(model_params)
     _apply_model_d_model(model_params)
 
     # Set tasks

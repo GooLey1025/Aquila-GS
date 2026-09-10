@@ -170,5 +170,5 @@ model:
   d_model: 256
   l2_scale: 1.0e-05
   # Used only when a branch down-conv tower omits kernel_size.
-  downconv_kernel_size: 5
+  downconv_kernel_size: 9
   verbose: false

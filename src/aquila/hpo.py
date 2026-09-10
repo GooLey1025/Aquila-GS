@@ -69,7 +69,6 @@ def merge_optuna_config(config: Dict, trial_params: Dict) -> Dict:
     # The function will insert branch_name after 'branches'
     branches_param_map = {
         'branches_embedder_kernel_size': ('train', 'branches', 'embedder', 0, 'kernel_size'),
-        'branches_downconv_kernel_size': ('train', 'branches', 'trunk', 0, 'kernel_size'),
         'branches_downconv_dropout': ('train', 'branches', 'trunk', 0, 'dropout'),
         'branches_transformer_dropout': ('train', 'branches', 'trunk', 1, 'dropout'),
         'branches_transformer_num_heads': ('train', 'branches', 'trunk', 1, 'num_heads'),
@@ -88,6 +87,11 @@ def merge_optuna_config(config: Dict, trial_params: Dict) -> Dict:
     branches_params = {}
     
     for key, value in trial_params.items():
+        if key == 'branches_downconv_kernel_size':
+            # This is a global fallback. Branch-local kernel_size values have
+            # higher priority and are preserved when the model is built.
+            merged_config.setdefault('model', {})['downconv_kernel_size'] = value
+            continue
         if key.startswith('branches_') or key in ['fusion_dropout', 'mlp_hidden_features', 
                                                    'mlp_dropout', 'heads_hidden_features', 
                                                    'heads_dropout']:

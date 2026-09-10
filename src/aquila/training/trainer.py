@@ -184,18 +184,17 @@ class NestedCVTrainer:
             score = _metric_value(validation.metrics, metric)
             row["validation"] = validation.metrics
             self._step_scheduler_on_validation(validation.metrics, score)
-            if best_state is None:
-                best_epoch = epoch
-                best_metrics = validation.metrics
-                # Keep the best weights on-device during the loop; a full
-                # D2H clone on every improvement stalls the SM pipeline.
-                best_state = _device_state_dict(self.model)
+            first_checkpoint = best_state is None
             improved = _improved(score, best_score, maximize, min_delta)
-            if improved:
-                best_score = score
+            if first_checkpoint or improved:
+                if improved:
+                    best_score = score
                 best_epoch = epoch
                 best_metrics = validation.metrics
-                best_state = _device_state_dict(self.model)
+                # Allocate one device checkpoint on the first validation, then
+                # update it in place. Replacing the dict would temporarily keep
+                # old and new full model copies alive and can OOM large models.
+                best_state = _update_device_state_dict(self.model, best_state)
                 stale_epochs = 0
             else:
                 stale_epochs += 1
@@ -774,11 +773,32 @@ def _cpu_state_dict(module: nn.Module) -> Dict[str, torch.Tensor]:
     }
 
 
-def _device_state_dict(module: nn.Module) -> Dict[str, torch.Tensor]:
-    return {
-        name: tensor.detach().clone()
-        for name, tensor in module.state_dict().items()
-    }
+def _update_device_state_dict(
+    module: nn.Module,
+    destination: Dict[str, torch.Tensor] | None,
+) -> Dict[str, torch.Tensor]:
+    """Clone once, then copy model state into the existing device buffers."""
+    source = module.state_dict()
+    if destination is None:
+        return {
+            name: tensor.detach().clone()
+            for name, tensor in source.items()
+        }
+    if destination.keys() != source.keys():
+        raise ValueError("Checkpoint state keys do not match the model state")
+    with torch.no_grad():
+        for name, tensor in source.items():
+            target = destination[name]
+            if (
+                target.shape != tensor.shape
+                or target.dtype != tensor.dtype
+                or target.device != tensor.device
+            ):
+                raise ValueError(
+                    f"Checkpoint tensor does not match model state for {name!r}"
+                )
+            target.copy_(tensor.detach())
+    return destination
 
 
 def _to_cpu_copy(value: Any) -> Any:

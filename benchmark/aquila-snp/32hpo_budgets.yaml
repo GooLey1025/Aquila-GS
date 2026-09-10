@@ -70,7 +70,6 @@ model:
   - name: std_down_conv_tower
     in_channels: d_model
     out_channels: d_model
-    kernel_size: 5
     residual: true
     seq_len_threshold: 1500
     gain: 1.0

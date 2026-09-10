@@ -131,8 +131,8 @@ def merge_config(
     """Deep-copy a config and apply candidate parameters.
 
     ``branches_downconv_kernel_size`` is a grouped Aquila-Vars parameter:
-    it keeps the first trunk block's kernel size synchronized across every
-    variant-type branch.
+    it sets the global down-convolution kernel fallback. A branch-local
+    ``kernel_size`` remains authoritative and is not overwritten.
     """
     merged = copy.deepcopy(dict(base_config))
     for path, value in parameters.items():
@@ -142,13 +142,8 @@ def merge_config(
                 raise KeyError(
                     "branches_downconv_kernel_size requires train.branches"
                 )
-            for branch_name, branch_config in branches.items():
-                trunk = branch_config.get("trunk", [])
-                if not trunk:
-                    raise KeyError(
-                        f"Branch {branch_name!r} has no trunk block to update"
-                    )
-                trunk[0]["kernel_size"] = copy.deepcopy(value)
+            model = merged.setdefault("model", {})
+            model["downconv_kernel_size"] = copy.deepcopy(value)
             continue
         set_config_path(merged, str(path), copy.deepcopy(value))
     return merged
