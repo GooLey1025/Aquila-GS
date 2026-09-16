@@ -774,6 +774,54 @@ def _inverse_trait(
     return restored.astype(np.float32)
 
 
+FOLD_OUTPUT_FILES = (
+    "best_model.pt",
+    "hpo_results.json",
+    "metrics.json",
+    "training_history.json",
+    "config.yaml",
+    "preprocessing.json",
+    "sample_audit.json",
+    "predictions_original_scale.csv",
+)
+
+
+def load_completed_fold_summary(
+    output_directory: Path,
+    trait_name: str,
+    outer_fold: int,
+) -> dict[str, Any] | None:
+    """Load a completed fold result, or return None for partial output."""
+
+    fold_path = output_directory / trait_name / f"fold_{outer_fold}"
+    if any(not (fold_path / name).is_file() for name in FOLD_OUTPUT_FILES):
+        return None
+    try:
+        with (fold_path / "hpo_results.json").open(
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            hpo = json.load(handle)
+        with (fold_path / "metrics.json").open(
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            metrics = json.load(handle)
+        normalized = metrics["normalized"]
+        return {
+            "trait": trait_name,
+            "outer_fold": outer_fold,
+            "best_candidate_id": hpo["best_candidate_id"],
+            "best_parameters": hpo["best_parameters"],
+            "best_valid_pearson_mean": hpo["best_valid_pearson_mean"],
+            "test_pearson": normalized["avg_pearson"],
+            "elapsed_seconds": None,
+            "resumed_from_existing": True,
+        }
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def run_outer_fold(
     data_directory: Path,
     output_directory: Path,
@@ -1142,11 +1190,7 @@ def main() -> None:
 
     data_directory = Path(args.data_dir).resolve()
     output_directory = Path(args.output_dir).resolve()
-    if output_directory.exists() and any(output_directory.iterdir()):
-        if not args.overwrite:
-            raise FileExistsError(
-                f"Output directory is not empty: {output_directory}"
-            )
+    if args.overwrite and output_directory.exists():
         import shutil
 
         shutil.rmtree(output_directory)
@@ -1173,7 +1217,7 @@ def main() -> None:
         candidates = candidates[: args.max_candidates]
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
     worker_gpu_ids = expand_gpu_workers(gpu_ids, args.jobs_per_gpu)
-    jobs = [
+    all_jobs = [
         TraitFoldJob(
             job_id=trait_position * len(outer_folds) + fold_position,
             trait_name=trait_name,
@@ -1183,6 +1227,18 @@ def main() -> None:
         for trait_position, trait_name in enumerate(traits)
         for fold_position, outer_fold in enumerate(outer_folds)
     ]
+    completed_summaries = []
+    jobs = []
+    for job in all_jobs:
+        completed = load_completed_fold_summary(
+            output_directory,
+            job.trait_name,
+            job.outer_fold,
+        )
+        if completed is None:
+            jobs.append(job)
+        else:
+            completed_summaries.append(completed)
     worker_context = TraitFoldContext(
         data_directory=str(data_directory),
         output_directory=str(output_directory),
@@ -1198,7 +1254,8 @@ def main() -> None:
     )
     print(
         f"[INFO] MENET {len(traits)} traits x {len(outer_folds)} outer folds; "
-        f"one independent trait/fold job across {devices}; "
+        f"{len(completed_summaries)} completed job(s) skipped, "
+        f"{len(jobs)} job(s) remaining across {devices}; "
         f"{args.jobs_per_gpu} concurrent job(s) per GPU"
     )
     work_results = execute_gpu_jobs(
@@ -1208,7 +1265,15 @@ def main() -> None:
         worker_args=(worker_context,),
         raise_on_error=True,
     )
-    summaries = [result.value for result in work_results]
+    summaries = completed_summaries + [
+        result.value for result in work_results
+    ]
+    summaries.sort(
+        key=lambda result: (
+            traits.index(result["trait"]),
+            outer_folds.index(result["outer_fold"]),
+        )
+    )
     with (output_directory / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(
             {

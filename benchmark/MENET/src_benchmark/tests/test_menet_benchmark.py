@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import sys
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from MENET_train_cv import (
     _menet_loader,
     build_relatedness,
     expand_gpu_workers,
+    load_completed_fold_summary,
     load_vcf_genotypes,
     parse_args,
     validate_variant_schema,
@@ -230,3 +232,56 @@ def test_gpu_cli_supports_selection_and_cpu_fallback() -> None:
 def test_gpu_worker_slots_allow_multiple_jobs_per_device() -> None:
     assert expand_gpu_workers([0, 2], 3) == [0, 0, 0, 2, 2, 2]
     assert expand_gpu_workers([], 4) == []
+
+
+def test_completed_fold_summary_requires_all_outputs(tmp_path: Path) -> None:
+    fold_path = tmp_path / "TraitA" / "fold_2"
+    fold_path.mkdir(parents=True)
+    required_files = {
+        "best_model.pt": "",
+        "hpo_results.json": json.dumps(
+            {
+                "best_candidate_id": 3,
+                "best_parameters": {"train.learning_rate": 0.001},
+                "best_valid_pearson_mean": 0.45,
+            }
+        ),
+        "metrics.json": json.dumps(
+            {"normalized": {"avg_pearson": 0.67}, "original": {}}
+        ),
+        "training_history.json": "{}",
+        "config.yaml": "{}",
+        "preprocessing.json": "{}",
+        "sample_audit.json": "{}",
+        "predictions_original_scale.csv": "SampleID,Prediction,Observed\n",
+    }
+    for name, content in required_files.items():
+        (fold_path / name).write_text(content, encoding="utf-8")
+
+    summary = load_completed_fold_summary(tmp_path, "TraitA", 2)
+    assert summary is not None
+    assert summary["trait"] == "TraitA"
+    assert summary["outer_fold"] == 2
+    assert summary["test_pearson"] == 0.67
+    assert summary["resumed_from_existing"] is True
+
+    (fold_path / "sample_audit.json").unlink()
+    assert load_completed_fold_summary(tmp_path, "TraitA", 2) is None
+
+
+def test_completed_fold_summary_rejects_invalid_json(tmp_path: Path) -> None:
+    fold_path = tmp_path / "TraitA" / "fold_0"
+    fold_path.mkdir(parents=True)
+    for name in (
+        "best_model.pt",
+        "training_history.json",
+        "config.yaml",
+        "preprocessing.json",
+        "sample_audit.json",
+        "predictions_original_scale.csv",
+    ):
+        (fold_path / name).write_text("", encoding="utf-8")
+    (fold_path / "hpo_results.json").write_text("{", encoding="utf-8")
+    (fold_path / "metrics.json").write_text("{}", encoding="utf-8")
+
+    assert load_completed_fold_summary(tmp_path, "TraitA", 0) is None
