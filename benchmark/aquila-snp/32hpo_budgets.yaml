@@ -67,21 +67,21 @@ model:
     norm_type: layer
     residual: false
   trunk:
-  - name: std_down_conv_tower
+  # Variant 10: traditional down_conv_tower + full MHA + uncertainty weighting.
+  - name: down_conv_tower
     in_channels: d_model
     out_channels: d_model
+    activation: gelu
+    norm_type: layer
+    order: nac
     residual: true
     seq_len_threshold: 1500
-    gain: 1.0
-    bn_momentum: 0.1
-  - name: transformer_mqa
+  - name: transformer
     d_model: d_model
-    num_query_heads: 8
-    qk_head_dim: 32
-    v_head_dim: 32
+    num_heads: 8
+    d_ff: d_model
     activation: gelu
     use_rope: false
-    d_ff: d_model
   - name: multi_head_pool
     d_model: d_model
     num_heads: 4
