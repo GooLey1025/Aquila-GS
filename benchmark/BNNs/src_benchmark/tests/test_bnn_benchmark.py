@@ -163,6 +163,73 @@ def test_json_writer_sanitizes_non_finite_values(tmp_path: Path) -> None:
     }
 
 
+def _write_completed_fold(root: Path, trait: str, outer_fold: int) -> None:
+    fold = root / trait / f"fold_{outer_fold}"
+    fold.mkdir(parents=True)
+    (fold / "best_model.pt").write_bytes(b"model")
+    (fold / "hpo_results.json").write_text(
+        json.dumps(
+            {
+                "best_candidate_id": 2,
+                "best_parameters": {"train.learning_rate": 0.001},
+                "best_valid_pearson_mean": 0.5,
+                "final_epoch": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+    metrics = {
+        "normalized": {"avg_pearson": 0.4},
+        "original": {"avg_pearson": 0.4},
+    }
+    (fold / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+    (fold / "training_history.json").write_text(
+        '{"final": [{"epoch": 1}]}', encoding="utf-8"
+    )
+    (fold / "config.yaml").write_text("train:\n  epochs: 10\n", encoding="utf-8")
+    (fold / "preprocessing.json").write_text("{}", encoding="utf-8")
+    (fold / "sample_audit.json").write_text(
+        '{"outer_test_sample_ids": ["sample-1"]}', encoding="utf-8"
+    )
+    (fold / "selected_variants.json").write_text(
+        '{"variants": []}', encoding="utf-8"
+    )
+    (fold / "predictions_normalized_scale.csv").write_text(
+        "SampleID,Prediction,Observed,PosteriorStd\nsample-1,1.0,1.0,0.1\n",
+        encoding="utf-8",
+    )
+    (fold / "predictions_original_scale.csv").write_text(
+        "SampleID,Prediction,Observed\nsample-1,1.0,1.0\n",
+        encoding="utf-8",
+    )
+
+
+def test_completed_trait_requires_every_outer_fold(tmp_path: Path) -> None:
+    _write_completed_fold(tmp_path, "TraitA", 0)
+    assert RUNNER._load_completed_trait(tmp_path, "TraitA", [0, 1]) is None
+
+    _write_completed_fold(tmp_path, "TraitA", 1)
+    recovered = RUNNER._load_completed_trait(tmp_path, "TraitA", [0, 1])
+    assert recovered is not None
+    assert [result["outer_fold"] for result in recovered] == [0, 1]
+    assert all(result["recovered"] for result in recovered)
+
+
+def test_completed_trait_rejects_incomplete_prediction_rows(tmp_path: Path) -> None:
+    _write_completed_fold(tmp_path, "TraitA", 0)
+    prediction_path = (
+        tmp_path
+        / "TraitA"
+        / "fold_0"
+        / "predictions_original_scale.csv"
+    )
+    prediction_path.write_text(
+        "SampleID,Prediction,Observed\nother-sample,1.0,1.0\n",
+        encoding="utf-8",
+    )
+    assert RUNNER._load_completed_trait(tmp_path, "TraitA", [0]) is None
+
+
 def test_candidate_selection_epoch_and_metric_aggregation() -> None:
     first = CandidateResult(
         0,

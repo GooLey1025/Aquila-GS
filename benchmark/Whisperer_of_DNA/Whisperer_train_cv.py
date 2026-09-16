@@ -83,6 +83,7 @@ class OuterFoldContext:
     max_epochs: int
     budget: dict[str, Any]
     live_metrics_log: bool
+    resume: bool
 
 
 def positive_int(value: str) -> int:
@@ -130,7 +131,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=1,
         help="Maximum concurrent outer-fold jobs per GPU (default: 1).",
     )
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Delete the output directory before running. Without this flag, "
+            "completed folds and completed inner metrics logs are reused."
+        ),
+    )
     parser.add_argument("--max-inner-folds", type=int, default=None)
     parser.add_argument("--max-candidates", type=int, default=None)
     parser.add_argument("--max-epochs", type=int, default=None)
@@ -223,6 +231,114 @@ def _observation_counts(split: MultiTraitSplit) -> dict[str, int]:
     }
 
 
+def _read_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _load_completed_outer_fold(
+    output_directory: Path,
+    outer_fold: int,
+    trait_names: Sequence[str],
+) -> dict[str, Any] | None:
+    """Recover a fully written outer-fold result without retraining it."""
+
+    fold_path = output_directory / f"fold_{outer_fold}"
+    required = (
+        fold_path / "best_model.ckpt",
+        fold_path / "hpo_results.json",
+        fold_path / "metrics.json",
+        fold_path / "runtime.json",
+    )
+    if not all(path.is_file() for path in required):
+        return None
+    try:
+        hpo = _read_json(fold_path / "hpo_results.json")
+        metrics = _read_json(fold_path / "metrics.json")
+        runtime = _read_json(fold_path / "runtime.json")
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    completed_traits = tuple(str(name) for name in runtime.get("traits", ()))
+    if completed_traits and completed_traits != tuple(trait_names):
+        return None
+    try:
+        return {
+            "outer_fold": outer_fold,
+            "traits": list(trait_names),
+            "best_candidate_id": hpo["best_candidate_id"],
+            "best_parameters": hpo["best_parameters"],
+            "best_valid_pearson_mean": hpo["best_valid_pearson_mean"],
+            "final_epoch": hpo["final_epoch"],
+            "metrics": metrics,
+            "runtime": runtime,
+        }
+    except (KeyError, TypeError):
+        return None
+
+
+def _load_completed_inner_result(
+    path: Path,
+    inner_fold: int,
+    expected_seed: int,
+    max_epochs: int,
+) -> tuple[InnerFoldResult, list[dict[str, Any]]] | None:
+    """Recover one completed inner run from its append-only metrics log."""
+
+    if not path.is_file():
+        return None
+    rows = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    return None
+                if not isinstance(row, dict):
+                    return None
+                rows.append(row)
+    except OSError:
+        return None
+    if not rows:
+        return None
+    epochs = [row.get("epoch") for row in rows]
+    if epochs != list(range(1, len(rows) + 1)):
+        return None
+    if any(row.get("seed") != expected_seed for row in rows):
+        return None
+    last = rows[-1]
+    try:
+        last_epoch = int(last["epoch"])
+        best_epoch = int(last["best_epoch"])
+        best_metric = float(last["best_valid_r"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not bool(last.get("early_stop")) and last_epoch < max_epochs:
+        return None
+    if not np.isfinite(best_metric):
+        return None
+    history = [
+        {
+            "epoch": row["epoch"],
+            "train_loss": row.get("train_loss"),
+            "valid_loss": row.get("valid_loss"),
+            "valid_avg_pearson": row.get("valid_r"),
+        }
+        for row in rows
+    ]
+    return (
+        InnerFoldResult(
+            inner_fold,
+            best_metric,
+            best_epoch,
+            {"training_seed": expected_seed, "recovered_from_metrics_log": True},
+        ),
+        history,
+    )
+
+
 def _write_trait_predictions(
     path: Path,
     split: MultiTraitSplit,
@@ -260,6 +376,7 @@ def run_outer_fold(
     max_epochs: int,
     budget: Mapping[str, Any],
     live_metrics_log: bool = False,
+    resume: bool = False,
 ) -> dict[str, Any]:
     started = time.time()
     names = tuple(str(name) for name in trait_names)
@@ -275,6 +392,59 @@ def run_outer_fold(
     global_variants = None
     variant_schema = None
     for inner_fold in inner_folds:
+        recovered_by_candidate = {}
+        if resume:
+            for candidate_id in range(len(candidates)):
+                training_seed = derive_seed(
+                    int(config["seed"]),
+                    outer_fold,
+                    candidate_id,
+                    inner_fold,
+                )
+                metrics_log_path = (
+                    fold_path
+                    / f"candidate_{candidate_id}"
+                    / f"inner_{inner_fold}"
+                    / "metrics.jsonl"
+                )
+                recovered = _load_completed_inner_result(
+                    metrics_log_path,
+                    inner_fold,
+                    training_seed,
+                    max_epochs,
+                )
+                if recovered is not None:
+                    recovered_by_candidate[candidate_id] = recovered
+        if recovered_by_candidate:
+            print(
+                f"[INFO] traits={list(names)} outer_fold={outer_fold} "
+                f"inner_fold={inner_fold} found "
+                f"{len(recovered_by_candidate)}/{len(candidates)} completed "
+                "candidates",
+                flush=True,
+            )
+        if len(recovered_by_candidate) == len(candidates):
+            for candidate_id in range(len(candidates)):
+                recovered_result, recovered_history = recovered_by_candidate[
+                    candidate_id
+                ]
+                inner_results[candidate_id].append(recovered_result)
+                histories[f"candidate_{candidate_id}/inner_{inner_fold}"] = (
+                    recovered_history
+                )
+            inner_audit.append(
+                {
+                    "inner_fold": inner_fold,
+                    "recovered_from_metrics_logs": True,
+                }
+            )
+            print(
+                f"[INFO] traits={list(names)} outer_fold={outer_fold} "
+                f"inner_fold={inner_fold} recovered all {len(candidates)} "
+                "candidates; skipped VCF loading",
+                flush=True,
+            )
+            continue
         train, valid, schema = benchmark.load_multi_trait_fold(
             names,
             outer_fold,
@@ -308,9 +478,27 @@ def run_outer_fold(
                 / f"candidate_{candidate_id}"
                 / f"inner_{inner_fold}"
                 / "metrics.jsonl"
-                if live_metrics_log
+                if live_metrics_log or resume
                 else None
             )
+            recovered = recovered_by_candidate.get(candidate_id)
+            if recovered is not None:
+                recovered_result, recovered_history = recovered
+                inner_results[candidate_id].append(recovered_result)
+                histories[f"candidate_{candidate_id}/inner_{inner_fold}"] = (
+                    recovered_history
+                )
+                print(
+                    f"[INFO] traits={list(names)} outer_fold={outer_fold} "
+                    f"inner_fold={inner_fold} candidate={candidate_id + 1}/"
+                    f"{len(candidates)} recovered best_valid_pearson="
+                    f"{recovered_result.metric:.6f} "
+                    f"best_epoch={recovered_result.best_epoch}",
+                    flush=True,
+                )
+                continue
+            if resume and metrics_log_path is not None and metrics_log_path.exists():
+                metrics_log_path.unlink()
             result = train_model(
                 train.genotypes,
                 train.processed_targets,
@@ -564,6 +752,7 @@ def _run_outer_fold(
         context.max_epochs,
         context.budget,
         context.live_metrics_log,
+        context.resume,
     )
     thread_limiter.restore_original_limits()
     return result
@@ -575,9 +764,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     config_path = Path(args.config).resolve()
     output_directory = Path(args.output_dir).resolve()
     if output_directory.exists() and any(output_directory.iterdir()):
-        if not args.overwrite:
-            raise FileExistsError(f"Output directory is not empty: {output_directory}")
-        shutil.rmtree(output_directory)
+        if args.overwrite:
+            shutil.rmtree(output_directory)
+        else:
+            print(
+                f"[INFO] Resuming from existing results in {output_directory}",
+                flush=True,
+            )
     output_directory.mkdir(parents=True, exist_ok=True)
     config = _load_config(config_path)
     benchmark = WhispererPreparedBenchmark(data_directory)
@@ -617,9 +810,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     }
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
     worker_gpu_ids = expand_gpu_workers(gpu_ids, args.jobs_per_gpu)
+    completed_results = []
+    pending_outer_folds = []
+    for outer_fold in outer_folds:
+        completed = (
+            _load_completed_outer_fold(output_directory, outer_fold, traits)
+            if not args.overwrite
+            else None
+        )
+        if completed is None:
+            pending_outer_folds.append(outer_fold)
+        else:
+            completed_results.append(completed)
+            print(
+                f"[INFO] outer_fold={outer_fold} recovered completed fold",
+                flush=True,
+            )
     jobs = [
         OuterFoldJob(job_id=fold_index, outer_fold=outer_fold)
-        for fold_index, outer_fold in enumerate(outer_folds)
+        for fold_index, outer_fold in enumerate(pending_outer_folds)
     ]
     worker_context = OuterFoldContext(
         data_directory=str(data_directory),
@@ -631,6 +840,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_epochs=max_epochs,
         budget=budget,
         live_metrics_log=args.live_metrics_log,
+        resume=not args.overwrite,
     )
     work_results = execute_gpu_jobs(
         jobs,
@@ -639,7 +849,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         worker_args=(worker_context,),
         raise_on_error=True,
     )
-    results = [work_result.value for work_result in work_results]
+    results = completed_results + [
+        work_result.value for work_result in work_results
+    ]
+    results.sort(key=lambda result: result["outer_fold"])
     run_index = []
     for trait_name in traits:
         fold_results = [

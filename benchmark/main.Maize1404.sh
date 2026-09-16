@@ -68,11 +68,14 @@ python elasticnet_nested_cv.py \
   -o results/$COHORT
 
 cd ../CLCNet
-/usr/bin/time -v -o $COHORT.time.txt python CLCNet_train_cv.py \
-  --data-dir ../$COHORT.cv.data \
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2 \
+/usr/bin/time -v -o "$COHORT.time.txt" \
+python CLCNet_train_cv.py \
+  --data-dir "../$COHORT.cv.data" \
   --config configs/CLCNet_nested_cv.yaml \
-  --jobs-per-gpu 2 \
-  -o results/$COHORT
+  --jobs-per-gpu 1 \
+  -o "results/$COHORT" \
+  --overwrite
 
 cd ../MENET
 /usr/bin/time -v -o $COHORT.time.txt python MENET_train_cv.py \

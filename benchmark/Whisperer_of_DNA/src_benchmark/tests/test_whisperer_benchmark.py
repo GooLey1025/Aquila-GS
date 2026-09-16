@@ -34,7 +34,13 @@ from aquila.benchmark.common import evaluate_two_scales
 from aquila.data.preprocessing import PerTraitPreprocessor, TraitPreprocessing
 from aquila.training.distributed import derive_seed
 from aquila.training.hpo import generate_grid_candidates, half_up_median_epoch
-from Whisperer_train_cv import _slice_metrics, expand_gpu_workers, parse_args
+from Whisperer_train_cv import (
+    _load_completed_inner_result,
+    _load_completed_outer_fold,
+    _slice_metrics,
+    expand_gpu_workers,
+    parse_args,
+)
 from whisperer_data import (
     GENOTYPE_CLASSES,
     WhispererVCF,
@@ -71,6 +77,90 @@ def test_gpu_slot_expansion_and_positive_job_count() -> None:
     assert expand_gpu_workers([0, 2], 3) == [0, 0, 0, 2, 2, 2]
     with pytest.raises(SystemExit):
         parse_args(["-o", "output", "--jobs-per-gpu", "0"])
+
+
+def test_completed_inner_metrics_log_is_recovered(tmp_path: Path) -> None:
+    path = tmp_path / "metrics.jsonl"
+    rows = [
+        {
+            "epoch": 1,
+            "train_loss": 1.0,
+            "valid_loss": 0.8,
+            "valid_r": 0.2,
+            "best_epoch": 1,
+            "best_valid_r": 0.2,
+            "early_stop": False,
+            "seed": 17,
+        },
+        {
+            "epoch": 2,
+            "train_loss": 0.7,
+            "valid_loss": 0.9,
+            "valid_r": 0.1,
+            "best_epoch": 1,
+            "best_valid_r": 0.2,
+            "early_stop": True,
+            "seed": 17,
+        },
+    ]
+    path.write_text(
+        "".join(f"{json.dumps(row)}\n" for row in rows),
+        encoding="utf-8",
+    )
+    recovered = _load_completed_inner_result(path, 3, 17, 100)
+    assert recovered is not None
+    result, history = recovered
+    assert result.inner_fold == 3
+    assert result.metric == pytest.approx(0.2)
+    assert result.best_epoch == 1
+    assert len(history) == 2
+
+
+def test_incomplete_or_mismatched_inner_metrics_log_is_not_recovered(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "metrics.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "epoch": 1,
+                "best_epoch": 1,
+                "best_valid_r": 0.2,
+                "early_stop": False,
+                "seed": 17,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _load_completed_inner_result(path, 0, 17, 100) is None
+    assert _load_completed_inner_result(path, 0, 18, 1) is None
+
+
+def test_completed_outer_fold_is_recovered(tmp_path: Path) -> None:
+    fold = tmp_path / "fold_2"
+    fold.mkdir()
+    (fold / "best_model.ckpt").touch()
+    (fold / "hpo_results.json").write_text(
+        json.dumps(
+            {
+                "best_candidate_id": 4,
+                "best_parameters": {"learning_rate": 0.001},
+                "best_valid_pearson_mean": 0.5,
+                "final_epoch": 8,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (fold / "metrics.json").write_text('{"normalized": {}, "original": {}}')
+    (fold / "runtime.json").write_text(
+        '{"traits": ["TraitA"], "elapsed_seconds": 1.0}',
+        encoding="utf-8",
+    )
+    recovered = _load_completed_outer_fold(tmp_path, 2, ("TraitA",))
+    assert recovered is not None
+    assert recovered["best_candidate_id"] == 4
+    assert _load_completed_outer_fold(tmp_path, 2, ("TraitB",)) is None
 
 
 def test_genotype_encoding_all_classes_and_missing() -> None:

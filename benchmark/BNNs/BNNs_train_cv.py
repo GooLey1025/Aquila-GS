@@ -134,7 +134,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Maximum concurrent trait/fold jobs per GPU (default: 1).",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Delete the output directory before running. Without this flag, "
+            "traits with every requested outer fold fully completed are reused."
+        ),
+    )
     parser.add_argument("--max-candidates", type=int, default=None)
     parser.add_argument("--max-inner-folds", type=int, default=None)
     return parser.parse_args(argv)
@@ -144,6 +151,104 @@ def _write_json(path: Path, values: Mapping[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(sanitize_json(values), handle, indent=2, allow_nan=False)
         handle.write("\n")
+
+
+def _read_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _load_completed_trait_fold(
+    output_directory: Path,
+    trait_name: str,
+    outer_fold: int,
+) -> dict[str, Any] | None:
+    """Recover one fold only when all of its final outputs are complete."""
+
+    fold_path = output_directory / trait_name / f"fold_{outer_fold}"
+    required_files = (
+        "best_model.pt",
+        "hpo_results.json",
+        "metrics.json",
+        "training_history.json",
+        "config.yaml",
+        "preprocessing.json",
+        "sample_audit.json",
+        "selected_variants.json",
+        "predictions_normalized_scale.csv",
+        "predictions_original_scale.csv",
+    )
+    required = tuple(fold_path / name for name in required_files)
+    if not all(path.is_file() and path.stat().st_size > 0 for path in required):
+        return None
+    try:
+        hpo = _read_json(fold_path / "hpo_results.json")
+        metrics = _read_json(fold_path / "metrics.json")
+        history = _read_json(fold_path / "training_history.json")
+        audit = _read_json(fold_path / "sample_audit.json")
+        _read_json(fold_path / "preprocessing.json")
+        _read_json(fold_path / "selected_variants.json")
+        with (fold_path / "config.yaml").open("r", encoding="utf-8") as handle:
+            if not isinstance(yaml.safe_load(handle), dict):
+                return None
+        sample_ids = [str(value) for value in audit["outer_test_sample_ids"]]
+        if not sample_ids or not isinstance(history["final"], list):
+            return None
+        prediction_ids = []
+        for filename in (
+            "predictions_normalized_scale.csv",
+            "predictions_original_scale.csv",
+        ):
+            with (fold_path / filename).open(
+                "r", encoding="utf-8", newline=""
+            ) as handle:
+                rows = list(csv.DictReader(handle))
+            ids = [str(row["SampleID"]) for row in rows]
+            if ids != sample_ids:
+                return None
+            prediction_ids.append(ids)
+        if prediction_ids[0] != prediction_ids[1]:
+            return None
+        return {
+            "trait": trait_name,
+            "outer_fold": outer_fold,
+            "best_candidate_id": hpo["best_candidate_id"],
+            "best_parameters": hpo["best_parameters"],
+            "best_valid_pearson_mean": hpo["best_valid_pearson_mean"],
+            "final_epoch": hpo["final_epoch"],
+            "metrics": {
+                "normalized": metrics["normalized"],
+                "original": metrics["original"],
+            },
+            "elapsed_seconds": 0.0,
+            "recovered": True,
+        }
+    except (
+        OSError,
+        csv.Error,
+        json.JSONDecodeError,
+        yaml.YAMLError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _load_completed_trait(
+    output_directory: Path,
+    trait_name: str,
+    outer_folds: Sequence[int],
+) -> list[dict[str, Any]] | None:
+    """Recover a trait only if every requested outer fold is complete."""
+
+    recovered = [
+        _load_completed_trait_fold(output_directory, trait_name, outer_fold)
+        for outer_fold in outer_folds
+    ]
+    if any(result is None for result in recovered):
+        return None
+    return [result for result in recovered if result is not None]
 
 
 def _candidate_payload(candidate: CandidateResult) -> dict[str, Any]:
@@ -623,9 +728,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     data_directory = Path(args.data_dir).resolve()
     output_directory = Path(args.output_dir).resolve()
     if output_directory.exists() and any(output_directory.iterdir()):
-        if not args.overwrite:
-            raise FileExistsError(f"Output directory is not empty: {output_directory}")
-        shutil.rmtree(output_directory)
+        if args.overwrite:
+            shutil.rmtree(output_directory)
+        else:
+            print(
+                f"[INFO] Resuming from existing results in {output_directory}",
+                flush=True,
+            )
     output_directory.mkdir(parents=True, exist_ok=True)
     with Path(args.config).open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -662,16 +771,31 @@ def main(argv: Sequence[str] | None = None) -> None:
         candidates = candidates[: args.max_candidates]
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
     worker_gpu_ids = expand_gpu_workers(gpu_ids, args.jobs_per_gpu)
-    jobs = [
-        TraitFoldJob(
-            job_id=trait_position * len(outer_folds) + fold_position,
-            trait_name=trait_name,
-            trait_index=trait_names.index(trait_name),
-            outer_fold=outer_fold,
+    completed_results = []
+    jobs = []
+    for trait_position, trait_name in enumerate(traits):
+        completed_trait = (
+            _load_completed_trait(output_directory, trait_name, outer_folds)
+            if not args.overwrite
+            else None
         )
-        for trait_position, trait_name in enumerate(traits)
-        for fold_position, outer_fold in enumerate(outer_folds)
-    ]
+        if completed_trait is not None:
+            completed_results.extend(completed_trait)
+            print(
+                f"[INFO] BNN trait={trait_name} recovered completed trait "
+                f"({len(outer_folds)}/{len(outer_folds)} outer folds); skipping",
+                flush=True,
+            )
+            continue
+        for fold_position, outer_fold in enumerate(outer_folds):
+            jobs.append(
+                TraitFoldJob(
+                    job_id=trait_position * len(outer_folds) + fold_position,
+                    trait_name=trait_name,
+                    trait_index=trait_names.index(trait_name),
+                    outer_fold=outer_fold,
+                )
+            )
     worker_context = TraitFoldContext(
         data_directory=str(data_directory),
         output_directory=str(output_directory),
@@ -687,7 +811,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         worker_args=(worker_context,),
         raise_on_error=True,
     )
-    results = [work_result.value for work_result in work_results]
+    results = completed_results + [
+        work_result.value for work_result in work_results
+    ]
+    results.sort(
+        key=lambda result: (
+            traits.index(result["trait"]),
+            outer_folds.index(result["outer_fold"]),
+        )
+    )
     _write_json(
         output_directory / "summary.json",
         {

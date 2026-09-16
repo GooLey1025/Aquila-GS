@@ -24,6 +24,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 import yaml
+from threadpoolctl import threadpool_limits
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
@@ -140,6 +141,8 @@ class TraitFoldContext:
     candidates: tuple[dict[str, Any], ...]
     inner_count: int
     seed: int
+    live_metrics_log: bool
+    resume: bool
 
 
 class DeterministicTripletDataset(Dataset):
@@ -219,7 +222,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Maximum concurrent trait/fold jobs per GPU (default: 1).",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Delete the output directory before running. Without this flag, "
+            "completed trait/fold jobs and completed inner metrics logs are reused."
+        ),
+    )
     parser.add_argument(
         "--max-candidates",
         type=int,
@@ -232,6 +242,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Testing only: limit inner folds.",
     )
+    parser.add_argument(
+        "--live-metrics-log",
+        action="store_true",
+        help=(
+            "Append per-epoch JSONL metrics under each trait/fold for "
+            "encoder, candidate, and outer-refit training."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -241,6 +259,144 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _append_metrics_log(
+    path: str | Path | None,
+    record: Mapping[str, Any],
+) -> None:
+    """Append and flush one JSONL record for live progress inspection."""
+
+    if path is None:
+        return
+    log_path = Path(path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        key: (None if isinstance(value, float) and not math.isfinite(value) else value)
+        for key, value in record.items()
+    }
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        handle.flush()
+
+
+def _read_metrics_log(path: Path) -> list[dict[str, Any]] | None:
+    if not path.is_file():
+        return None
+    rows = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    return None
+                rows.append(row)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not rows or [row.get("epoch") for row in rows] != list(
+        range(1, len(rows) + 1)
+    ):
+        return None
+    return rows
+
+
+def _load_completed_encoder_epoch(
+    path: Path,
+    expected_seed: int,
+    max_epochs: int,
+) -> int | None:
+    """Recover the selected encoder epoch from a completed metrics log."""
+
+    rows = _read_metrics_log(path)
+    if rows is None or any(
+        row.get("stage") != "encoder" or row.get("seed") != expected_seed
+        for row in rows
+    ):
+        return None
+    last = rows[-1]
+    try:
+        last_epoch = int(last["epoch"])
+        best_epoch = int(last["best_epoch"])
+        best_loss = float(last["best_valid_loss"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not bool(last.get("early_stop")) and last_epoch < max_epochs:
+        return None
+    return best_epoch if math.isfinite(best_loss) else None
+
+
+def _load_completed_menet_result(
+    path: Path,
+    inner_fold: int,
+    expected_seed: int,
+    max_epochs: int,
+) -> InnerFoldResult | None:
+    """Recover one completed MENET candidate result from its metrics log."""
+
+    rows = _read_metrics_log(path)
+    if rows is None or any(
+        row.get("stage") != "menet" or row.get("seed") != expected_seed
+        for row in rows
+    ):
+        return None
+    last = rows[-1]
+    try:
+        last_epoch = int(last["epoch"])
+        best_epoch = int(last["best_epoch"])
+        best_metric = float(last["best_valid_pearson"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not bool(last.get("early_stop")) and last_epoch < max_epochs:
+        return None
+    if not math.isfinite(best_metric):
+        return None
+    return InnerFoldResult(
+        inner_fold=inner_fold,
+        metric=best_metric,
+        best_epoch=best_epoch,
+        metrics={
+            "avg_pearson": best_metric,
+            "training_seed": expected_seed,
+            "recovered_from_metrics_log": True,
+        },
+    )
+
+
+def _load_completed_trait_fold(
+    output_directory: Path,
+    trait_name: str,
+    outer_fold: int,
+) -> dict[str, Any] | None:
+    """Recover a fully written trait/fold result without retraining it."""
+
+    fold_path = output_directory / trait_name / f"fold_{outer_fold}"
+    required = (
+        fold_path / "best_model.pt",
+        fold_path / "hpo_results.json",
+        fold_path / "metrics.json",
+        fold_path / "predictions_original_scale.csv",
+    )
+    if not all(path.is_file() for path in required):
+        return None
+    try:
+        with (fold_path / "hpo_results.json").open("r", encoding="utf-8") as handle:
+            hpo = json.load(handle)
+        with (fold_path / "metrics.json").open("r", encoding="utf-8") as handle:
+            metrics = json.load(handle)
+        return {
+            "trait": trait_name,
+            "outer_fold": outer_fold,
+            "best_candidate_id": hpo["best_candidate_id"],
+            "best_parameters": hpo["best_parameters"],
+            "best_valid_pearson_mean": hpo["best_valid_pearson_mean"],
+            "test_pearson": metrics["normalized"]["avg_pearson"],
+            "elapsed_seconds": 0.0,
+            "recovered": True,
+        }
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
 
 
 def _open_vcf(path: Path):
@@ -443,6 +599,7 @@ def train_encoder(
     device: torch.device,
     seed: int,
     fixed_epochs: int | None = None,
+    metrics_log_path: str | Path | None = None,
 ) -> EncoderResult:
     """Train the phenotype-supervised encoder on observed training labels only."""
     set_seed(seed)
@@ -505,7 +662,19 @@ def train_encoder(
         history.append({"epoch": epoch, "valid_loss": valid_loss})
         if valid_loader is None:
             best_state = copy.deepcopy(model.state_dict())
+            _append_metrics_log(
+                metrics_log_path,
+                {
+                    "stage": "encoder",
+                    "epoch": epoch,
+                    "valid_loss": None,
+                    "fixed_epochs": True,
+                    "early_stop": False,
+                    "seed": seed,
+                },
+            )
             continue
+        early_stop = False
         if valid_loss < best_loss - float(encoder_config.get("min_delta", 0.0)):
             best_loss = valid_loss
             best_epoch = epoch
@@ -514,7 +683,21 @@ def train_encoder(
         else:
             stale_epochs += 1
             if stale_epochs >= patience:
-                break
+                early_stop = True
+        _append_metrics_log(
+            metrics_log_path,
+            {
+                "stage": "encoder",
+                "epoch": epoch,
+                "valid_loss": valid_loss,
+                "best_epoch": best_epoch,
+                "best_valid_loss": best_loss if math.isfinite(best_loss) else None,
+                "early_stop": early_stop,
+                "seed": seed,
+            },
+        )
+        if early_stop:
+            break
     return EncoderResult(
         state_dict={key: value.cpu() for key, value in best_state.items()},
         best_epoch=best_epoch,
@@ -614,6 +797,7 @@ def train_menet(
     device: torch.device,
     seed: int,
     fixed_epochs: int | None = None,
+    metrics_log_path: str | Path | None = None,
 ) -> MeNetResult:
     """Train MENET and select epochs exclusively from inner validation."""
     set_seed(seed)
@@ -665,6 +849,18 @@ def train_menet(
             optimizer.step()
         if valid_loader is None:
             best_state = copy.deepcopy(model.state_dict())
+            _append_metrics_log(
+                metrics_log_path,
+                {
+                    "stage": "menet",
+                    "epoch": epoch,
+                    "valid_loss": None,
+                    "valid_pearson": None,
+                    "fixed_epochs": True,
+                    "early_stop": False,
+                    "seed": seed,
+                },
+            )
             continue
         predictions, targets, valid_loss = _predict_menet(
             model,
@@ -681,6 +877,7 @@ def train_menet(
         history.append(
             {"epoch": epoch, "valid_loss": valid_loss, "valid_pearson": pearson}
         )
+        early_stop = False
         if math.isfinite(pearson) and pearson > best_metric + float(
             train_config.get("min_delta", 0.0)
         ):
@@ -692,7 +889,24 @@ def train_menet(
         else:
             stale_epochs += 1
             if stale_epochs >= patience:
-                break
+                early_stop = True
+        _append_metrics_log(
+            metrics_log_path,
+            {
+                "stage": "menet",
+                "epoch": epoch,
+                "valid_loss": valid_loss,
+                "valid_pearson": pearson,
+                "best_epoch": best_epoch,
+                "best_valid_pearson": (
+                    best_metric if math.isfinite(best_metric) else None
+                ),
+                "early_stop": early_stop,
+                "seed": seed,
+            },
+        )
+        if early_stop:
+            break
     return MeNetResult(
         state_dict={key: value.cpu() for key, value in best_state.items()},
         best_epoch=best_epoch,
@@ -834,6 +1048,8 @@ def run_outer_fold(
     inner_count: int,
     device: torch.device,
     seed: int,
+    live_metrics_log: bool = False,
+    resume: bool = False,
 ) -> dict[str, Any]:
     fold_start = time.time()
     fold_path = output_directory / trait_name / f"fold_{outer_fold}"
@@ -904,19 +1120,79 @@ def run_outer_fold(
                 float(config["encoder"]["learning_rate"]),
                 int(config["encoder"]["embedding_dim"]),
             )
-            if encoder_key not in encoder_cache:
-                encoder_seed = derive_seed(
-                    seed,
-                    outer_fold,
-                    encoder_group_ids[encoder_key],
+            encoder_group_id = encoder_group_ids[encoder_key]
+            encoder_seed = derive_seed(
+                seed,
+                outer_fold,
+                encoder_group_id,
+                inner_fold,
+            )
+            encoder_log_path = (
+                fold_path
+                / "encoders"
+                / f"group_{encoder_group_id}"
+                / f"inner_{inner_fold}"
+                / "metrics.jsonl"
+            )
+            menet_seed = derive_seed(
+                seed + 1,
+                outer_fold,
+                candidate_id,
+                inner_fold,
+            )
+            menet_log_path = (
+                fold_path
+                / f"candidate_{candidate_id}"
+                / f"inner_{inner_fold}"
+                / "metrics.jsonl"
+            )
+            recovered_result = (
+                _load_completed_menet_result(
+                    menet_log_path,
                     inner_fold,
+                    menet_seed,
+                    int(config["train"]["max_epochs"]),
                 )
+                if resume
+                else None
+            )
+            recovered_encoder_epoch = (
+                _load_completed_encoder_epoch(
+                    encoder_log_path,
+                    encoder_seed,
+                    int(config["encoder"]["max_epochs"]),
+                )
+                if resume
+                else None
+            )
+            if recovered_result is not None and recovered_encoder_epoch is not None:
+                inner_results_by_candidate[candidate_id].append(recovered_result)
+                encoder_epoch_by_candidate[candidate_id].append(
+                    recovered_encoder_epoch
+                )
+                print(
+                    f"[INFO] trait={trait_name} outer_fold={outer_fold} "
+                    f"inner_fold={inner_fold} candidate={candidate_id + 1}/"
+                    f"{len(candidates)} recovered best_valid_pearson="
+                    f"{recovered_result.metric:.6f} "
+                    f"best_epoch={recovered_result.best_epoch}",
+                    flush=True,
+                )
+                continue
+            if encoder_key not in encoder_cache:
+                if resume and encoder_log_path.exists():
+                    encoder_log_path.unlink()
                 encoder = train_encoder(
                     train,
                     valid,
                     config,
                     device,
                     encoder_seed,
+                    metrics_log_path=(
+                        encoder_log_path
+                        if live_metrics_log or resume
+                        else None
+                    ),
                 )
                 train_rep, valid_rep, _ = build_relatedness(
                     train,
@@ -927,12 +1203,8 @@ def run_outer_fold(
                 )
                 encoder_cache[encoder_key] = (encoder, train_rep, valid_rep)
             encoder, train_rep, valid_rep = encoder_cache[encoder_key]
-            menet_seed = derive_seed(
-                seed + 1,
-                outer_fold,
-                candidate_id,
-                inner_fold,
-            )
+            if resume and menet_log_path.exists():
+                menet_log_path.unlink()
             result = train_menet(
                 train,
                 valid,
@@ -941,6 +1213,11 @@ def run_outer_fold(
                 config,
                 device,
                 menet_seed,
+                metrics_log_path=(
+                    menet_log_path
+                    if live_metrics_log or resume
+                    else None
+                ),
             )
             metric = float(result.metrics.get("avg_pearson", float("nan")))
             inner_results_by_candidate[candidate_id].append(
@@ -1006,6 +1283,11 @@ def run_outer_fold(
         device,
         derive_seed(seed, outer_fold, best.candidate_id, 999),
         fixed_epochs=final_encoder_epoch,
+        metrics_log_path=(
+            fold_path / "outer_refit" / "encoder_metrics.jsonl"
+            if live_metrics_log
+            else None
+        ),
     )
     train_rep, test_rep, relation_scale = build_relatedness(
         outer_train,
@@ -1023,6 +1305,11 @@ def run_outer_fold(
         device,
         derive_seed(seed + 1, outer_fold, best.candidate_id, 999),
         fixed_epochs=final_menet_epoch,
+        metrics_log_path=(
+            fold_path / "outer_refit" / "menet_metrics.jsonl"
+            if live_metrics_log
+            else None
+        ),
     )
     normalized_metrics, normalized_predictions = evaluate_model(
         outer_train,
@@ -1159,29 +1446,43 @@ def _run_trait_fold(
 ) -> dict[str, Any]:
     """Run one MENET trait/fold job on its assigned scheduler device."""
 
-    device = torch.device(device_name)
-    if device.type == "cuda":
-        torch.cuda.set_device(device.index)
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-    data_directory = Path(worker_context.data_directory)
-    prepared = load_prepared_data(data_directory)
-    return {
-        "trait": job.trait_name,
-        **run_outer_fold(
-            data_directory,
-            Path(worker_context.output_directory),
-            prepared,
-            job.trait_name,
-            job.trait_index,
-            job.outer_fold,
-            worker_context.base_config,
-            worker_context.candidates,
-            worker_context.inner_count,
-            device,
-            worker_context.seed,
-        ),
-    }
+    thread_limiter = threadpool_limits(limits=4)
+    torch.set_num_threads(4)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # PyTorch only permits setting inter-op threads before parallel work
+        # starts; a reused worker may already have initialized that runtime.
+        pass
+
+    try:
+        device = torch.device(device_name)
+        if device.type == "cuda":
+            torch.cuda.set_device(device.index)
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+        data_directory = Path(worker_context.data_directory)
+        prepared = load_prepared_data(data_directory)
+        return {
+            "trait": job.trait_name,
+            **run_outer_fold(
+                data_directory,
+                Path(worker_context.output_directory),
+                prepared,
+                job.trait_name,
+                job.trait_index,
+                job.outer_fold,
+                worker_context.base_config,
+                worker_context.candidates,
+                worker_context.inner_count,
+                device,
+                worker_context.seed,
+                worker_context.live_metrics_log,
+                worker_context.resume,
+            ),
+        }
+    finally:
+        thread_limiter.restore_original_limits()
 
 
 def main() -> None:
@@ -1190,10 +1491,16 @@ def main() -> None:
 
     data_directory = Path(args.data_dir).resolve()
     output_directory = Path(args.output_dir).resolve()
-    if args.overwrite and output_directory.exists():
-        import shutil
+    if output_directory.exists() and any(output_directory.iterdir()):
+        if args.overwrite:
+            import shutil
 
-        shutil.rmtree(output_directory)
+            shutil.rmtree(output_directory)
+        else:
+            print(
+                f"[INFO] Resuming from existing results in {output_directory}",
+                flush=True,
+            )
     output_directory.mkdir(parents=True, exist_ok=True)
     with Path(args.config).open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -1246,6 +1553,8 @@ def main() -> None:
         candidates=tuple(candidates),
         inner_count=inner_count,
         seed=args.seed,
+        live_metrics_log=args.live_metrics_log,
+        resume=not args.overwrite,
     )
     devices = (
         [f"cuda:{gpu_id}" for gpu_id in worker_gpu_ids]

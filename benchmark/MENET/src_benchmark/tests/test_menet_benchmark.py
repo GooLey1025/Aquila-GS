@@ -13,6 +13,7 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 import yaml
 
@@ -33,6 +34,9 @@ from MENET_train_cv import (
     SplitData,
     _encode_gt,
     _inverse_trait,
+    _load_completed_encoder_epoch,
+    _load_completed_menet_result,
+    _load_completed_trait_fold,
     _menet_loader,
     build_relatedness,
     expand_gpu_workers,
@@ -55,6 +59,105 @@ def test_gt_encoding() -> None:
     assert _encode_gt("1/1", 0, 0.0) == 1.0
     assert _encode_gt("./.", 0, 0.25) == 0.25
     assert _encode_gt("12:1/0", 1, 0.0) == 0.0
+
+
+def test_completed_inner_logs_are_recovered(tmp_path: Path) -> None:
+    encoder_path = tmp_path / "encoder.jsonl"
+    encoder_path.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in (
+                {
+                    "stage": "encoder",
+                    "epoch": 1,
+                    "best_epoch": 1,
+                    "best_valid_loss": 0.5,
+                    "early_stop": False,
+                    "seed": 11,
+                },
+                {
+                    "stage": "encoder",
+                    "epoch": 2,
+                    "best_epoch": 1,
+                    "best_valid_loss": 0.5,
+                    "early_stop": True,
+                    "seed": 11,
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _load_completed_encoder_epoch(encoder_path, 11, 100) == 1
+
+    menet_path = tmp_path / "menet.jsonl"
+    menet_path.write_text(
+        json.dumps(
+            {
+                "stage": "menet",
+                "epoch": 1,
+                "best_epoch": 1,
+                "best_valid_pearson": 0.4,
+                "early_stop": True,
+                "seed": 12,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    recovered = _load_completed_menet_result(menet_path, 2, 12, 100)
+    assert recovered is not None
+    assert recovered.inner_fold == 2
+    assert recovered.metric == pytest.approx(0.4)
+    assert recovered.best_epoch == 1
+
+
+def test_incomplete_inner_log_is_not_recovered(tmp_path: Path) -> None:
+    path = tmp_path / "metrics.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "stage": "menet",
+                "epoch": 1,
+                "best_epoch": 1,
+                "best_valid_pearson": 0.4,
+                "early_stop": False,
+                "seed": 12,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _load_completed_menet_result(path, 0, 12, 100) is None
+    assert _load_completed_menet_result(path, 0, 13, 1) is None
+
+
+def test_completed_trait_fold_is_recovered(tmp_path: Path) -> None:
+    fold = tmp_path / "TraitA" / "fold_3"
+    fold.mkdir(parents=True)
+    (fold / "best_model.pt").touch()
+    (fold / "predictions_original_scale.csv").write_text(
+        "SampleID,Prediction,Observed\n",
+        encoding="utf-8",
+    )
+    (fold / "hpo_results.json").write_text(
+        json.dumps(
+            {
+                "best_candidate_id": 2,
+                "best_parameters": {"train.dropout": 0.1},
+                "best_valid_pearson_mean": 0.3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (fold / "metrics.json").write_text(
+        '{"normalized": {"avg_pearson": 0.25}, "original": {}}',
+        encoding="utf-8",
+    )
+    recovered = _load_completed_trait_fold(tmp_path, "TraitA", 3)
+    assert recovered is not None
+    assert recovered["best_candidate_id"] == 2
+    assert recovered["test_pearson"] == pytest.approx(0.25)
 
 
 def test_vcf_conversion(tmp_path: Path) -> None:
