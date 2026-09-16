@@ -112,7 +112,7 @@ cd ../BNNs
   --jobs-per-gpu 2
 
 cd ../aquila-snp
-aquila_train_cv.py --data-dir ../$COHORT.cv.data --config conv_mha.aquila-snp.hpo.yaml \
+aquila_train_cv.py --data-dir ../$COHORT.cv.data --config 32hpo_budgets.yaml \
   -o results/$COHORT --live-metrics-log
 
 cd ..
