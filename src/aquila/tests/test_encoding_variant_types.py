@@ -138,7 +138,42 @@ def test_10classed_onehot_is_unordered_diploid_over_acgt(tmp_path: Path) -> None
     assert matrix[2, 0].tolist() == [0, 1, 0, 0, 0, 0, 0, 0, 0, 0]  # TA == AT
     assert matrix[0, 1].tolist() == [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]  # GG
     assert matrix[1, 1].tolist() == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # missing
-    assert matrix[2, 1].tolist() == [0, 0, 0, 0, 0, 0, 0, 0, 1, 0]  # CG
+
+
+def test_dem_10classed_onehot_uses_exact_pregv_channel_order(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "input.vcf"
+    path.write_text(
+        "##fileformat=VCFv4.2\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
+        "AA\tCC\tGG\tTT\tAC\tAG\tAT\tCG\tCT\tGT\n"
+        "1\t10\trs10\tA\tC\t.\tPASS\t.\tGT\t"
+        "0/0\t1/1\t./.\t./.\t0/1\t./.\t./.\t./.\t./.\t./.\n"
+        "1\t20\trs20\tG\tT\t.\tPASS\t.\tGT\t"
+        "./.\t./.\t0/0\t1/1\t./.\t./.\t./.\t./.\t./.\t0/1\n"
+        "1\t30\trs30\tA\tG\t.\tPASS\t.\tGT\t"
+        "./.\t./.\t./.\t./.\t./.\t0/1\t./.\t./.\t./.\t./.\n"
+        "1\t40\trs40\tA\tT\t.\tPASS\t.\tGT\t"
+        "./.\t./.\t./.\t./.\t./.\t./.\t1/0\t./.\t./.\t./.\n"
+        "1\t50\trs50\tC\tG\t.\tPASS\t.\tGT\t"
+        "./.\t./.\t./.\t./.\t./.\t./.\t./.\t0/1\t./.\t./.\n"
+        "1\t60\trs60\tC\tT\t.\tPASS\t.\tGT\t"
+        "./.\t./.\t./.\t./.\t./.\t./.\t./.\t./.\t0/1\t./.\n",
+        encoding="utf-8",
+    )
+    parsed = parse_genotype_file(
+        str(path),
+        encoding_type="dem_10classed_onehot",
+        variant_type="snp",
+    )
+    matrix = parsed["matrix"]
+    assert matrix.shape == (10, 6, 10)
+    expected_marker = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for sample_index, marker_index in enumerate((0, 0, 1, 1, 0, 2, 3, 4, 5, 1)):
+        expected = expected_marker.copy()
+        expected[sample_index] = 1
+        assert matrix[sample_index, marker_index].tolist() == expected
 
 
 def test_parse_id_prefix_spec_splits_and_strips_caret() -> None:

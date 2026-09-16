@@ -1013,7 +1013,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--encoding",
         "--encoding-type",
-        choices=("token", "diploid_onehot", "onehot", "10classed_onehot"),
+        choices=(
+            "token",
+            "diploid_onehot",
+            "onehot",
+            "10classed_onehot",
+            "dem_10classed_onehot",
+        ),
         default="diploid_onehot",
         help="Genotype encoding passed to aquila.encoding.parse_genotype_file.",
     )

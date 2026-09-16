@@ -841,12 +841,36 @@ for _idx, _gt in enumerate(TEN_CLASSED_GENOTYPE_ORDER):
     TEN_CLASSED_INDEX[_gt] = _idx
     TEN_CLASSED_INDEX[_gt[1] + _gt[0]] = _idx
 
+# Exact channel order used by DEM/PREGV. Keep this as a separate encoding
+# instead of changing TEN_CLASSED_GENOTYPE_ORDER, which would invalidate
+# existing Aquila prepared data and checkpoints.
+DEM_TEN_CLASSED_GENOTYPE_ORDER = (
+    "AA", "CC", "GG", "TT", "AC", "AG", "AT", "CG", "CT", "GT",
+)
+DEM_TEN_CLASSED_INDEX = {}
+for _idx, _gt in enumerate(DEM_TEN_CLASSED_GENOTYPE_ORDER):
+    DEM_TEN_CLASSED_INDEX[_gt] = _idx
+    DEM_TEN_CLASSED_INDEX[_gt[1] + _gt[0]] = _idx
+
 
 def _nucleotides_to_10class_onehot(allele1: str, allele2: str) -> np.ndarray:
     """Map two nucleotides to a 10-class unordered diploid one-hot."""
     enc = np.zeros(10, dtype=np.float32)
     key = f"{allele1}{allele2}".upper()
     idx = TEN_CLASSED_INDEX.get(key)
+    if idx is None:
+        return enc
+    enc[idx] = 1.0
+    return enc
+
+
+def _nucleotides_to_dem_10class_onehot(
+    allele1: str, allele2: str
+) -> np.ndarray:
+    """Map two nucleotides to DEM's exact 10-channel genotype order."""
+    enc = np.zeros(10, dtype=np.float32)
+    key = f"{allele1}{allele2}".upper()
+    idx = DEM_TEN_CLASSED_INDEX.get(key)
     if idx is None:
         return enc
     enc[idx] = 1.0
@@ -887,6 +911,19 @@ def _gt_to_10class_onehot(
     if len(n1) != 1 or len(n2) != 1:
         return enc
     return _nucleotides_to_10class_onehot(n1, n2)
+
+
+def _gt_to_dem_10class_onehot(
+    gt_field: str, format_field: str, ref: str, alt: str
+) -> np.ndarray:
+    """Map VCF GT to DEM's exact 10-channel order; missing stays zeros."""
+    aquila = _gt_to_10class_onehot(gt_field, format_field, ref, alt)
+    if not aquila.any():
+        return aquila
+    # Aquila order -> DEM order:
+    # AA,AT,AC,AG,TT,TC,TG,CC,CG,GG
+    # AA,CC,GG,TT,AC,AG,AT,CG,CT,GT
+    return aquila[[0, 7, 9, 4, 2, 3, 1, 8, 5, 6]]
 
 
 def parse_genotype_snp_vcf_10classed_onehot(
@@ -998,6 +1035,24 @@ def parse_genotype_snp_vcf_10classed_onehot(
     }
 
 
+def parse_genotype_snp_vcf_dem_10classed_onehot(
+    vcf_path: str,
+    *,
+    assume_all_variants: bool = False,
+    id_prefixes: Sequence[str] | None = None,
+) -> dict:
+    """Parse VCF SNPs using DEM/PREGV's exact 10-class channel order."""
+    parsed = parse_genotype_snp_vcf_10classed_onehot(
+        vcf_path,
+        assume_all_variants=assume_all_variants,
+        id_prefixes=id_prefixes,
+    )
+    parsed["matrix"] = np.ascontiguousarray(
+        parsed["matrix"][..., [0, 7, 9, 4, 2, 3, 1, 8, 5, 6]]
+    )
+    return parsed
+
+
 def parse_genotype_indel_vcf(
     vcf_path: str,
     *,
@@ -1102,10 +1157,14 @@ def parse_genotype_file(
         ValueError: If encoding_type or variant_type is not recognized
     """
     # Validate inputs
-    if encoding_type not in ['token', 'diploid_onehot', 'onehot', '10classed_onehot']:
+    if encoding_type not in [
+        'token', 'diploid_onehot', 'onehot', '10classed_onehot',
+        'dem_10classed_onehot',
+    ]:
         raise ValueError(
             "encoding_type must be 'token', 'diploid_onehot', 'onehot', or "
-            f"'10classed_onehot', got '{encoding_type}'"
+            "'10classed_onehot', or 'dem_10classed_onehot', "
+            f"got '{encoding_type}'"
         )
 
     if variant_type is not None and variant_type not in ['snp', 'indel', 'sv']:
@@ -1113,7 +1172,12 @@ def parse_genotype_file(
             f"variant_type must be 'snp', 'indel', or 'sv', got '{variant_type}'"
         )
 
-    if encoding_type in ('onehot', '10classed_onehot') and variant_type not in (None, 'snp'):
+    if (
+        encoding_type in (
+            'onehot', '10classed_onehot', 'dem_10classed_onehot'
+        )
+        and variant_type not in (None, 'snp')
+    ):
         raise ValueError(
             f"encoding_type '{encoding_type}' is only supported for single-branch SNP VCF "
             "(variant_type 'snp' or omitted)."
@@ -1133,6 +1197,10 @@ def parse_genotype_file(
             return parse_genotype_snp_vcf_10classed_onehot(
                 geno_path, id_prefixes=id_prefixes
             )
+        if encoding_type == 'dem_10classed_onehot':
+            return parse_genotype_snp_vcf_dem_10classed_onehot(
+                geno_path, id_prefixes=id_prefixes
+            )
         return parse_genotype_vcf(geno_path, id_prefixes=id_prefixes)
 
     if variant_type == 'snp':
@@ -1150,6 +1218,14 @@ def parse_genotype_file(
                 assume_all_variants=True,
                 id_prefixes=id_prefixes,
             ))
+        if encoding_type == 'dem_10classed_onehot':
+            return ensure_snp_sites_are_acgt(
+                parse_genotype_snp_vcf_dem_10classed_onehot(
+                    geno_path,
+                    assume_all_variants=True,
+                    id_prefixes=id_prefixes,
+                )
+            )
         # diploid_onehot
         return ensure_snp_sites_are_acgt(parse_genotype_snp_vcf(
             geno_path,
