@@ -334,7 +334,6 @@ done
 
 All benchmark runners in this section enforce the same prepared-data fold binding. For directories with enabled `fold_specific_gwas` metadata, omitting `--outer-folds` selects only the bound fold, while explicitly requesting another fold or multiple folds is rejected. Prepared-data directories without this metadata retain the original all-fold default.
 
-
 ### Specific case: DEM vs Aquila
 
 #### [DEM](https://github.com/cma2015/DEM/)

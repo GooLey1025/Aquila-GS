@@ -2,6 +2,9 @@ snp_train
 src/aquila.egg-info
 src/aquila/__pycache__/
 src/aquila/scripts/__pycache__/
+build/
+*.so
+src/minepy/mine.c
 *best_model/
 
 *.hpo/

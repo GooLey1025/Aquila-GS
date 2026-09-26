@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = [
+    "setuptools>=61,<82",
+    "wheel",
+    "Cython>=3.0.11",
+    "numpy>=2.0,<3",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -80,6 +85,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["aquila*"]
+include = ["aquila*", "minepy*"]
 namespaces = false
 

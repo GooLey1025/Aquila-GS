@@ -5,9 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMMON_SCRIPT_DIR="$(cd "${SCRIPT_DIR}/../scripts" && pwd)"
 P=Tomato706
 THREADS="${THREADS:-$(nproc)}"
-LD_WINDOW=1000
-LD_STEP=50
-LD_R2=0.005
+N_SNPS=10000
 FILTER_TAG="max_missing_0.5.maf_0.05.biallelic.filter"
 
 VCF_IN="${P}.merge_snp.vcf.gz"
@@ -15,7 +13,8 @@ VCF_KEEP="${P}.merge_snp.keep.vcf.gz"
 KEEP_SAMPLES="${P}.keep.samples.txt"
 VCF_FILT="${P}.merge_snp.keep.${FILTER_TAG}.vcf.gz"
 VCF_IMPUTE="results/${P}.merge_snp.keep.${FILTER_TAG}.impute.biallelic.vcf.gz"
-VCF_PRUNED="${P}.LD.vcf.gz"
+VCF_MIC="${P}.MIC.vcf.gz"
+PHENO_IN="${P}.pheno"
 
 if python3 -c "import pandas" >/dev/null 2>&1; then
     PY=python3
@@ -45,11 +44,19 @@ if [[ ! -f "${VCF_IMPUTE}" ]]; then
     exit 1
 fi
 
-"${COMMON_SCRIPT_DIR}/ld_prune_plink2.sh" \
-    "${VCF_IMPUTE}" "${P}" "${LD_WINDOW}" "${LD_STEP}" "${LD_R2}"
+"$PY" "${COMMON_SCRIPT_DIR}/mic_select_snps.py" \
+    --vcf "${VCF_IMPUTE}" \
+    --pheno "${PHENO_IN}" \
+    --vcf-out "${VCF_MIC}" \
+    --scores-out "${P}.MIC.scores.tsv" \
+    --cache-dir "${P}.MIC.cache" \
+    --sample-map tomato \
+    --n-snps "${N_SNPS}" \
+    --threads "${THREADS}"
 
 # SL### in the VCF corresponds to TS-N in Tomato539_pheno.xlsx (SL001 -> TS-1).
-"$PY" "${SCRIPT_DIR}/scripts/rename_ld_vcf_and_pheno.py" "${P}"
+"$PY" "${SCRIPT_DIR}/scripts/rename_ld_vcf_and_pheno.py" \
+    "${P}" --vcf "${VCF_MIC}"
 
 plink2 \
     --vcf "${VCF_IMPUTE}" \
@@ -59,10 +66,10 @@ plink2 \
     --out "${P}.merge_snp.pca"
 
 plink2 \
-    --vcf "${VCF_PRUNED}" \
+    --vcf "${VCF_MIC}" \
     --pca 2 \
     --vcf-half-call missing \
-    --out "${P}.LD.pca"
+    --out "${P}.MIC.pca"
 
 if python3 -c "import matplotlib" >/dev/null 2>&1; then
     PLOT_PY=python3
