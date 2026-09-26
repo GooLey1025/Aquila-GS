@@ -1,10 +1,10 @@
 COHORT=Maize1404
 PHENO_FILE=species_data/Maize1404/benchmark.pheno
-VCF_FILE=species_data/Maize1404/Maize1404.LD.rename.vcf.gz
+VCF_FILE=species_data/Maize1404/Maize1404.MIC.rename.vcf.gz
 
-COHORT=Soybean2795
+COHORT=Soybean975
 PHENO_FILE=species_data/$COHORT/benchmark.pheno
-VCF_FILE=species_data/$COHORT/Soybean2795.LD.rename.vcf.gz
+VCF_FILE=species_data/$COHORT/Soybean975.MIC.rename.vcf.gz
 
 COHORT=wheat994
 PHENO_FILE=species_data/wheat994/benchmark.pheno
