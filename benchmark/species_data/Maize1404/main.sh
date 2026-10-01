@@ -63,3 +63,48 @@ else
 fi
 "$PLOT_PY" plot_pca.py "${P}.impute.pca"
 "$PLOT_PY" plot_pca.py "${P}.MIC.rename.pca"
+
+# Synonymous and missense SNPs, merged, then LD-pruned.
+# Coordinates match B73 RefGen_v3. PLINK REF alleles are flipped onto that
+# reference before annotation. Sample names drop the CUBIC_ prefix so they
+# match benchmark.pheno.
+"${COMMON_SCRIPT_DIR}/prepare_zea_mays_agpv3.sh"
+"${COMMON_SCRIPT_DIR}/snpeff_coding_ld.sh" \
+    --java /usr/lib/jvm/java-21-openjdk-amd64/bin/java \
+    --snpeff-home /data4/gulei/snpEff \
+    --vcf "${VCF_IMPUTE}" \
+    --genome Zea_mays_AGPv3 \
+    --fasta /data4/gulei/snpEff/genomes/Zea_mays_AGPv3/sequences.fa \
+    --prefix "${SCRIPT_DIR}/Maize1404.coding" \
+    --skip-ld \
+    --threads "${THREADS}"
+
+BOTH_VCF="${SCRIPT_DIR}/Maize1404.coding.both.vcf.gz"
+BOTH_LD="${SCRIPT_DIR}/Maize1404.coding.both.ld"
+FINAL_VCF="${SCRIPT_DIR}/Maize1404.coding.ld.vcf.gz"
+if [[ ! -s "${BOTH_VCF}" ]]; then
+    bcftools concat -a \
+        "${SCRIPT_DIR}/Maize1404.coding.syn.vcf.gz" \
+        "${SCRIPT_DIR}/Maize1404.coding.nonsyn.vcf.gz" \
+        -Ou \
+        | bcftools sort -Oz -o "${BOTH_VCF}"
+    bcftools index -f "${BOTH_VCF}"
+fi
+if [[ ! -s "${BOTH_LD}.prune.in" ]]; then
+    plink2 \
+        --vcf "${BOTH_VCF}" \
+        --indep-pairwise 1000 50 0.1 \
+        --threads "${THREADS}" \
+        --memory 30000 \
+        --out "${BOTH_LD}"
+fi
+if [[ ! -s "${FINAL_VCF}" ]]; then
+    bcftools query -l "${BOTH_VCF}" \
+        | awk '{ name = $1; sub(/^CUBIC_/, "", name); print name }' \
+        > "${SCRIPT_DIR}/Maize1404.coding.ld.samples"
+    bcftools view -i "ID=@${BOTH_LD}.prune.in" -Oz -o "${FINAL_VCF}.tmp.vcf.gz" --threads "${THREADS}" "${BOTH_VCF}"
+    bcftools reheader -N "${SCRIPT_DIR}/Maize1404.coding.ld.samples" -o "${FINAL_VCF}" "${FINAL_VCF}.tmp.vcf.gz"
+    rm -f "${FINAL_VCF}.tmp.vcf.gz"
+    bcftools index -f "${FINAL_VCF}"
+fi
+echo "[INFO] ${FINAL_VCF}: $(bcftools index -n "${FINAL_VCF}") variants"
