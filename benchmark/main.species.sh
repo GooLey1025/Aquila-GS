@@ -26,46 +26,46 @@ cd croparnet
   --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
   -o results/$COHORT \
-  --jobs-per-gpu 4
+  --jobs-per-gpu 4 --overwrite
 
 cd ../cropformer
 /usr/bin/time -v -o $COHORT.time.txt python src_benchmark/adapter.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
   -o results/$COHORT \
-  --jobs-per-gpu 4
+  --jobs-per-gpu 4 --overwrite
 
 cd ../xgboost
 /usr/bin/time -v -o $COHORT.time.txt python xgboost_train_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/xgboost_nested_cv.yaml \
   -o results/$COHORT \
-  --n-jobs 4
+  --n-jobs 4 --overwrite
 
 cd ../bayescpi
 /usr/bin/time -v -o $COHORT.time.txt python bayescpi_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
-  -o results/$COHORT
+  -o results/$COHORT --overwrite
 
 cd ../rrBLUP
 /usr/bin/time -v -o $COHORT.time.txt python rrblup_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
-  -o results/$COHORT
+  -o results/$COHORT --overwrite
 
 
 cd ../Lasso
 python lasso_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
-  -o results/$COHORT
+  -o results/$COHORT --overwrite
 
 cd ../ElasticNet
 python elasticnet_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
-  -o results/$COHORT
+  -o results/$COHORT --overwrite
 
 cd ../CLCNet
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2 \
@@ -75,21 +75,21 @@ python CLCNet_train_cv.py \
   --config configs/CLCNet_nested_cv.yaml \
   --jobs-per-gpu 1 \
   -o "results/$COHORT" \
-  --overwrite
+  --overwrite --live-metrics-log
 
 cd ../MENET
 /usr/bin/time -v -o $COHORT.time.txt python MENET_train_cv.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/MeNet_nested_cv.yaml \
   --jobs-per-gpu 2 \
-  -o results/$COHORT
+  -o results/$COHORT --overwrite
 
 cd ../DEM
 /usr/bin/time -v -o $COHORT.DEM-SNP.time.txt python DEM_train_benchmark.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/DEM-SNP_nested_cv.yaml \
   --output-dir results/DEM-SNP/$COHORT \
-  --jobs-per-gpu 2
+  --jobs-per-gpu 2 --overwrite
 
 # /usr/bin/time -v -o $COHORT.DEM-Vars.time.txt python DEM_train_benchmark.py \
 #   --data-dir ../$COHORT.vars.cv.data \
@@ -102,14 +102,14 @@ cd ../Whisperer_of_DNA
   --data-dir ../$COHORT.cv.data \
   --config configs/Whisperer_nested_cv.yaml \
   --output-dir results/$COHORT \
-  --jobs-per-gpu 2
+  --jobs-per-gpu 2 --overwrite
 
 cd ../BNNs
 /usr/bin/time -v -o $COHORT.time.txt python BNNs_train_cv.py \
   --data-dir ../$COHORT.cv.data \
   --config configs/BNNs_nested_cv.yaml \
   --output-dir results/$COHORT \
-  --jobs-per-gpu 2
+  --jobs-per-gpu 2 --overwrite
 
 cd ../aquila-snp
 aquila_train_cv.py --data-dir ../$COHORT.cv.data --config 32hpo_budgets.yaml \
