@@ -113,7 +113,7 @@ cd ../BNNs
 
 cd ../aquila-snp
 aquila_train_cv.py --data-dir ../$COHORT.cv.data --config 32hpo_budgets.yaml \
-  -o results/$COHORT --live-metrics-log
+  -o results/$COHORT --live-metrics-log --overwrite
 
 cd ..
 python summary_and_plot_benchmark_model.py --benchmark-dir . Maize1404
