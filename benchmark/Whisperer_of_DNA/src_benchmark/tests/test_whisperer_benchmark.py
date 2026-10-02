@@ -35,8 +35,11 @@ from aquila.data.preprocessing import PerTraitPreprocessor, TraitPreprocessing
 from aquila.training.distributed import derive_seed
 from aquila.training.hpo import generate_grid_candidates, half_up_median_epoch
 from Whisperer_train_cv import (
+    _build_inner_hpo_jobs,
+    _inner_hpo_job_id,
     _load_completed_inner_result,
     _load_completed_outer_fold,
+    _outer_refit_job_id,
     _slice_metrics,
     expand_gpu_workers,
     parse_args,
@@ -77,6 +80,20 @@ def test_gpu_slot_expansion_and_positive_job_count() -> None:
     assert expand_gpu_workers([0, 2], 3) == [0, 0, 0, 2, 2, 2]
     with pytest.raises(SystemExit):
         parse_args(["-o", "output", "--jobs-per-gpu", "0"])
+
+
+def test_inner_hpo_jobs_cover_candidates_per_inner_fold() -> None:
+    jobs = _build_inner_hpo_jobs([2], 3, [0, 1])
+    assert [(job.inner_fold, job.candidate_id) for job in jobs] == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+    ]
+    assert jobs[0].job_id == _inner_hpo_job_id(2, 0, 0)
+    assert _outer_refit_job_id(2) == 2 * 1_000_000 + 999_999
 
 
 def test_completed_inner_metrics_log_is_recovered(tmp_path: Path) -> None:

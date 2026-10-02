@@ -59,6 +59,25 @@ def test_explicit_snp_keeps_all_acgt_sites_without_id_prefix(tmp_path: Path) -> 
     assert parsed["matrix"].shape == (2, 2, 8)
 
 
+def test_snp_mode_drops_acgt_sites_with_no_called_genotype(tmp_path: Path) -> None:
+    path = tmp_path / "input.vcf"
+    path.write_text(
+        "##fileformat=VCFv4.2\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tA\tB\n"
+        "1\t10\tSNP-1-10-1\tA\tG\t.\tPASS\t.\tGT\t0/0\t0/1\n"
+        "1\t20\tSNP-1-20-1\tT\tA\t.\tPASS\t.\tGT\t./.\t./.\n",
+        encoding="utf-8",
+    )
+    parsed = parse_genotype_file(
+        str(path),
+        encoding_type="diploid_onehot",
+        variant_type="snp",
+        id_prefix="SNP-",
+    )
+    assert parsed["variant_ids"] == ["SNP-1-10-1"]
+    assert parsed["matrix"].shape == (2, 1, 8)
+
+
 def test_snp_mode_allows_star_allele_as_all_zero(tmp_path: Path) -> None:
     path = tmp_path / "input.vcf"
     path.write_text(

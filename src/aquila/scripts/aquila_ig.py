@@ -99,6 +99,21 @@ def parse_args():
     )
 
     parser.add_argument(
+        '--variant-type',
+        type=str,
+        default=None,
+        choices=['snp', 'indel', 'sv'],
+        help='Encode every kept VCF record as this type. Defaults to the checkpoint config.'
+    )
+
+    parser.add_argument(
+        '--id-prefix',
+        type=str,
+        default=None,
+        help="Keep VCF IDs with this prefix, for example 'SNP-'. Defaults to the checkpoint metadata."
+    )
+
+    parser.add_argument(
         '--device',
         type=str,
         default='cuda' if torch.cuda.is_available() else 'cpu',
@@ -187,7 +202,15 @@ def resolve_model_dir(args):
                 checkpoint_path = latest_ckpt
     
     if checkpoint_path is None:
-        raise FileNotFoundError(f"Could not find checkpoint in {model_dir}/checkpoints")
+        for name in ('best_model.pt', 'best_checkpoint.pt'):
+            candidate = model_dir / name
+            if candidate.is_file():
+                checkpoint_path = candidate
+                break
+    if checkpoint_path is None:
+        raise FileNotFoundError(
+            f"Could not find a checkpoint in {model_dir}/checkpoints or {model_dir}/best_model.pt"
+        )
     
     return str(config_path), str(checkpoint_path)
 
@@ -223,6 +246,18 @@ def load_task_names_from_model_dir(model_dir: Path) -> Tuple[List[str], List[str
                 elif row['task_type'] == 'classification' and row['task_name'] not in classification_tasks:
                     classification_tasks.append(row['task_name'])
     
+    config_path = None
+    for name in ('config.yaml', 'params.yaml', 'training_config.yaml'):
+        candidate = model_dir / name
+        if candidate.is_file():
+            config_path = candidate
+            break
+    if config_path is not None and not regression_tasks:
+        config = load_config(str(config_path))
+        data_config = config.get('data', {})
+        regression_tasks = list(data_config.get('regression_tasks') or [])
+        classification_tasks = list(data_config.get('classification_tasks') or [])
+
     # Try data_config.json
     data_config_path = model_dir / 'data_cache' / 'data_config.json'
     if data_config_path.exists():
@@ -269,6 +304,53 @@ def detect_num_targets_from_checkpoint(state_dict: Dict, task_type: str = 'regre
     return None
 
 
+def _training_variant_order(variant_ids: object, branch: str) -> Optional[List[str]]:
+    """Return the variant order stored with a production checkpoint."""
+    if isinstance(variant_ids, dict):
+        if branch == 'snp' and 'main' in variant_ids:
+            values = variant_ids['main']
+        else:
+            values = variant_ids.get(branch, variant_ids.get(branch.upper()))
+        if values is None:
+            return None
+        return [str(value) for value in values]
+    if isinstance(variant_ids, list):
+        return [str(value) for value in variant_ids]
+    return None
+
+
+def _align_to_training_variants(
+    data_dict: Dict[str, np.ndarray],
+    snp_ids: Dict[str, List[str]],
+    variant_ids: object,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, List[str]]]:
+    """Reorder each encoded branch to the variant order used in training."""
+    if not variant_ids:
+        return data_dict, snp_ids
+    aligned_data = {}
+    aligned_ids = {}
+    for branch, matrix in data_dict.items():
+        order = _training_variant_order(variant_ids, branch)
+        current_ids = [str(value) for value in snp_ids.get(branch, [])]
+        if not order or current_ids == order:
+            aligned_data[branch] = matrix
+            aligned_ids[branch] = current_ids
+            continue
+        position = {variant_id: index for index, variant_id in enumerate(current_ids)}
+        missing = [variant_id for variant_id in order if variant_id not in position]
+        if missing:
+            preview = ", ".join(missing[:5])
+            raise ValueError(
+                f"{len(missing)} training {branch} variants are missing from the VCF "
+                f"(for example: {preview})"
+            )
+        columns = [position[variant_id] for variant_id in order]
+        aligned_data[branch] = np.asarray(matrix)[:, columns]
+        aligned_ids[branch] = order
+        print(f"Aligned {branch} variants to the training order ({len(order)} sites)")
+    return aligned_data, aligned_ids
+
+
 def load_model_and_data(args):
     """
     Load model from checkpoint and prepare data.
@@ -309,13 +391,23 @@ def load_model_and_data(args):
 
     # Override encoding type
     encoding_type = args.encoding_type
+    config.setdefault('data', {})
     config['data']['encoding_type'] = encoding_type
 
     print(f"Encoding type: {encoding_type}")
 
-    # Get variant type from config
-    variant_type = config.get('data', {}).get('variant_type')
+    # Load the checkpoint before parsing so variant order and ID filters
+    # follow the trained production model when those fields are present.
+    print(f"\nLoading checkpoint: {args.checkpoint}")
+    checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
+    checkpoint_metadata = checkpoint.get('metadata') or {}
+
+    variant_type = args.variant_type or config.get('data', {}).get('variant_type')
+    if variant_type is None:
+        variant_type = checkpoint_metadata.get('variant_type')
+    id_prefix = args.id_prefix or checkpoint_metadata.get('id_prefix')
     print(f"Variant type: {variant_type}")
+    print(f"ID prefix: {id_prefix}")
 
     # Determine if multi-branch
     is_multi_branch = encoding_type in ['snp_indel_vcf', 'snp_indel_sv_vcf'] or variant_type in ['snp_indel', 'snp_indel_sv']
@@ -339,7 +431,12 @@ def load_model_and_data(args):
                     raise ValueError("No VCF file specified. Please provide --vcf or set geno_file in config.")
 
             print(f"Loading multi-branch genotype data from: {geno_file}")
-            result = parse_genotype_file(geno_file, encoding_type=encoding_type, variant_type=variant_type)
+            result = parse_genotype_file(
+                geno_file,
+                encoding_type=encoding_type,
+                variant_type=variant_type,
+                id_prefix=id_prefix,
+            )
 
             # result is a dict: {'snp': {'matrix': ..., 'sample_ids': ..., 'variant_ids': ...}, ...}
             data_dict = {}
@@ -377,7 +474,10 @@ def load_model_and_data(args):
 
             print("Loading genotype data...")
             result = parse_genotype_file(
-                vcf_file, encoding_type=encoding_type, variant_type=variant_type
+                vcf_file,
+                encoding_type=encoding_type,
+                variant_type=variant_type,
+                id_prefix=id_prefix,
             )
             if isinstance(result, dict):
                 snp_matrix = result['matrix']
@@ -428,9 +528,11 @@ def load_model_and_data(args):
 
     print(f"\nSequence lengths: {seq_length}")
 
-    # Load checkpoint
-    print(f"\nLoading checkpoint: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
+    data_dict, snp_ids = _align_to_training_variants(
+        data_dict,
+        snp_ids,
+        checkpoint_metadata.get('variant_ids'),
+    )
 
     # Extract state dict
     if 'model_state_dict' in checkpoint:
@@ -607,19 +709,24 @@ class IntegratedGradients:
             else:
                 target = outputs['classification'][0, task_idx]
 
-            # Backward pass
-            self.model.zero_grad()
-            target.backward()
+            # Differentiate only with respect to inputs. Parameter gradients are
+            # unnecessary for IG and are prohibitively expensive when hundreds
+            # of permutation models are interpreted.
+            gradients = torch.autograd.grad(
+                target,
+                tuple(interpolated_dict.values()),
+                allow_unused=True,
+            )
 
             # Accumulate gradients with trapezoidal weights
-            for vtype in input_dict.keys():
-                if interpolated_dict[vtype].grad is not None:
+            for (vtype, _), gradient in zip(interpolated_dict.items(), gradients):
+                if gradient is not None:
                     # Trapezoidal rule: endpoints have weight 0.5, interior points have weight 1.0
                     if step_idx == 0 or step_idx == len(alphas) - 1:
                         weight = 0.5
                     else:
                         weight = 1.0
-                    accumulated_grads[vtype] += weight * interpolated_dict[vtype].grad
+                    accumulated_grads[vtype] += weight * gradient
 
         # Final IG computation
         # IG = sum(gradients) * step_size * (input - baseline)

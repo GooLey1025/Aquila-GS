@@ -183,6 +183,15 @@ def parse_args() -> argparse.Namespace:
         help="Replace output directories for selected folds.",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an interrupted grid run. Finished inner folds are read "
+            "from metrics.jsonl and are not trained again. Do not combine "
+            "with --overwrite; --resume keeps the existing output."
+        ),
+    )
+    parser.add_argument(
         "--precision",
         choices=("bf16", "fp32", "float32"),
         default="bf16",
@@ -821,6 +830,58 @@ def _build_candidate_result(
     )
 
 
+def _queue_fold_final(
+    pool: Any,
+    *,
+    fold_id: int,
+    parameter_sets: Sequence[Mapping[str, Any]],
+    inners: Mapping[int, Mapping[int, Mapping[int, Mapping[str, Any]]]],
+    expected_inners: Mapping[int, int],
+    completed_inners: Mapping[int, int],
+    final_submitted: Dict[int, bool],
+    metric: str,
+    direction: str,
+) -> None:
+    """Queue the outer refit once every inner fold for ``fold_id`` is known."""
+    if (
+        completed_inners[fold_id] != expected_inners[fold_id]
+        or final_submitted[fold_id]
+    ):
+        return
+    candidates = [
+        _build_candidate_result(
+            candidate_id,
+            parameter_sets[candidate_id],
+            inners[fold_id][candidate_id],
+            metric,
+        )
+        for candidate_id in range(len(parameter_sets))
+    ]
+    hpo_result = select_best_candidate(
+        candidates,
+        direction,
+        method="grid",
+    )
+    print(
+        f"[fold {fold_id}] HPO complete "
+        f"(best candidate={hpo_result.best.candidate_id}, "
+        f"final_epoch={hpo_result.best.final_epoch}); "
+        "queueing final refit"
+    )
+    pool.submit(
+        NestedCVJob(
+            job_id=_final_job_id(fold_id),
+            kind="final",
+            fold_id=fold_id,
+            candidate_id=int(hpo_result.best.candidate_id),
+            parameters=dict(hpo_result.best.parameters),
+            final_epoch=int(hpo_result.best.final_epoch),
+            hpo_result=hpo_result,
+        )
+    )
+    final_submitted[fold_id] = True
+
+
 def _run_pipelined_grid_cv(
     *,
     prepared: PreparedData,
@@ -829,6 +890,7 @@ def _run_pipelined_grid_cv(
     selected_folds: Sequence[int],
     gpu_ids: Sequence[int],
     global_seed: int,
+    resume: bool = False,
 ) -> list[Dict[str, Any]]:
     """Keep GPUs busy: inner-fold jobs across folds, then per-fold final refits."""
     train_config = config.get("train", {})
@@ -847,6 +909,7 @@ def _run_pipelined_grid_cv(
             "currently requires at least one regression trait."
         )
     inner_count = int(prepared.metadata["inner_folds"])
+    max_epochs = int(train_config.get("num_epochs", 300))
     patience = int(train_config.get("early_stopping_patience", 20))
     loader_options = _loader_kwargs(train_config)
     live_metrics_log = bool(train_config.get("live_metrics_log", False))
@@ -875,9 +938,42 @@ def _run_pipelined_grid_cv(
         int(fold_id): inner_count * len(parameter_sets)
         for fold_id in selected_folds
     }
+    # fold_id -> candidate_id -> inner_fold -> payload
+    inners: Dict[int, Dict[int, Dict[int, Dict[str, Any]]]] = {
+        int(fold_id): {} for fold_id in selected_folds
+    }
+    completed_inners = {int(fold_id): 0 for fold_id in selected_folds}
+    resumed_inners = 0
     for fold_id in selected_folds:
         for candidate_id, parameters in enumerate(parameter_sets):
             for inner_fold in range(inner_count):
+                log_path = (
+                    output_directory
+                    / f"fold_{fold_id}"
+                    / f"candidate_{candidate_id}"
+                    / f"inner_{inner_fold}"
+                    / "metrics.jsonl"
+                )
+                resumed_payload = (
+                    _completed_inner_log_payload(log_path, max_epochs=max_epochs)
+                    if resume
+                    else None
+                )
+                if resumed_payload is not None:
+                    inners[int(fold_id)].setdefault(int(candidate_id), {})[
+                        int(inner_fold)
+                    ] = {
+                        "kind": "inner",
+                        "fold_id": int(fold_id),
+                        "candidate_id": int(candidate_id),
+                        "inner_fold": int(inner_fold),
+                        **resumed_payload,
+                    }
+                    completed_inners[int(fold_id)] += 1
+                    resumed_inners += 1
+                    continue
+                if resume and log_path.is_file():
+                    log_path.unlink()
                 inner_jobs.append(
                     NestedCVJob(
                         job_id=_inner_job_id(fold_id, candidate_id, inner_fold),
@@ -894,12 +990,12 @@ def _run_pipelined_grid_cv(
         f"{len(inner_jobs)} inner-fold jobs across folds {list(selected_folds)}; "
         "final refit queued per fold when that fold's HPO completes"
     )
+    if resume:
+        print(
+            f"[INFO] Resumed {resumed_inners} finished inner folds from "
+            "metrics.jsonl; incomplete logs will be trained again"
+        )
 
-    # fold_id -> candidate_id -> inner_fold -> payload
-    inners: Dict[int, Dict[int, Dict[int, Dict[str, Any]]]] = {
-        int(fold_id): {} for fold_id in selected_folds
-    }
-    completed_inners = {int(fold_id): 0 for fold_id in selected_folds}
     final_submitted = {int(fold_id): False for fold_id in selected_folds}
     fold_summaries: Dict[int, Dict[str, Any]] = {}
 
@@ -910,6 +1006,18 @@ def _run_pipelined_grid_cv(
         deterministic=train_deterministic_enabled(pool_context.config),
     ) as pool:
         pool.submit_many(inner_jobs)
+        for fold_id in selected_folds:
+            _queue_fold_final(
+                pool,
+                fold_id=int(fold_id),
+                parameter_sets=parameter_sets,
+                inners=inners,
+                expected_inners=expected_inners,
+                completed_inners=completed_inners,
+                final_submitted=final_submitted,
+                metric=metric,
+                direction=direction,
+            )
         while len(fold_summaries) < len(selected_folds):
             work = pool.get()
             if not work.succeeded:
@@ -926,42 +1034,17 @@ def _run_pipelined_grid_cv(
                 inner_fold = int(payload["inner_fold"])
                 inners[fold_id].setdefault(candidate_id, {})[inner_fold] = payload
                 completed_inners[fold_id] += 1
-                if (
-                    completed_inners[fold_id] == expected_inners[fold_id]
-                    and not final_submitted[fold_id]
-                ):
-                    candidates = [
-                        _build_candidate_result(
-                            candidate_id,
-                            parameter_sets[candidate_id],
-                            inners[fold_id][candidate_id],
-                            metric,
-                        )
-                        for candidate_id in range(len(parameter_sets))
-                    ]
-                    hpo_result = select_best_candidate(
-                        candidates,
-                        direction,
-                        method="grid",
-                    )
-                    print(
-                        f"[fold {fold_id}] HPO complete "
-                        f"(best candidate={hpo_result.best.candidate_id}, "
-                        f"final_epoch={hpo_result.best.final_epoch}); "
-                        "queueing final refit"
-                    )
-                    pool.submit(
-                        NestedCVJob(
-                            job_id=_final_job_id(fold_id),
-                            kind="final",
-                            fold_id=fold_id,
-                            candidate_id=int(hpo_result.best.candidate_id),
-                            parameters=dict(hpo_result.best.parameters),
-                            final_epoch=int(hpo_result.best.final_epoch),
-                            hpo_result=hpo_result,
-                        )
-                    )
-                    final_submitted[fold_id] = True
+                _queue_fold_final(
+                    pool,
+                    fold_id=fold_id,
+                    parameter_sets=parameter_sets,
+                    inners=inners,
+                    expected_inners=expected_inners,
+                    completed_inners=completed_inners,
+                    final_submitted=final_submitted,
+                    metric=metric,
+                    direction=direction,
+                )
             elif kind == "final":
                 fold_summaries[fold_id] = payload["summary"]
             else:
@@ -1389,6 +1472,7 @@ def _prepare_output(
     output_directory: Path,
     selected_folds: Sequence[int],
     overwrite: bool,
+    resume: bool = False,
 ) -> None:
     import shutil
 
@@ -1396,12 +1480,54 @@ def _prepare_output(
     for fold_id in selected_folds:
         fold_directory = output_directory / f"fold_{fold_id}"
         if fold_directory.exists() and any(fold_directory.iterdir()):
+            if resume:
+                continue
             if not overwrite:
                 raise FileExistsError(
                     f"Fold output already exists: {fold_directory}; "
-                    "use --overwrite to replace it"
+                    "use --overwrite to replace it, or --resume to continue"
                 )
             shutil.rmtree(fold_directory)
+
+
+def _completed_inner_log_payload(
+    path: Path,
+    *,
+    max_epochs: int,
+) -> Dict[str, Any] | None:
+    """Return an HPO payload when a live metrics log finished training.
+
+    A log is finished when its last row early-stopped or reached
+    ``max_epochs``. ``best_valid_r`` is the early-stopping score, which for
+    ``best/val_r`` is mean Pearson. Incomplete logs return None so the fold
+    is trained again.
+    """
+    if not path.is_file():
+        return None
+    last_record = None
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                last_record = line
+    if not last_record:
+        return None
+    record = json.loads(last_record)
+    epoch = int(record.get("epoch") or 0)
+    finished = bool(record.get("early_stop")) or epoch >= int(max_epochs)
+    best_epoch = record.get("best_epoch")
+    best_valid_r = record.get("best_valid_r")
+    if (
+        not finished
+        or best_epoch is None
+        or best_valid_r is None
+        or not np.isfinite(float(best_valid_r))
+    ):
+        return None
+    return {
+        "best_epoch": int(best_epoch),
+        "best_metrics": {"avg_pearson": float(best_valid_r)},
+    }
 
 
 def _copy_params_yaml(config_path: Path, output_directory: Path) -> Path:
@@ -1426,15 +1552,25 @@ def main() -> None:
         config,
         True if args.use_deterministic else None,
     )
-    if args.live_metrics_log:
+    if args.live_metrics_log or args.resume:
         config["train"]["live_metrics_log"] = True
+    if args.resume and args.overwrite:
+        print(
+            "[INFO] --resume keeps existing fold outputs; "
+            "--overwrite will not delete them"
+        )
     if "mixed_precision" in config["train"]:
         # Prefer explicit precision; drop redundant legacy key.
         config["train"].pop("mixed_precision", None)
     _validate_preprocessing_cache(prepared, config)
     selected_folds = resolve_selected_folds(args.folds, prepared.metadata)
     output_directory = Path(args.output_dir)
-    _prepare_output(output_directory, selected_folds, args.overwrite)
+    _prepare_output(
+        output_directory,
+        selected_folds,
+        args.overwrite,
+        resume=args.resume,
+    )
     params_copy = _copy_params_yaml(Path(args.config), output_directory)
 
     prepared = PreparedData(
@@ -1471,6 +1607,7 @@ def main() -> None:
                 selected_folds=selected_folds,
                 gpu_ids=gpu_ids,
                 global_seed=global_seed,
+                resume=args.resume,
             )
             for item in completed:
                 fold_id = int(item["outer_fold"])

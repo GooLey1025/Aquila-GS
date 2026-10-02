@@ -34,6 +34,7 @@ from MENET_train_cv import (
     SplitData,
     _encode_gt,
     _inverse_trait,
+    collect_within_accession,
     _load_completed_encoder_epoch,
     _load_completed_menet_result,
     _load_completed_trait_fold,
@@ -265,6 +266,49 @@ def test_single_trait_inverse_transform() -> None:
         0,
     )
     assert restored[:, 0].tolist() == [10.0, 14.0]
+
+
+def test_within_accession_uses_saved_normalized_predictions(tmp_path: Path) -> None:
+    preprocessing = {
+        "traits": [
+            {
+                "name": "A",
+                "mean": 10.0,
+                "std": 2.0,
+                "use_log1p": False,
+                "log_shift": 0.0,
+            },
+            {
+                "name": "B",
+                "mean": 0.0,
+                "std": 1.0,
+                "use_log1p": False,
+                "log_shift": 0.0,
+            },
+        ]
+    }
+    for trait_name, rows in {
+        "A": [("s1", 12.0, 14.0), ("s2", 8.0, 6.0)],
+        "B": [("s1", 3.0, 4.0), ("s2", 1.0, 0.0)],
+    }.items():
+        fold = tmp_path / trait_name / "fold_0"
+        fold.mkdir(parents=True)
+        (fold / "preprocessing.json").write_text(
+            json.dumps(preprocessing),
+            encoding="utf-8",
+        )
+        lines = ["SampleID,Prediction,Observed"]
+        lines.extend(f"{sample},{prediction},{observed}" for sample, prediction, observed in rows)
+        (fold / "predictions_original_scale.csv").write_text(
+            "\n".join(lines) + "\n",
+            encoding="utf-8",
+        )
+
+    report = collect_within_accession(tmp_path)
+    assert report["traits_found"] == 2
+    assert report["n_accessions"] == 2
+    assert report["within_accession_pearson_r"] == pytest.approx(1.0)
+    assert report["folds"][0]["outer_fold"] == 0
 
 
 def test_regression_metrics_include_mse() -> None:

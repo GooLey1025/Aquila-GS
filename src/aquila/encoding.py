@@ -90,11 +90,29 @@ def _all_zero_site_indices(matrix: np.ndarray) -> np.ndarray:
     return np.flatnonzero(per_sample.sum(axis=0) == 0)
 
 
+def _drop_variant_columns(parsed: dict, drop: set[int]) -> dict:
+    """Remove variant-axis columns and the parallel per-site lists."""
+    if not drop:
+        return parsed
+    site_count = len(parsed["variant_ids"])
+    keep = [index for index in range(site_count) if index not in drop]
+    if "matrix" in parsed:
+        parsed["matrix"] = np.asarray(parsed["matrix"])[:, keep]
+    for key in ("variant_ids", "refs", "alts", "chroms", "positions"):
+        values = parsed.get(key)
+        if isinstance(values, list) and len(values) == site_count:
+            parsed[key] = [values[index] for index in keep]
+    if not parsed["variant_ids"]:
+        raise ValueError("SNP mode dropped every site; no encoded variants remain")
+    return parsed
+
+
 def ensure_snp_sites_are_acgt(parsed: dict) -> dict:
     """Reject SNP-mode sites that are neither ACGT SNPs nor VCF ``*``.
 
     ``*`` (spanning deletion) is allowed and stored as all-zero. Other non-ACGT
-    alleles still fail. All-zero columns on ACGT SNPs still fail.
+    alleles still fail. ACGT sites whose encoding is all-zero have no called
+    genotype and are dropped.
     """
     if not isinstance(parsed, dict) or "variant_ids" not in parsed:
         return parsed
@@ -103,6 +121,8 @@ def ensure_snp_sites_are_acgt(parsed: dict) -> dict:
     alts = list(parsed.get("alts") or [])
     bad: list[str] = []
     seen: set[str] = set()
+    uncalled: list[str] = []
+    drop: set[int] = set()
 
     n = len(variant_ids)
     for i in range(n):
@@ -119,22 +139,30 @@ def ensure_snp_sites_are_acgt(parsed: dict) -> dict:
             idx = int(i)
             ref = refs[idx] if idx < len(refs) else None
             alt = alts[idx] if idx < len(alts) else None
-            if _is_star_allele(ref, alt):
+            if _is_star_allele(ref, alt) or not _is_biallelic_acgt_snp(ref, alt):
                 continue
             vid = variant_ids[idx] if idx < len(variant_ids) else f"site_{idx}"
+            drop.add(idx)
             if vid not in seen:
                 seen.add(vid)
-                bad.append(vid)
+                uncalled.append(vid)
 
-    if not bad:
-        return parsed
-    examples = ", ".join(str(v) for v in bad[:8])
-    more = "" if len(bad) <= 8 else f" (+{len(bad) - 8} more)"
-    raise ValueError(
-        f"--variant-type snp (SNP mode) found {len(bad)} non-ACGT site(s) "
-        f"(REF/ALT are not single-base A/C/G/T, or the site encodes as all-zero): "
-        f"{examples}{more}."
-    )
+    if bad:
+        examples = ", ".join(str(v) for v in bad[:8])
+        more = "" if len(bad) <= 8 else f" (+{len(bad) - 8} more)"
+        raise ValueError(
+            f"--variant-type snp (SNP mode) found {len(bad)} non-ACGT site(s) "
+            f"(REF/ALT are not single-base A/C/G/T): {examples}{more}."
+        )
+    if uncalled:
+        examples = ", ".join(str(v) for v in uncalled[:8])
+        more = "" if len(uncalled) <= 8 else f" (+{len(uncalled) - 8} more)"
+        print(
+            f"Dropping {len(uncalled)} ACGT SNP site(s) with no called genotype: "
+            f"{examples}{more}."
+        )
+        return _drop_variant_columns(parsed, drop)
+    return parsed
 
 
 ###############################################################################

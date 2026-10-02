@@ -4,8 +4,8 @@ hpo:
   metric: best/val_r
   direction: maximize
   seed: 42
-  # 2^5 = 32 candidates. Training and branch settings follow the
-  # Aquila-SNP 32-budget configuration wherever applicable.
+  # 2 x 3 x 2 = 12 candidates. No shared trunk: fusion feeds the
+  # regression head directly.
   parameters:
     # HPO alias for model.downconv_kernel_size. This changes the global
     # fallback only; an explicit train.branches.*.trunk.0.kernel_size wins.
@@ -15,9 +15,6 @@ hpo:
     model.dropout:
       type: categorical
       choices: [0.3, 0.4, 0.5]
-    train.shared_trunk.0.hidden_features:
-      type: categorical
-      choices: [256, 512]
     model.d_model:
       type: categorical
       choices: [256, 512]
@@ -143,15 +140,6 @@ train:
     fusion_dim: 256
     num_branches: 3
     which_branch_to_add: null
-
-  shared_trunk:
-  - name: mlp_block
-    in_features: 256
-    hidden_features: 512
-    out_features: 256
-    num_layers: 2
-    activation: gelu
-    norm_type: layer
 
   heads:
     regression:

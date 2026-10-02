@@ -62,6 +62,14 @@ MODEL_COLORS = {
 SCALE_NAMES = ("normalized", "processed", "standardized")
 PRIMARY_TRAIT_PEARSON = "within_trait_pearson"
 LINE_WIDTH = 1.05
+# These cohorts select a different GWAS marker panel for each outer fold, so
+# their results live under results/<cohort>/fold_<k>/ rather than one shared
+# panel summary such as results/lasso/summary.json.
+CURRENT_FOLD_GWAS_COHORTS = frozenset({"Rice655", "Rice1171"})
+SHARED_PANEL_SUMMARY_DIRS = {
+    "Lasso": "lasso",
+    "ElasticNet": "elasticnet",
+}
 
 
 @dataclass(frozen=True)
@@ -356,10 +364,9 @@ def summary_candidates(benchmark_dir: Path, model_dir: str, cohort: str) -> list
         else benchmark_dir / model_dir / "results"
     )
     candidates = [root / cohort / "summary.json"]
-    if model_dir == "Lasso":
-        candidates.append(root / "lasso" / "summary.json")
-    elif model_dir == "ElasticNet":
-        candidates.append(root / "elasticnet" / "summary.json")
+    shared_dir = SHARED_PANEL_SUMMARY_DIRS.get(model_dir)
+    if shared_dir is not None and cohort not in CURRENT_FOLD_GWAS_COHORTS:
+        candidates.append(root / shared_dir / "summary.json")
     elif model_dir in {"DEM/results/DEM-SNP", "DEM/results/DEM-Vars"}:
         variant = Path(model_dir).name
         candidates.append(
@@ -441,25 +448,12 @@ def load_fold_sharded_result(
     )
 
 
-def load_model_result(
-    benchmark_dir: Path,
+def load_summary_file_result(
+    summary_file: Path,
     cohort: str,
     display_name: str,
     model_dir: str,
 ) -> ModelResult:
-    candidates = summary_candidates(benchmark_dir, model_dir, cohort)
-    summary_file = next((path for path in candidates if path.is_file()), None)
-    if summary_file is None:
-        sharded = load_fold_sharded_result(
-            candidates,
-            cohort,
-            display_name,
-            model_dir,
-        )
-        if sharded is not None:
-            return sharded
-        return ModelResult(display_name, None, {}, "missing", "Final summary not found")
-
     try:
         payload, values = _values_from_summary(summary_file, model_dir)
     except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -495,6 +489,37 @@ def load_model_result(
             "No final per-trait Pearson correlations found",
         )
     return ModelResult(display_name, summary_file, values, "available", "OK")
+
+
+def load_model_result(
+    benchmark_dir: Path,
+    cohort: str,
+    display_name: str,
+    model_dir: str,
+) -> ModelResult:
+    candidates = summary_candidates(benchmark_dir, model_dir, cohort)
+    summary_file = next((path for path in candidates if path.is_file()), None)
+    file_result = (
+        load_summary_file_result(summary_file, cohort, display_name, model_dir)
+        if summary_file is not None
+        else None
+    )
+    if file_result is not None and file_result.status == "available":
+        return file_result
+
+    sharded = load_fold_sharded_result(
+        candidates,
+        cohort,
+        display_name,
+        model_dir,
+    )
+    if sharded is not None and (
+        sharded.status == "available" or file_result is None
+    ):
+        return sharded
+    if file_result is not None:
+        return file_result
+    return ModelResult(display_name, None, {}, "missing", "Final summary not found")
 
 
 def load_expected_traits(benchmark_dir: Path, cohort: str) -> list[str]:
@@ -546,6 +571,20 @@ def preprocessing_by_trait(
     }
 
 
+def preprocessing_from_saved(path: Path) -> dict[str, Mapping[str, Any]] | None:
+    if not path.is_file():
+        return None
+    payload = read_json(path)
+    traits = payload.get("traits")
+    if not isinstance(traits, Sequence) or isinstance(traits, (str, bytes)):
+        return None
+    return {
+        str(item["name"]): item
+        for item in traits
+        if isinstance(item, Mapping) and item.get("name") is not None
+    }
+
+
 def transform_original_values(
     values: pd.Series,
     parameters: Mapping[str, Any],
@@ -564,6 +603,7 @@ def prediction_file_for_trait(
     model_dir: str,
     trait: str,
     outer_fold: int,
+    cohort: str | None = None,
 ) -> tuple[Path, str, str, str] | None:
     fold_dir = result_root / trait / f"fold_{outer_fold}"
     formats = {
@@ -593,8 +633,16 @@ def prediction_file_for_trait(
     if spec is None:
         return None
     filename, separator, prediction_column, observed_column = spec
-    path = fold_dir / filename
-    if not path.is_file():
+    search_dirs = [fold_dir]
+    if cohort in CURRENT_FOLD_GWAS_COHORTS:
+        search_dirs.append(
+            result_root / f"fold_{outer_fold}" / trait / f"fold_{outer_fold}"
+        )
+    path = next(
+        (directory / filename for directory in search_dirs if (directory / filename).is_file()),
+        None,
+    )
+    if path is None:
         return None
     return path, separator, prediction_column, observed_column
 
@@ -651,7 +699,7 @@ def read_long_predictions(
     for trait in traits:
         for outer_fold in range(100):
             file_spec = prediction_file_for_trait(
-                result_root, model_dir, trait, outer_fold
+                result_root, model_dir, trait, outer_fold, cohort
             )
             if file_spec is None:
                 if outer_fold >= 5:
@@ -666,8 +714,11 @@ def read_long_predictions(
             predicted = pd.to_numeric(frame[prediction_column], errors="coerce")
             observed = pd.to_numeric(frame[observed_column], errors="coerce")
             if model_dir == "MENET":
-                parameters = preprocessing_by_trait(
-                    benchmark_dir, cohort, outer_fold
+                saved = preprocessing_from_saved(path.parent / "preprocessing.json")
+                parameters = (
+                    saved if saved is not None else preprocessing_by_trait(
+                        benchmark_dir, cohort, outer_fold
+                    )
                 ).get(trait)
                 if parameters is None:
                     raise ValueError(

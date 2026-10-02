@@ -63,16 +63,35 @@ from whisperer_model import (
 
 
 @dataclass(frozen=True)
-class OuterFoldJob:
-    """One independently scheduled outer-fold multi-trait run."""
+class InnerHPOJob:
+    """One independently scheduled inner-fold HPO candidate."""
 
     job_id: int
     outer_fold: int
+    candidate_id: int
+    inner_fold: int
 
 
 @dataclass(frozen=True)
-class OuterFoldContext:
-    """Spawn-safe inputs shared by DNA Whisper workers."""
+class OuterRefitJob:
+    """Outer-train refit after all inner HPO jobs for a fold complete."""
+
+    job_id: int
+    outer_fold: int
+    started: float
+    best_candidate_id: int
+    best_parameters: dict[str, Any]
+    final_epoch: int
+    best_valid_pearson_mean: float
+    candidate_results: tuple[CandidateResult, ...]
+    histories: dict[str, Any]
+    inner_audit: tuple[dict[str, Any], ...]
+    variant_schema: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class WorkerContext:
+    """Spawn-safe inputs shared by DNA Whisper GPU workers."""
 
     data_directory: str
     output_directory: str
@@ -84,6 +103,9 @@ class OuterFoldContext:
     budget: dict[str, Any]
     live_metrics_log: bool
     resume: bool
+
+
+_LOADED_SPLITS: dict[tuple[Any, ...], tuple[MultiTraitSplit, MultiTraitSplit, dict[str, Any]]] = {}
 
 
 def positive_int(value: str) -> int:
@@ -99,6 +121,46 @@ def expand_gpu_workers(gpu_ids: Sequence[int], jobs_per_gpu: int) -> list[int]:
     if jobs_per_gpu < 1:
         raise ValueError("--jobs-per-gpu must be at least 1")
     return [gpu_id for gpu_id in gpu_ids for _ in range(jobs_per_gpu)]
+
+
+def _inner_hpo_job_id(outer_fold: int, candidate_id: int, inner_fold: int) -> int:
+    return int(outer_fold) * 1_000_000 + int(inner_fold) * 1_000 + int(candidate_id)
+
+
+def _outer_refit_job_id(outer_fold: int) -> int:
+    return int(outer_fold) * 1_000_000 + 999_999
+
+
+def _build_inner_hpo_jobs(
+    outer_folds: Sequence[int],
+    candidate_count: int,
+    inner_folds: Sequence[int],
+) -> list[InnerHPOJob]:
+    """Order jobs by inner fold then candidate so GPU workers reuse loaded VCFs."""
+
+    jobs = []
+    for outer_fold in outer_folds:
+        for inner_fold in inner_folds:
+            for candidate_id in range(candidate_count):
+                jobs.append(
+                    InnerHPOJob(
+                        job_id=_inner_hpo_job_id(outer_fold, candidate_id, inner_fold),
+                        outer_fold=int(outer_fold),
+                        candidate_id=int(candidate_id),
+                        inner_fold=int(inner_fold),
+                    )
+                )
+    return jobs
+
+
+def _limit_worker_threads() -> Any:
+    limiter = threadpool_limits(limits=1)
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+    return limiter
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -129,7 +191,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--jobs-per-gpu",
         type=positive_int,
         default=1,
-        help="Maximum concurrent outer-fold jobs per GPU (default: 1).",
+        help="Maximum concurrent inner-HPO jobs per GPU (default: 1).",
     )
     parser.add_argument(
         "--overwrite",
@@ -364,398 +426,411 @@ def _write_trait_predictions(
     )
 
 
-def run_outer_fold(
-    benchmark: WhispererPreparedBenchmark,
-    output_directory: Path,
-    trait_names: Sequence[str],
+def _load_inner_split(
+    context: WorkerContext,
     outer_fold: int,
-    config: Mapping[str, Any],
-    candidates: Sequence[Mapping[str, Any]],
-    inner_folds: Sequence[int],
-    device: torch.device,
-    max_epochs: int,
-    budget: Mapping[str, Any],
-    live_metrics_log: bool = False,
-    resume: bool = False,
+    inner_fold: int,
+) -> tuple[MultiTraitSplit, MultiTraitSplit, dict[str, Any]]:
+    key = (context.data_directory, outer_fold, inner_fold, context.trait_names)
+    cached = _LOADED_SPLITS.get(key)
+    if cached is not None:
+        return cached
+    _LOADED_SPLITS.clear()
+    benchmark = WhispererPreparedBenchmark(Path(context.data_directory))
+    train, valid, schema = benchmark.load_multi_trait_fold(
+        context.trait_names,
+        outer_fold,
+        inner_fold,
+        block_length=int(context.config["model"]["embedding"]["Block_length"]),
+    )
+    _LOADED_SPLITS[key] = (train, valid, schema)
+    return train, valid, schema
+
+
+def _run_inner_hpo_job(
+    job: InnerHPOJob,
+    device_name: str,
+    context: WorkerContext,
 ) -> dict[str, Any]:
-    started = time.time()
-    names = tuple(str(name) for name in trait_names)
-    fold_path = output_directory / f"fold_{outer_fold}"
-    fold_path.mkdir(parents=True, exist_ok=True)
-    block_length = int(config["model"]["embedding"]["Block_length"])
-    patience = int(config["training"]["patience"])
-    inner_results: dict[int, list[InnerFoldResult]] = {
-        index: [] for index in range(len(candidates))
-    }
-    histories: dict[str, Any] = {}
-    inner_audit = []
-    global_variants = None
-    variant_schema = None
-    for inner_fold in inner_folds:
-        recovered_by_candidate = {}
-        if resume:
-            for candidate_id in range(len(candidates)):
-                training_seed = derive_seed(
-                    int(config["seed"]),
-                    outer_fold,
-                    candidate_id,
-                    inner_fold,
-                )
-                metrics_log_path = (
-                    fold_path
-                    / f"candidate_{candidate_id}"
-                    / f"inner_{inner_fold}"
-                    / "metrics.jsonl"
-                )
-                recovered = _load_completed_inner_result(
-                    metrics_log_path,
-                    inner_fold,
-                    training_seed,
-                    max_epochs,
-                )
-                if recovered is not None:
-                    recovered_by_candidate[candidate_id] = recovered
-        if recovered_by_candidate:
-            print(
-                f"[INFO] traits={list(names)} outer_fold={outer_fold} "
-                f"inner_fold={inner_fold} found "
-                f"{len(recovered_by_candidate)}/{len(candidates)} completed "
-                "candidates",
-                flush=True,
-            )
-        if len(recovered_by_candidate) == len(candidates):
-            for candidate_id in range(len(candidates)):
-                recovered_result, recovered_history = recovered_by_candidate[
-                    candidate_id
-                ]
-                inner_results[candidate_id].append(recovered_result)
-                histories[f"candidate_{candidate_id}/inner_{inner_fold}"] = (
-                    recovered_history
-                )
-            inner_audit.append(
-                {
-                    "inner_fold": inner_fold,
-                    "recovered_from_metrics_logs": True,
-                }
-            )
-            print(
-                f"[INFO] traits={list(names)} outer_fold={outer_fold} "
-                f"inner_fold={inner_fold} recovered all {len(candidates)} "
-                "candidates; skipped VCF loading",
-                flush=True,
-            )
-            continue
-        train, valid, schema = benchmark.load_multi_trait_fold(
-            names,
-            outer_fold,
-            inner_fold,
-            block_length=block_length,
-            expected_variants=global_variants,
+    limiter = _limit_worker_threads()
+    try:
+        device = torch.device(device_name)
+        if device.type == "cuda":
+            configure_cuda_runtime(device_name, deterministic=False)
+        names = tuple(context.trait_names)
+        fold_path = Path(context.output_directory) / f"fold_{job.outer_fold}"
+        fold_path.mkdir(parents=True, exist_ok=True)
+        parameters = _candidate_parameters(context.candidates[job.candidate_id])
+        parameters["batch_size"] = int(context.config["training"]["batch_size"])
+        training_seed = derive_seed(
+            int(context.config["seed"]),
+            job.outer_fold,
+            job.candidate_id,
+            job.inner_fold,
         )
-        if global_variants is None:
-            global_variants = tuple(tuple(value) for value in schema["variants"])
-            variant_schema = schema
-        inner_audit.append(
-            {
-                "inner_fold": inner_fold,
+        metrics_log_path = (
+            fold_path
+            / f"candidate_{job.candidate_id}"
+            / f"inner_{job.inner_fold}"
+            / "metrics.jsonl"
+            if context.live_metrics_log or context.resume
+            else None
+        )
+        recovered = None
+        if context.resume:
+            recovered = _load_completed_inner_result(
+                metrics_log_path,
+                job.inner_fold,
+                training_seed,
+                context.max_epochs,
+            )
+        if recovered is not None:
+            recovered_result, recovered_history = recovered
+            print(
+                f"[INFO] traits={list(names)} outer_fold={job.outer_fold} "
+                f"inner_fold={job.inner_fold} candidate={job.candidate_id + 1}/"
+                f"{len(context.candidates)} recovered best_valid_pearson="
+                f"{recovered_result.metric:.6f} "
+                f"best_epoch={recovered_result.best_epoch} device={device}",
+                flush=True,
+            )
+            return {
+                "outer_fold": job.outer_fold,
+                "candidate_id": job.candidate_id,
+                "inner_fold": job.inner_fold,
+                "metric": recovered_result.metric,
+                "best_epoch": recovered_result.best_epoch,
+                "metrics": dict(recovered_result.metrics),
+                "history": recovered_history,
+                "audit": None,
+                "variant_schema": None,
+                "recovered": True,
+            }
+        if context.resume and metrics_log_path is not None and metrics_log_path.exists():
+            metrics_log_path.unlink()
+        train, valid, schema = _load_inner_split(context, job.outer_fold, job.inner_fold)
+        print(
+            f"[INFO] traits={list(names)} outer_fold={job.outer_fold} "
+            f"inner_fold={job.inner_fold} candidate={job.candidate_id + 1}/"
+            f"{len(context.candidates)} device={device}",
+            flush=True,
+        )
+        result = train_model(
+            train.genotypes,
+            train.processed_targets,
+            valid.genotypes,
+            valid.processed_targets,
+            apply_candidate_overrides(context.config["model"], parameters, names),
+            parameters,
+            device,
+            training_seed,
+            max_epochs=context.max_epochs,
+            patience=int(context.config["training"]["patience"]),
+            train_mask=train.observed_mask,
+            valid_mask=valid.observed_mask,
+            trait_names=names,
+            metrics_log_path=metrics_log_path,
+        )
+        print(
+            f"[INFO] traits={list(names)} outer_fold={job.outer_fold} "
+            f"inner_fold={job.inner_fold} candidate={job.candidate_id + 1}/"
+            f"{len(context.candidates)} "
+            f"best_valid_pearson={result.best_metric:.6f} "
+            f"best_epoch={result.best_epoch} device={device}",
+            flush=True,
+        )
+        return {
+            "outer_fold": job.outer_fold,
+            "candidate_id": job.candidate_id,
+            "inner_fold": job.inner_fold,
+            "metric": result.best_metric,
+            "best_epoch": result.best_epoch,
+            "metrics": {**result.best_metrics, "training_seed": training_seed},
+            "history": list(result.history),
+            "audit": {
+                "inner_fold": job.inner_fold,
                 **build_sample_audit(train, valid, held_out_name="valid"),
                 "train_observations_per_trait": _observation_counts(train),
                 "valid_observations_per_trait": _observation_counts(valid),
-            }
-        )
-        for candidate_id, raw_parameters in enumerate(candidates):
-            parameters = _candidate_parameters(raw_parameters)
-            parameters["batch_size"] = int(config["training"]["batch_size"])
-            training_seed = derive_seed(
-                int(config["seed"]),
-                outer_fold,
-                candidate_id,
-                inner_fold,
+            },
+            "variant_schema": schema,
+            "recovered": False,
+        }
+    finally:
+        limiter.restore_original_limits()
+
+
+def _assemble_outer_hpo(
+    payloads: Sequence[Mapping[str, Any]],
+    context: WorkerContext,
+    outer_fold: int,
+) -> dict[str, Any]:
+    by_candidate: dict[int, dict[int, Mapping[str, Any]]] = {}
+    for payload in payloads:
+        if int(payload["outer_fold"]) != int(outer_fold):
+            continue
+        by_candidate.setdefault(int(payload["candidate_id"]), {})[
+            int(payload["inner_fold"])
+        ] = payload
+    histories: dict[str, Any] = {}
+    audits: dict[int, dict[str, Any]] = {}
+    variant_schema = None
+    candidate_results = []
+    for candidate_id, raw_parameters in enumerate(context.candidates):
+        folds = by_candidate.get(candidate_id, {})
+        missing = [inner_fold for inner_fold in context.inner_folds if inner_fold not in folds]
+        if missing:
+            raise ValueError(
+                f"outer_fold={outer_fold} candidate={candidate_id} missing inner folds {missing}"
             )
-            model_config = apply_candidate_overrides(config["model"], parameters, names)
-            metrics_log_path = (
-                fold_path
-                / f"candidate_{candidate_id}"
-                / f"inner_{inner_fold}"
-                / "metrics.jsonl"
-                if live_metrics_log or resume
-                else None
-            )
-            recovered = recovered_by_candidate.get(candidate_id)
-            if recovered is not None:
-                recovered_result, recovered_history = recovered
-                inner_results[candidate_id].append(recovered_result)
-                histories[f"candidate_{candidate_id}/inner_{inner_fold}"] = (
-                    recovered_history
-                )
-                print(
-                    f"[INFO] traits={list(names)} outer_fold={outer_fold} "
-                    f"inner_fold={inner_fold} candidate={candidate_id + 1}/"
-                    f"{len(candidates)} recovered best_valid_pearson="
-                    f"{recovered_result.metric:.6f} "
-                    f"best_epoch={recovered_result.best_epoch}",
-                    flush=True,
-                )
-                continue
-            if resume and metrics_log_path is not None and metrics_log_path.exists():
-                metrics_log_path.unlink()
-            result = train_model(
-                train.genotypes,
-                train.processed_targets,
-                valid.genotypes,
-                valid.processed_targets,
-                model_config,
-                parameters,
-                device,
-                training_seed,
-                max_epochs=max_epochs,
-                patience=patience,
-                train_mask=train.observed_mask,
-                valid_mask=valid.observed_mask,
-                trait_names=names,
-                metrics_log_path=metrics_log_path,
-            )
-            inner_results[candidate_id].append(
+        inner_results = []
+        for inner_fold in context.inner_folds:
+            payload = folds[inner_fold]
+            inner_results.append(
                 InnerFoldResult(
                     inner_fold,
-                    result.best_metric,
-                    result.best_epoch,
-                    {**result.best_metrics, "training_seed": training_seed},
+                    float(payload["metric"]),
+                    int(payload["best_epoch"]),
+                    dict(payload["metrics"]),
                 )
             )
-            print(
-                f"[INFO] traits={list(names)} outer_fold={outer_fold} "
-                f"inner_fold={inner_fold} "
-                f"candidate={candidate_id + 1}/{len(candidates)} "
-                f"best_valid_pearson={result.best_metric:.6f} "
-                f"best_epoch={result.best_epoch}",
-                flush=True,
-            )
-            histories[f"candidate_{candidate_id}/inner_{inner_fold}"] = list(
-                result.history
-            )
-    candidate_results = []
-    for candidate_id, raw_parameters in enumerate(candidates):
-        results = tuple(inner_results[candidate_id])
-        metrics = np.asarray([result.metric for result in results], dtype=float)
-        objective = (
-            float(metrics.mean()) if np.isfinite(metrics).all() else float("nan")
-        )
+            histories[f"candidate_{candidate_id}/inner_{inner_fold}"] = payload["history"]
+            if payload.get("audit") is not None:
+                audits[inner_fold] = dict(payload["audit"])
+            if payload.get("variant_schema") is not None:
+                schema = dict(payload["variant_schema"])
+                if variant_schema is None:
+                    variant_schema = schema
+                elif variant_schema.get("variants") != schema.get("variants"):
+                    raise ValueError(
+                        "Fold VCF variant schema differs from the global schema"
+                    )
+        metrics = np.asarray([result.metric for result in inner_results], dtype=float)
         parameters = _candidate_parameters(raw_parameters)
-        parameters["batch_size"] = int(config["training"]["batch_size"])
+        parameters["batch_size"] = int(context.config["training"]["batch_size"])
         candidate_results.append(
             CandidateResult(
                 candidate_id,
                 parameters,
-                objective,
-                results,
+                float(metrics.mean()) if np.isfinite(metrics).all() else float("nan"),
+                tuple(inner_results),
             )
         )
     hpo = select_best_candidate(candidate_results, "maximize", "grid")
-    best = hpo.best
-    final_epoch = half_up_median_epoch(best.best_epochs)
-    final_parameters = dict(best.parameters)
-    final_config = apply_candidate_overrides(config["model"], final_parameters, names)
-    final_seed = derive_seed(
-        int(config["seed"]),
-        outer_fold,
-        best.candidate_id,
-        999,
-    )
-    final_config["random_seed"] = final_seed
-    outer_train, outer_test, final_schema = benchmark.load_multi_trait_fold(
-        names,
-        outer_fold,
-        None,
-        block_length=block_length,
-        expected_variants=global_variants,
-    )
-    variant_schema = final_schema
-    final_result = train_model(
-        outer_train.genotypes,
-        outer_train.processed_targets,
-        None,
-        None,
-        final_config,
-        final_parameters,
-        device,
-        final_seed,
-        max_epochs=final_epoch,
-        patience=final_epoch,
-        fixed_epochs=final_epoch,
-        train_mask=outer_train.observed_mask,
-        trait_names=names,
-        metrics_log_path=(
-            fold_path / "outer_refit" / "metrics.jsonl" if live_metrics_log else None
-        ),
-    )
-    predictions, observed, test_loss = predict_model(
-        final_result.state_dict,
-        outer_test.genotypes,
-        outer_test.processed_targets,
-        final_config,
-        final_parameters,
-        device,
-        outer_test.observed_mask,
-    )
-    predictions_original = benchmark.inverse_selected_traits(
-        predictions,
-        observed,
-        names,
-        outer_fold,
-    )
-    processed_metrics = evaluate_regression(
-        predictions,
-        outer_test.processed_targets,
-        observed,
-        names,
-    ).metrics
-    original_metrics = evaluate_regression(
-        predictions_original,
-        outer_test.raw_targets,
-        observed,
-        names,
-    ).metrics
-    checkpoint = {
-        "state_dict": final_result.state_dict,
-        "config": final_config,
-        "parameters": final_parameters,
-        "traits": list(names),
-        "outer_fold": outer_fold,
-        "final_epoch": final_epoch,
-        "training_seed": final_seed,
-        "retained_variants": outer_train.variants,
-    }
-    torch.save(checkpoint, fold_path / "best_model.ckpt")
-    with (fold_path / "config.yaml").open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(
-            {
-                "model": final_config,
-                "optimizer": final_parameters,
-                "training": config["training"],
-                "budget": dict(budget),
-                "traits": list(names),
-            },
-            handle,
-            sort_keys=False,
+    inner_audit = tuple(
+        audits.get(
+            inner_fold,
+            {"inner_fold": inner_fold, "recovered_from_metrics_logs": True},
         )
-    shutil.copy2(
-        benchmark.resolve_fold_paths(outer_fold).preprocessing,
-        fold_path / "preprocessing.json",
+        for inner_fold in context.inner_folds
     )
-    write_json(
-        fold_path / "hpo_results.json",
-        {
-            "method": hpo.method,
-            "direction": hpo.direction,
-            "best_candidate_id": best.candidate_id,
-            "best_parameters": best.parameters,
-            "best_valid_pearson_mean": best.objective,
-            "final_epoch": final_epoch,
-            "candidates": [serialize_candidate(item) for item in candidate_results],
-            "actual_budget": dict(budget),
-        },
-    )
-    metrics = {
-        "normalized": processed_metrics,
-        "original": original_metrics,
-        "test_loss": test_loss,
-    }
-    write_json(fold_path / "metrics.json", metrics)
-    write_json(
-        fold_path / "training_history.json",
-        {**histories, "outer_refit": list(final_result.history)},
-    )
-    write_json(
-        fold_path / "sample_audit.json",
-        {
-            "outer": {
-                **build_sample_audit(outer_train, outer_test, held_out_name="test"),
-                "train_observations_per_trait": _observation_counts(outer_train),
-                "test_observations_per_trait": _observation_counts(outer_test),
-            },
-            "inner_folds": inner_audit,
-        },
-    )
-    write_json(fold_path / "variant_schema.json", variant_schema)
-    for trait_name in names:
-        _write_trait_predictions(
-            fold_path / f"predictions_{trait_name}_original_scale.csv",
-            outer_test,
-            predictions,
-            predictions_original,
-            trait_name,
-            outer_fold,
-        )
-        trait_fold = output_directory / trait_name / f"fold_{outer_fold}"
-        trait_fold.mkdir(parents=True, exist_ok=True)
-        write_json(trait_fold / "metrics.json", _slice_metrics(metrics, trait_name))
-        _write_trait_predictions(
-            trait_fold / "predictions_original_scale.csv",
-            outer_test,
-            predictions,
-            predictions_original,
-            trait_name,
-            outer_fold,
-        )
-    runtime = {
-        "elapsed_seconds": time.time() - started,
-        "device": str(device),
-        "training_seed": final_seed,
-        "actual_budget": dict(budget),
-        "outer_test_evaluations": 1,
-        "traits": list(names),
-    }
-    write_json(fold_path / "runtime.json", runtime)
     return {
-        "outer_fold": outer_fold,
-        "traits": list(names),
-        "best_candidate_id": best.candidate_id,
-        "best_parameters": best.parameters,
-        "best_valid_pearson_mean": best.objective,
-        "final_epoch": final_epoch,
-        "metrics": sanitize_json(metrics),
-        "runtime": runtime,
+        "hpo": hpo,
+        "candidate_results": tuple(candidate_results),
+        "histories": histories,
+        "inner_audit": inner_audit,
+        "variant_schema": variant_schema,
     }
 
 
-def _run_outer_fold(
-    job: OuterFoldJob,
+def _run_outer_refit_job(
+    job: OuterRefitJob,
     device_name: str,
-    context: OuterFoldContext,
+    context: WorkerContext,
 ) -> dict[str, Any]:
-    thread_limiter = threadpool_limits(limits=1)
-    torch.set_num_threads(1)
+    limiter = _limit_worker_threads()
     try:
-        torch.set_num_interop_threads(1)
-    except RuntimeError:
-        pass
-    device = torch.device(device_name)
-    if device.type == "cuda":
-        configure_cuda_runtime(device_name, deterministic=False)
-    benchmark = WhispererPreparedBenchmark(Path(context.data_directory))
-    print(
-        f"[INFO] traits={list(context.trait_names)} outer_fold={job.outer_fold} "
-        f"candidates={len(context.candidates)} "
-        f"inner_folds={len(context.inner_folds)} device={device}",
-        flush=True,
-    )
-    result = run_outer_fold(
-        benchmark,
-        Path(context.output_directory),
-        context.trait_names,
-        job.outer_fold,
-        context.config,
-        context.candidates,
-        context.inner_folds,
-        device,
-        context.max_epochs,
-        context.budget,
-        context.live_metrics_log,
-        context.resume,
-    )
-    thread_limiter.restore_original_limits()
-    return result
+        device = torch.device(device_name)
+        if device.type == "cuda":
+            configure_cuda_runtime(device_name, deterministic=False)
+        names = tuple(context.trait_names)
+        output_directory = Path(context.output_directory)
+        fold_path = output_directory / f"fold_{job.outer_fold}"
+        fold_path.mkdir(parents=True, exist_ok=True)
+        final_parameters = dict(job.best_parameters)
+        final_config = apply_candidate_overrides(
+            context.config["model"],
+            final_parameters,
+            names,
+        )
+        final_seed = derive_seed(
+            int(context.config["seed"]),
+            job.outer_fold,
+            job.best_candidate_id,
+            999,
+        )
+        final_config["random_seed"] = final_seed
+        expected_variants = None
+        if job.variant_schema is not None:
+            expected_variants = tuple(
+                tuple(value) for value in job.variant_schema["variants"]
+            )
+        benchmark = WhispererPreparedBenchmark(Path(context.data_directory))
+        print(
+            f"[INFO] traits={list(names)} outer_fold={job.outer_fold} "
+            f"outer_refit candidate={job.best_candidate_id} "
+            f"final_epoch={job.final_epoch} device={device}",
+            flush=True,
+        )
+        outer_train, outer_test, variant_schema = benchmark.load_multi_trait_fold(
+            names,
+            job.outer_fold,
+            None,
+            block_length=int(context.config["model"]["embedding"]["Block_length"]),
+            expected_variants=expected_variants,
+        )
+        final_result = train_model(
+            outer_train.genotypes,
+            outer_train.processed_targets,
+            None,
+            None,
+            final_config,
+            final_parameters,
+            device,
+            final_seed,
+            max_epochs=job.final_epoch,
+            patience=job.final_epoch,
+            fixed_epochs=job.final_epoch,
+            train_mask=outer_train.observed_mask,
+            trait_names=names,
+            metrics_log_path=(
+                fold_path / "outer_refit" / "metrics.jsonl"
+                if context.live_metrics_log
+                else None
+            ),
+        )
+        predictions, observed, test_loss = predict_model(
+            final_result.state_dict,
+            outer_test.genotypes,
+            outer_test.processed_targets,
+            final_config,
+            final_parameters,
+            device,
+            outer_test.observed_mask,
+        )
+        predictions_original = benchmark.inverse_selected_traits(
+            predictions,
+            observed,
+            names,
+            job.outer_fold,
+        )
+        processed_metrics = evaluate_regression(
+            predictions,
+            outer_test.processed_targets,
+            observed,
+            names,
+        ).metrics
+        original_metrics = evaluate_regression(
+            predictions_original,
+            outer_test.raw_targets,
+            observed,
+            names,
+        ).metrics
+        checkpoint = {
+            "state_dict": final_result.state_dict,
+            "config": final_config,
+            "parameters": final_parameters,
+            "traits": list(names),
+            "outer_fold": job.outer_fold,
+            "final_epoch": job.final_epoch,
+            "training_seed": final_seed,
+            "retained_variants": outer_train.variants,
+        }
+        torch.save(checkpoint, fold_path / "best_model.ckpt")
+        with (fold_path / "config.yaml").open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(
+                {
+                    "model": final_config,
+                    "optimizer": final_parameters,
+                    "training": context.config["training"],
+                    "budget": dict(context.budget),
+                    "traits": list(names),
+                },
+                handle,
+                sort_keys=False,
+            )
+        shutil.copy2(
+            benchmark.resolve_fold_paths(job.outer_fold).preprocessing,
+            fold_path / "preprocessing.json",
+        )
+        write_json(
+            fold_path / "hpo_results.json",
+            {
+                "method": "grid",
+                "direction": "maximize",
+                "best_candidate_id": job.best_candidate_id,
+                "best_parameters": job.best_parameters,
+                "best_valid_pearson_mean": job.best_valid_pearson_mean,
+                "final_epoch": job.final_epoch,
+                "candidates": [
+                    serialize_candidate(item) for item in job.candidate_results
+                ],
+                "actual_budget": dict(context.budget),
+            },
+        )
+        metrics = {
+            "normalized": processed_metrics,
+            "original": original_metrics,
+            "test_loss": test_loss,
+        }
+        write_json(fold_path / "metrics.json", metrics)
+        write_json(
+            fold_path / "training_history.json",
+            {**job.histories, "outer_refit": list(final_result.history)},
+        )
+        write_json(
+            fold_path / "sample_audit.json",
+            {
+                "outer": {
+                    **build_sample_audit(outer_train, outer_test, held_out_name="test"),
+                    "train_observations_per_trait": _observation_counts(outer_train),
+                    "test_observations_per_trait": _observation_counts(outer_test),
+                },
+                "inner_folds": list(job.inner_audit),
+            },
+        )
+        write_json(fold_path / "variant_schema.json", variant_schema)
+        for trait_name in names:
+            _write_trait_predictions(
+                fold_path / f"predictions_{trait_name}_original_scale.csv",
+                outer_test,
+                predictions,
+                predictions_original,
+                trait_name,
+                job.outer_fold,
+            )
+            trait_fold = output_directory / trait_name / f"fold_{job.outer_fold}"
+            trait_fold.mkdir(parents=True, exist_ok=True)
+            write_json(trait_fold / "metrics.json", _slice_metrics(metrics, trait_name))
+            _write_trait_predictions(
+                trait_fold / "predictions_original_scale.csv",
+                outer_test,
+                predictions,
+                predictions_original,
+                trait_name,
+                job.outer_fold,
+            )
+        runtime = {
+            "elapsed_seconds": time.time() - job.started,
+            "device": str(device),
+            "training_seed": final_seed,
+            "actual_budget": dict(context.budget),
+            "outer_test_evaluations": 1,
+            "traits": list(names),
+        }
+        write_json(fold_path / "runtime.json", runtime)
+        return {
+            "outer_fold": job.outer_fold,
+            "traits": list(names),
+            "best_candidate_id": job.best_candidate_id,
+            "best_parameters": job.best_parameters,
+            "best_valid_pearson_mean": job.best_valid_pearson_mean,
+            "final_epoch": job.final_epoch,
+            "metrics": sanitize_json(metrics),
+            "runtime": runtime,
+        }
+    finally:
+        limiter.restore_original_limits()
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -826,11 +901,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 f"[INFO] outer_fold={outer_fold} recovered completed fold",
                 flush=True,
             )
-    jobs = [
-        OuterFoldJob(job_id=fold_index, outer_fold=outer_fold)
-        for fold_index, outer_fold in enumerate(pending_outer_folds)
-    ]
-    worker_context = OuterFoldContext(
+    worker_context = WorkerContext(
         data_directory=str(data_directory),
         output_directory=str(output_directory),
         config=config,
@@ -842,9 +913,58 @@ def main(argv: Sequence[str] | None = None) -> None:
         live_metrics_log=args.live_metrics_log,
         resume=not args.overwrite,
     )
+    inner_jobs = _build_inner_hpo_jobs(
+        pending_outer_folds,
+        len(candidates),
+        inner_folds,
+    )
+    print(
+        f"[INFO] traits={list(traits)} outer_folds={pending_outer_folds} "
+        f"candidates={len(candidates)} inner_folds={inner_folds} "
+        f"inner_hpo_jobs={len(inner_jobs)} gpus={gpu_ids or ['cpu']} "
+        f"jobs_per_gpu={args.jobs_per_gpu}",
+        flush=True,
+    )
+    fold_started = {outer_fold: time.time() for outer_fold in pending_outer_folds}
+    inner_payloads = [
+        work_result.value
+        for work_result in execute_gpu_jobs(
+            inner_jobs,
+            _run_inner_hpo_job,
+            worker_gpu_ids,
+            worker_args=(worker_context,),
+            raise_on_error=True,
+        )
+    ]
+    refit_jobs = []
+    for outer_fold in pending_outer_folds:
+        assembled = _assemble_outer_hpo(inner_payloads, worker_context, outer_fold)
+        best = assembled["hpo"].best
+        refit_jobs.append(
+            OuterRefitJob(
+                job_id=_outer_refit_job_id(outer_fold),
+                outer_fold=int(outer_fold),
+                started=fold_started[outer_fold],
+                best_candidate_id=int(best.candidate_id),
+                best_parameters=dict(best.parameters),
+                final_epoch=half_up_median_epoch(best.best_epochs),
+                best_valid_pearson_mean=float(best.objective),
+                candidate_results=assembled["candidate_results"],
+                histories=assembled["histories"],
+                inner_audit=assembled["inner_audit"],
+                variant_schema=assembled["variant_schema"],
+            )
+        )
+        print(
+            f"[INFO] outer_fold={outer_fold} HPO complete "
+            f"best_candidate={best.candidate_id} "
+            f"best_valid_pearson_mean={best.objective:.6f} "
+            f"final_epoch={half_up_median_epoch(best.best_epochs)}",
+            flush=True,
+        )
     work_results = execute_gpu_jobs(
-        jobs,
-        _run_outer_fold,
+        refit_jobs,
+        _run_outer_refit_job,
         worker_gpu_ids,
         worker_args=(worker_context,),
         raise_on_error=True,

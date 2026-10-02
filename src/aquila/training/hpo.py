@@ -124,6 +124,40 @@ def set_config_path(config: Dict[str, Any], path: str, value: Any) -> None:
         current[final] = value
 
 
+_BRANCH_DROPOUT_KEYS = {
+    "snp_dropout": "snp",
+    "indel_dropout": "indel",
+    "sv_dropout": "sv",
+}
+
+
+def _apply_branch_dropout(merged: Dict[str, Any], branch_name: str, value: Any) -> None:
+    """Write one dropout onto every embedder and trunk block of one branch.
+
+    Fusion and the regression head stay untouched. Those are shared across
+    input types, so a per-type dropout must not overwrite them.
+    """
+    branches = merged.get("train", {}).get("branches", {})
+    branch = branches.get(branch_name) if isinstance(branches, dict) else None
+    if not isinstance(branch, dict):
+        raise KeyError(
+            f"{branch_name}_dropout requires train.branches.{branch_name}"
+        )
+    dropout = copy.deepcopy(value)
+    embedder = branch.get("embedder", branch.get("embedding"))
+    embedder_blocks = (
+        embedder
+        if isinstance(embedder, list)
+        else [embedder] if isinstance(embedder, dict) else []
+    )
+    for block in embedder_blocks:
+        if isinstance(block, dict):
+            block["dropout"] = dropout
+    for block in branch.get("trunk") or []:
+        if isinstance(block, dict):
+            block["dropout"] = dropout
+
+
 def merge_config(
     base_config: Mapping[str, Any],
     parameters: Mapping[str, Any],
@@ -133,6 +167,9 @@ def merge_config(
     ``branches_downconv_kernel_size`` is a grouped Aquila-Vars parameter:
     it sets the global down-convolution kernel fallback. A branch-local
     ``kernel_size`` remains authoritative and is not overwritten.
+
+    ``snp_dropout``, ``indel_dropout``, and ``sv_dropout`` write that dropout
+    onto every embedder and trunk block of the named branch.
     """
     merged = copy.deepcopy(dict(base_config))
     for path, value in parameters.items():
@@ -144,6 +181,9 @@ def merge_config(
                 )
             model = merged.setdefault("model", {})
             model["downconv_kernel_size"] = copy.deepcopy(value)
+            continue
+        if path in _BRANCH_DROPOUT_KEYS:
+            _apply_branch_dropout(merged, _BRANCH_DROPOUT_KEYS[path], value)
             continue
         set_config_path(merged, str(path), copy.deepcopy(value))
     return merged

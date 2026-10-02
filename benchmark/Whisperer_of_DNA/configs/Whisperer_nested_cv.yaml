@@ -4,7 +4,7 @@ model_config: ../training/config/model_config.json
 training:
   max_epochs: 100
   patience: 40
-  batch_size: 32
+  batch_size: 16
 
 hpo:
   method: grid

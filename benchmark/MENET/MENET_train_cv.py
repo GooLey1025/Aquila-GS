@@ -1000,6 +1000,150 @@ FOLD_OUTPUT_FILES = (
 )
 
 
+def _normalize_original_value(
+    value: float,
+    parameters: Mapping[str, Any],
+) -> float:
+    """Map one original-scale phenotype back onto the training scale."""
+
+    transformed = float(value)
+    if bool(parameters.get("use_log1p", False)):
+        transformed = math.log1p(
+            transformed + float(parameters.get("log_shift", 0.0))
+        )
+    std = float(parameters.get("std", 1.0))
+    if not math.isfinite(std) or std == 0.0:
+        std = 1.0
+    return (transformed - float(parameters.get("mean", 0.0))) / std
+
+
+def _preprocessing_by_name(path: Path) -> dict[str, Mapping[str, Any]]:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    traits = payload.get("traits")
+    if not isinstance(traits, list):
+        raise ValueError(f"Missing preprocessing traits in {path}")
+    return {
+        str(item["name"]): item
+        for item in traits
+        if isinstance(item, dict) and item.get("name") is not None
+    }
+
+
+def _finite_pearson(predicted: np.ndarray, observed: np.ndarray) -> float | None:
+    if predicted.size < 2:
+        return None
+    if float(np.std(predicted)) <= 0.0 or float(np.std(observed)) <= 0.0:
+        return None
+    value = float(np.corrcoef(predicted, observed)[0, 1])
+    return value if math.isfinite(value) else None
+
+
+def collect_within_accession(output_directory: Path) -> dict[str, Any]:
+    """Mean within-accession Pearson r on the normalized phenotype scale.
+
+    Each MENET job evaluates one trait, so this correlation is undefined in a
+    single trait's metrics. It compares an accession's predicted and observed
+    trait vectors after those traits have been saved.
+    """
+
+    records: list[tuple[int, str, str, float, float]] = []
+    traits_found: set[str] = set()
+    for trait_dir in sorted(path for path in output_directory.iterdir() if path.is_dir()):
+        for fold_dir in sorted(trait_dir.glob("fold_*")):
+            prediction_path = fold_dir / "predictions_original_scale.csv"
+            preprocessing_path = fold_dir / "preprocessing.json"
+            if not prediction_path.is_file() or not preprocessing_path.is_file():
+                continue
+            try:
+                outer_fold = int(fold_dir.name.removeprefix("fold_"))
+            except ValueError:
+                continue
+            parameters = _preprocessing_by_name(preprocessing_path).get(trait_dir.name)
+            if parameters is None:
+                continue
+            traits_found.add(trait_dir.name)
+            with prediction_path.open("r", encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    try:
+                        predicted = _normalize_original_value(
+                            float(row["Prediction"]),
+                            parameters,
+                        )
+                        observed = _normalize_original_value(
+                            float(row["Observed"]),
+                            parameters,
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if not math.isfinite(predicted) or not math.isfinite(observed):
+                        continue
+                    sample_id = str(row.get("SampleID", row.get("sample_id", "")))
+                    records.append(
+                        (outer_fold, sample_id, trait_dir.name, predicted, observed)
+                    )
+
+    grouped: dict[tuple[int, str], list[tuple[float, float]]] = {}
+    seen: set[tuple[int, str, str]] = set()
+    for outer_fold, sample_id, trait_name, predicted, observed in records:
+        key = (outer_fold, sample_id, trait_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        grouped.setdefault((outer_fold, sample_id), []).append((predicted, observed))
+
+    fold_values: dict[int, list[float]] = {}
+    for (outer_fold, _sample_id), pairs in grouped.items():
+        predicted = np.asarray([item[0] for item in pairs], dtype=float)
+        observed = np.asarray([item[1] for item in pairs], dtype=float)
+        correlation = _finite_pearson(predicted, observed)
+        if correlation is None:
+            continue
+        fold_values.setdefault(outer_fold, []).append(correlation)
+
+    folds = []
+    all_values: list[float] = []
+    for outer_fold in sorted(fold_values):
+        values = fold_values[outer_fold]
+        all_values.extend(values)
+        folds.append(
+            {
+                "outer_fold": outer_fold,
+                "within_accession_pearson_r": float(np.mean(values)),
+                "n_accessions": len(values),
+            }
+        )
+    return {
+        "scale": "normalized",
+        "within_accession_pearson_r": (
+            float(np.mean(all_values)) if all_values else None
+        ),
+        "n_accessions": len(all_values),
+        "traits_found": len(traits_found),
+        "folds": folds,
+    }
+
+
+def write_within_accession_report(output_directory: Path) -> dict[str, Any]:
+    """Save the cross-trait within-accession metric beside a MENET run."""
+
+    report = collect_within_accession(output_directory)
+    with (output_directory / "within_accession_pearson.json").open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(report, handle, indent=2)
+    summary_path = output_directory / "summary.json"
+    if summary_path.is_file():
+        with summary_path.open("r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+        if isinstance(summary, dict):
+            summary["within_accession_pearson"] = report
+            with summary_path.open("w", encoding="utf-8") as handle:
+                json.dump(summary, handle, indent=2, allow_nan=True)
+    return report
+
+
 def load_completed_fold_summary(
     output_directory: Path,
     trait_name: str,
@@ -1489,8 +1633,9 @@ def main() -> None:
     args = parse_args()
     from aquila.training.distributed import detect_gpu_ids, execute_gpu_jobs
 
-    data_directory = Path(args.data_dir).resolve()
     output_directory = Path(args.output_dir).resolve()
+
+    data_directory = Path(args.data_dir).resolve()
     if output_directory.exists() and any(output_directory.iterdir()):
         if args.overwrite:
             import shutil
@@ -1596,6 +1741,16 @@ def main() -> None:
             indent=2,
             allow_nan=True,
         )
+    report = write_within_accession_report(output_directory)
+    pooled = report["within_accession_pearson_r"]
+    pooled_text = f"{pooled:.4f}" if isinstance(pooled, float) else "NA"
+    print(
+        "[INFO] Within-accession Pearson "
+        f"r={pooled_text} n={report['n_accessions']} "
+        f"traits={report['traits_found']} "
+        f"-> {output_directory / 'within_accession_pearson.json'}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
