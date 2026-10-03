@@ -15,10 +15,14 @@ Usage:
                             --output predictions.tsv
 
     # Or with direct paths:
-    python aquila_predict.py --checkpoint path/to/best_checkpoint.pt \
-                            --config path/to/params.yaml \
+    python aquila_predict.py --checkpoint path/to/best_model.pt \
+                            --config path/to/config.yaml \
                             --vcf path/to/test.vcf \
                             --output predictions.tsv
+
+The VCF is the only required genotype input. Markers are filtered with the
+checkpoint ID prefix and aligned to the training marker list, so a VCF may
+contain extra samples, SNPs, indels, or SVs.
 """
 
 import argparse
@@ -120,6 +124,14 @@ def parse_args():
         default=None,
         choices=['token', 'diploid_onehot', 'onehot', 'snp_vcf', 'indel_vcf', 'sv_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf'],
         help='Encoding type for VCF parsing (default: read from config file)'
+    )
+
+    parser.add_argument(
+        '--id-prefix',
+        type=str,
+        default=None,
+        help='Keep VCF IDs with this prefix, e.g. "SNP-". '
+             'Default: prefix stored in the checkpoint.'
     )
 
     parser.add_argument(
@@ -308,7 +320,8 @@ def load_vcf_data(
     vcf_path: str,
     encoding_type: str,
     config: dict,
-    include_marker_ids: bool = False
+    include_marker_ids: bool = False,
+    id_prefix: Optional[str] = None,
 ) -> Tuple:
     """
     Load and encode VCF data.
@@ -329,11 +342,15 @@ def load_vcf_data(
     print(f"  Encoding type: {encoding_type}")
     print(f"  Variant type: {variant_type}")
     print(f"  Multi-branch: {is_multi_branch}")
+    if id_prefix:
+        print(f"  ID prefix: {id_prefix}")
     
     # Parse genotype with encoding
     if is_multi_branch:
         # Multi-branch: returns dict
-        variant_data = parse_genotype_file(vcf_path, encoding_type, variant_type)
+        variant_data = parse_genotype_file(
+            vcf_path, encoding_type, variant_type, id_prefix=id_prefix
+        )
 
         # Extract sample IDs from first variant type
         first_variant_type = list(variant_data.keys())[0]
@@ -356,7 +373,9 @@ def load_vcf_data(
                 variant_tensors[vtype] = torch.from_numpy(arr).long()
     else:
         # Single-branch
-        result = parse_genotype_file(vcf_path, encoding_type, variant_type)
+        result = parse_genotype_file(
+            vcf_path, encoding_type, variant_type, id_prefix=id_prefix
+        )
         # Handle both new dict format and old tuple format for backward compat
         if isinstance(result, dict):
             snp_matrix = result['matrix']
@@ -475,6 +494,71 @@ def validate_genotype_metadata(
         raise ValueError("Marker IDs or order mismatch")
 
     print("  Marker IDs and order match checkpoint metadata")
+
+
+def _expected_marker_list(metadata: Dict[str, Any], branch: Optional[str] = None):
+    """Return the training marker IDs for one branch, if the checkpoint has them."""
+    expected_ids = _metadata_value(metadata, 'marker_ids', 'variant_ids')
+    if expected_ids is None:
+        return None
+    if isinstance(expected_ids, dict):
+        if branch is not None:
+            expected = _branch_value(expected_ids, branch)
+            if expected is not None:
+                return [str(marker) for marker in expected]
+        if len(expected_ids) == 1:
+            return [str(marker) for marker in next(iter(expected_ids.values()))]
+        return None
+    return [str(marker) for marker in expected_ids]
+
+
+def _align_marker_matrix(matrix, marker_ids, expected: List[str]):
+    """Subset and reorder encoded markers to the training marker list."""
+    actual = [str(marker) for marker in marker_ids]
+    if actual == expected:
+        return matrix, actual
+    index = {marker: position for position, marker in enumerate(actual)}
+    missing = [marker for marker in expected if marker not in index]
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise ValueError(
+            f"{len(missing)} training markers are missing from the VCF "
+            f"(examples: {preview})"
+        )
+    order = [index[marker] for marker in expected]
+    aligned = matrix[:, order]
+    extra = len(actual) - len(expected)
+    print(
+        f"  Aligned input to {len(expected)} checkpoint markers"
+        + (f" ({extra} extra input markers ignored)" if extra else "")
+    )
+    return aligned, expected
+
+
+def align_variants_to_checkpoint(variant_data, marker_ids, seq_length, metadata):
+    """Drop extra VCF markers and put the remaining ones in training order."""
+    if isinstance(marker_ids, dict):
+        aligned_ids = {}
+        aligned_lengths = {}
+        for branch, branch_ids in marker_ids.items():
+            expected = _expected_marker_list(metadata, branch)
+            if expected is None:
+                aligned_ids[branch] = branch_ids
+                aligned_lengths[branch] = seq_length[branch]
+                continue
+            variant_data[branch], aligned_ids[branch] = _align_marker_matrix(
+                variant_data[branch], branch_ids, expected
+            )
+            aligned_lengths[branch] = len(aligned_ids[branch])
+        return variant_data, aligned_ids, aligned_lengths
+
+    expected = _expected_marker_list(metadata)
+    if expected is None:
+        return variant_data, marker_ids, seq_length
+    variant_data, marker_ids = _align_marker_matrix(
+        variant_data, marker_ids, expected
+    )
+    return variant_data, marker_ids, len(marker_ids)
 
 
 def load_normalization_stats(
@@ -906,10 +990,21 @@ def main():
         config['data'] = dict(config.get('data', {}))
         config['data']['variant_type'] = variant_type
     is_multi_branch = encoding_type in ['snp_indel_vcf', 'snp_indel_sv_vcf'] or variant_type in ['snp_indel', 'snp_indel_sv']
+
+    id_prefix = args.id_prefix
+    if not id_prefix:
+        stored_prefix = _metadata_value(metadata, 'id_prefix')
+        if isinstance(stored_prefix, (list, tuple)):
+            id_prefix = " | ".join(str(prefix) for prefix in stored_prefix)
+        elif stored_prefix:
+            id_prefix = str(stored_prefix)
     
     # Load VCF data
     variant_data, sample_ids, seq_length, marker_ids = load_vcf_data(
-        vcf_path, encoding_type, config, include_marker_ids=True
+        vcf_path, encoding_type, config, include_marker_ids=True, id_prefix=id_prefix
+    )
+    variant_data, marker_ids, seq_length = align_variants_to_checkpoint(
+        variant_data, marker_ids, seq_length, metadata
     )
     validate_genotype_metadata(seq_length, marker_ids, metadata)
     

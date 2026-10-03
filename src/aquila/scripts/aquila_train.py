@@ -262,13 +262,22 @@ def save_postprocess_data(
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Train Aquila model with VCF input')
+        description='Train Aquila model with VCF input or a prepared dataset')
 
     parser.add_argument(
         '--config',
         type=str,
         required=True,
         help='Path to configuration YAML file'
+    )
+    parser.add_argument(
+        '--data-dir',
+        type=str,
+        default=None,
+        help=(
+            'Prepared dataset from aquila-data-cv-production. '
+            'Trains one full-data model from --config using --seed.'
+        ),
     )
 
     parser.add_argument(
@@ -419,6 +428,27 @@ def parse_args():
         action='store_true',
         help='Save postprocessed genotype and normalized phenotype data for benchmark models (saved to output_dir/data_postprocess/)'
     )
+    parser.add_argument(
+        '--precision',
+        choices=('bf16', 'fp32', 'float32'),
+        default='bf16',
+        help='Training precision when --data-dir is set (default: bf16).'
+    )
+    parser.add_argument(
+        '--live-metrics-log',
+        action='store_true',
+        help='Write per-epoch metrics JSONL when --data-dir is set.'
+    )
+    parser.add_argument(
+        '--use-deterministic',
+        action='store_true',
+        help='Force deterministic CUDA algorithms when --data-dir is set.'
+    )
+    parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        help='Replace an existing --output directory when --data-dir is set.'
+    )
 
     return parser.parse_args()
 
@@ -427,6 +457,22 @@ def main():
     """Main training function."""
     # Parse arguments
     args = parse_args()
+    if args.data_dir:
+        from aquila.scripts.aquila_train_cv_production import train_prepared_model
+
+        output_dir = args.output or f"outputs/seed_{args.seed}"
+        train_prepared_model(
+            data_dir=args.data_dir,
+            config_path=args.config,
+            output_dir=output_dir,
+            seed=args.seed,
+            precision=args.precision,
+            live_metrics_log=args.live_metrics_log,
+            use_deterministic=args.use_deterministic,
+            overwrite=args.overwrite,
+            device=args.device,
+        )
+        return
 
     # Detect distributed training (launched by torchrun)
     is_distributed = False

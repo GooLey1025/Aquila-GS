@@ -254,6 +254,7 @@ class NestedCVTrainer:
         *,
         epochs: int,
         scheduler_epochs: int | None = None,
+        metrics_log_path: str | Path | None = None,
     ) -> TrainingResult:
         """Train for ``epochs`` while preserving the source LR schedule horizon.
 
@@ -269,15 +270,17 @@ class NestedCVTrainer:
         if schedule_horizon < int(epochs):
             raise ValueError("scheduler_epochs must be greater than or equal to epochs")
         self._configure_scheduler(train_loader, num_epochs=schedule_horizon)
+        log_path = Path(metrics_log_path) if metrics_log_path else None
         history = []
         for epoch in range(1, int(epochs) + 1):
-            history.append(
-                {
-                    "epoch": epoch,
-                    "train_loss": self._train_epoch(train_loader),
-                    "learning_rate": self._current_lr(),
-                }
-            )
+            row = {
+                "epoch": epoch,
+                "train_loss": self._train_epoch(train_loader),
+                "learning_rate": self._current_lr(),
+                "seed": getattr(self, "seed", None),
+            }
+            history.append(row)
+            _append_metrics_log(log_path, row)
         state = _cpu_state_dict(self.model)
         metrics: Dict[str, Any] = {"train_loss": history[-1]["train_loss"]}
         return TrainingResult(

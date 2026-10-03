@@ -29,6 +29,30 @@ aquila_train_cv_production.py \
   --precision bf16 --live-metrics-log \
   --use-deterministic --overwrite
 
+./aquila_export_locked_config.py \
+  --summary results/655rice.r2_0.045.aquila-snp/summary.json \
+  -o 655rice.r2_0.045.aquila-snp.locked.yaml
+
+for seed in $(seq 43 51); do
+  aquila_train.py \
+    --data-dir 655rice.r2_0.045.aquila-snp.production.data \
+    --config 655rice.r2_0.045.aquila-snp.locked.yaml \
+    --seed "$seed" \
+    -o "results/655rice.r2_0.045.aquila-snp/seeds/seed_${seed}" \
+    --precision bf16 \
+    --live-metrics-log \
+    --use-deterministic
+done
+
+# rrBLUP: same production protocol on the Aquila-SNP full reference set.
+# Five folds select the grid point; the saved model is refit on every sample.
+python rrBLUP/rrblup_production.py \
+  --data-dir 655rice.r2_0.045.aquila-snp.production.data \
+  --config rrBLUP/configs/production.yaml \
+  -o results/655rice.r2_0.045.rrblup \
+  --overwrite
+
+
 # For Aquila-Vars
 aquila_data_cv_production.py \
   --vcf 655rice.r2_0.045.panel.vcf.gz \
@@ -46,3 +70,5 @@ aquila_train_cv_production.py \
   --live-metrics-log \
   --use-deterministic \
   --overwrite
+
+# For rrBLUP
