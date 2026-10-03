@@ -5,7 +5,7 @@ data:
   max_features: 3000
 
 model:
-  hidden_dims: [32, 16, 8]
+  hidden_dims: [32]
   activation: relu
 
 prior:
@@ -35,11 +35,10 @@ hpo:
   direction: maximize
   parameters:
     data.lasso_alpha:
-      values: [0.0001, 0.001]
+      values: [0.001]
     model.hidden_dims:
       values:
-        - [32, 16, 8]
-        - [128, 64]
+        - [32]
     prior.pi:
       values: [0.25, 0.5]
     prior.sigma2:

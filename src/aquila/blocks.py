@@ -4054,6 +4054,100 @@ class GatedFusionBlock(nn.Module):
         return fused
 
 
+class SNPPrimaryResidualFusionBlock(nn.Module):
+    """Keep SNP as the primary signal and gate INDEL/SV residual corrections."""
+
+    def __init__(
+        self,
+        fusion_dim,
+        branch_dims=None,
+        branch_names=("snp", "indel", "sv"),
+        dropout=0.1,
+        gate_init=-3.0,
+    ):
+        super().__init__()
+        if "snp" not in branch_names:
+            raise ValueError("SNP-primary fusion requires an 'snp' branch")
+
+        self.fusion_dim = int(fusion_dim)
+        self.branch_names = [str(name).lower() for name in branch_names]
+        if branch_dims is None:
+            branch_dims = [None] * len(self.branch_names)
+        if len(branch_dims) != len(self.branch_names):
+            raise ValueError("branch_dims and branch_names must have equal length")
+        self.projections = nn.ModuleDict(
+            {
+                name: (
+                    nn.LazyLinear(self.fusion_dim)
+                    if in_dim is None
+                    else nn.Linear(int(in_dim), self.fusion_dim)
+                )
+                for name, in_dim in zip(self.branch_names, branch_dims)
+            }
+        )
+        auxiliary_names = [name for name in self.branch_names if name != "snp"]
+        self.residuals = nn.ModuleDict()
+        self.gates = nn.ModuleDict()
+        for name in auxiliary_names:
+            self.residuals[name] = nn.Sequential(
+                nn.Linear(2 * self.fusion_dim, self.fusion_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.fusion_dim, self.fusion_dim),
+            )
+            gate = nn.Linear(2 * self.fusion_dim, 1)
+            nn.init.zeros_(gate.weight)
+            nn.init.constant_(gate.bias, float(gate_init))
+            self.gates[name] = gate
+
+        self.layer_norm = nn.LayerNorm(self.fusion_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def _pool(branch_out):
+        return branch_out.mean(dim=1) if branch_out.dim() == 3 else branch_out
+
+    def forward(self, branch_outputs, branch_names=None):
+        names = (
+            [str(name).lower() for name in branch_names]
+            if branch_names is not None
+            else self.branch_names
+        )
+        if len(names) != len(branch_outputs):
+            raise ValueError("branch_names and branch_outputs must have equal length")
+
+        projected = {
+            name: self.projections[name](self._pool(output))
+            for name, output in zip(names, branch_outputs)
+        }
+        primary = projected["snp"]
+        fused = primary
+        for name in self.branch_names:
+            if name == "snp" or name not in projected:
+                continue
+            context = torch.cat([primary, projected[name]], dim=-1)
+            gate = torch.sigmoid(self.gates[name](context))
+            fused = fused + gate * self.residuals[name](context)
+        return self.dropout(self.layer_norm(fused))
+
+
+def snp_primary_residual_fusion(
+    fusion_dim,
+    branch_dims=None,
+    branch_names=("snp", "indel", "sv"),
+    dropout=0.1,
+    gate_init=-3.0,
+    **kwargs,
+):
+    return SNPPrimaryResidualFusionBlock(
+        fusion_dim=fusion_dim,
+        branch_dims=branch_dims,
+        branch_names=branch_names,
+        dropout=dropout,
+        gate_init=gate_init,
+    )
+
+
 class CrossAttentionFusionBlock(nn.Module):
     """
     Cross-attention fusion block for inter-branch communication.
@@ -4618,6 +4712,7 @@ name_func = {
 
     # Fusion (Multi-Branch)
     'gated_fusion': gated_fusion,
+    'snp_primary_residual_fusion': snp_primary_residual_fusion,
     'cross_attention_fusion': cross_attention_fusion,
     'perceiver_cross_fusion': perceiver_cross_fusion,
 

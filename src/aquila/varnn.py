@@ -332,6 +332,7 @@ class MultiBranchNeuralNetwork(VariantsNeuralNetwork):
     def build_multi_branch_model(self):
         """Build multi-branch architecture from config."""
         branches_config = self.params.get('branches', {})
+        self.branch_names = list(branches_config.keys())
         
         # Build each branch
         self.branch_embedders = nn.ModuleDict()
@@ -444,7 +445,11 @@ class MultiBranchNeuralNetwork(VariantsNeuralNetwork):
         
         # Apply fusion
         # Convert dict to list in consistent order
-        branch_list = [branch_outputs[name] for name in sorted(branch_outputs.keys())]
+        branch_list = [
+            branch_outputs[name]
+            for name in self.branch_names
+            if name in branch_outputs
+        ]
         
         fused = branch_list[0]  # Start with first branch
         for fusion_block in self.fusion_blocks:
@@ -454,6 +459,9 @@ class MultiBranchNeuralNetwork(VariantsNeuralNetwork):
             elif isinstance(fusion_block, blocks.CrossAttentionFusionBlock):
                 # Cross-attention: pass all branches, uses which_branch_as_query to select
                 fused = fusion_block(*branch_list)
+            elif isinstance(fusion_block, blocks.SNPPrimaryResidualFusionBlock):
+                # Named SNP-primary residual fusion uses the configured branch order.
+                fused = fusion_block(branch_list, branch_names=self.branch_names)
             else:
                 # Generic fusion block
                 fused = fusion_block(fused)
@@ -502,7 +510,7 @@ def _apply_model_d_model(model_params: dict) -> None:
     }
     width_keys = ("in_channels", "out_channels", "d_model", "d_ff")
 
-    def _rewrite(block: dict) -> None:
+    def _rewrite(block: dict, width: int) -> None:
         name = str(block.get("name") or "")
         for key in width_keys:
             if block.get(key) == "d_model" and not (
@@ -529,15 +537,16 @@ def _apply_model_d_model(model_params: dict) -> None:
     )
     for block in blocks:
         if isinstance(block, dict):
-            _rewrite(block)
+            _rewrite(block, width)
     for block in model_params.get("trunk") or []:
         if isinstance(block, dict):
-            _rewrite(block)
+            _rewrite(block, width)
 
     # Aquila-Vars keeps architecture blocks under train.* in legacy configs;
     # create_model_from_config copies them into model_params before this helper
     # is called for multi-branch models.
     for branch in (model_params.get("branches") or {}).values():
+        branch_width = int(branch.get("d_model", width))
         branch_embedder = branch.get("embedder") or branch.get("embedding")
         branch_blocks = (
             branch_embedder
@@ -546,10 +555,10 @@ def _apply_model_d_model(model_params: dict) -> None:
         )
         for block in branch_blocks:
             if isinstance(block, dict):
-                _rewrite(block)
+                _rewrite(block, branch_width)
         for block in branch.get("trunk") or []:
             if isinstance(block, dict):
-                _rewrite(block)
+                _rewrite(block, branch_width)
 
     for block in model_params.get("fusion") or []:
         if isinstance(block, dict) and block.get("name") == "gated_fusion":
