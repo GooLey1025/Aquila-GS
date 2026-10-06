@@ -462,6 +462,20 @@ class MultiBranchNeuralNetwork(VariantsNeuralNetwork):
             elif isinstance(fusion_block, blocks.SNPPrimaryResidualFusionBlock):
                 # Named SNP-primary residual fusion uses the configured branch order.
                 fused = fusion_block(branch_list, branch_names=self.branch_names)
+            elif isinstance(
+                fusion_block,
+                (
+                    blocks.SNPGlobalGateFusionBlock,
+                    blocks.SNPVectorGateFusionBlock,
+                    blocks.HierarchicalAuxFusionBlock,
+                ),
+            ):
+                fused = fusion_block(branch_list, branch_names=self.branch_names)
+            elif isinstance(
+                fusion_block,
+                (blocks.EqualMeanFusionBlock, blocks.ConcatFusionBlock),
+            ):
+                fused = fusion_block(branch_list)
             else:
                 # Generic fusion block
                 fused = fusion_block(fused)

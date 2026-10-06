@@ -228,10 +228,15 @@ def dgu(out_dim=64, dropout=0.1, **kwargs):
 class TransformerBlock(nn.Module):
     """Single transformer encoder block."""
 
-    def __init__(self, d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1,
+                 attention_dropout=None, ffn_dropout=None, residual_dropout=None,
+                 activation='gelu',
                  use_rope=False, use_positional_encoding=False, positional_encoding_type='sinusoidal',
                  max_position=50000, **kwargs):
         super().__init__()
+        attention_dropout = dropout if attention_dropout is None else attention_dropout
+        ffn_dropout = dropout if ffn_dropout is None else ffn_dropout
+        residual_dropout = dropout if residual_dropout is None else residual_dropout
 
         # Positional encoding (applied before attention)
         self.use_positional_encoding = use_positional_encoding
@@ -258,18 +263,18 @@ class TransformerBlock(nn.Module):
         attn_normalize = str(kwargs.pop('attn_normalize', 'softmax'))
         if use_rope:
             self.attention = layers.MultiHeadSelfAttentionRoPE(
-                d_model, num_heads, dropout, attn_normalize=attn_normalize)
+                d_model, num_heads, attention_dropout, attn_normalize=attn_normalize)
         else:
             self.attention = layers.MultiHeadSelfAttention(
-                d_model, num_heads, dropout, attn_normalize=attn_normalize)
+                d_model, num_heads, attention_dropout, attn_normalize=attn_normalize)
         ffn_num_hidden_layers = int(kwargs.pop('ffn_num_hidden_layers', 1))
         self.ffn = layers.FeedForward(
-            d_model, d_ff, dropout, activation,
+            d_model, d_ff, ffn_dropout, activation,
             num_hidden_layers=ffn_num_hidden_layers)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(residual_dropout)
+        self.dropout2 = nn.Dropout(residual_dropout)
 
     def forward(self, x, mask=None):
         # Apply positional encoding before attention (if enabled)
@@ -414,7 +419,9 @@ class TransformerBlockTranspose(nn.Module):
         return x
 
 
-def transformer(d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
+def transformer(d_model, num_heads, d_ff, dropout=0.1,
+                attention_dropout=None, ffn_dropout=None, residual_dropout=None,
+                activation='gelu',
                 use_rope=False, use_positional_encoding=False, positional_encoding_type='sinusoidal',
                 max_position=50000, ffn_num_hidden_layers=1, attn_normalize='softmax', **kwargs):
     """Single transformer encoder block.
@@ -441,7 +448,11 @@ def transformer(d_model, num_heads, d_ff, dropout=0.1, activation='gelu',
         but both can be used together if desired.
     """
     return TransformerBlock(d_model=d_model, num_heads=num_heads, d_ff=d_ff,
-                            dropout=dropout, activation=activation, use_rope=use_rope,
+                            dropout=dropout,
+                            attention_dropout=attention_dropout,
+                            ffn_dropout=ffn_dropout,
+                            residual_dropout=residual_dropout,
+                            activation=activation, use_rope=use_rope,
                             use_positional_encoding=use_positional_encoding,
                             positional_encoding_type=positional_encoding_type,
                             max_position=max_position,
@@ -1143,10 +1154,14 @@ class TransformerBlockMQA(nn.Module):
     """Transformer block with Multi-Query Attention and RoPE."""
 
     def __init__(self, d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
-                 dropout=0.1, max_position=8192, norm_type='layer', activation='gelu',
+                 dropout=0.1, attention_dropout=None, ffn_dropout=None,
+                 residual_dropout=None, max_position=8192, norm_type='layer', activation='gelu',
                  use_rope=True, d_ff=None, **kwargs):
         super().__init__()
         hidden_ff = int(2 * d_model if d_ff is None else d_ff)
+        attention_dropout = dropout if attention_dropout is None else attention_dropout
+        ffn_dropout = dropout if ffn_dropout is None else ffn_dropout
+        residual_dropout = dropout if residual_dropout is None else residual_dropout
 
         # Choose normalization type
         if norm_type == 'rms':
@@ -1166,18 +1181,18 @@ class TransformerBlockMQA(nn.Module):
             num_query_heads=num_query_heads,
             qk_head_dim=qk_head_dim,
             v_head_dim=v_head_dim,
-            dropout=dropout,
+            dropout=attention_dropout,
             max_position=max_position,
             use_rope=use_rope
         )
 
         self.ffn = layers.FeedForward(
-            d_model, hidden_ff, dropout, activation,
+            d_model, hidden_ff, ffn_dropout, activation,
             num_hidden_layers=int(kwargs.pop("ffn_num_hidden_layers", 1)),
         )
 
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(residual_dropout)
+        self.dropout2 = nn.Dropout(residual_dropout)
 
     def forward(self, x, mask=None):
         # Attention block with residual
@@ -1196,7 +1211,8 @@ class TransformerBlockMQA(nn.Module):
 
 
 def transformer_mqa(d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
-                    dropout=0.1, max_position=8192, norm_type='layer', activation='gelu',
+                    dropout=0.1, attention_dropout=None, ffn_dropout=None,
+                    residual_dropout=None, max_position=8192, norm_type='layer', activation='gelu',
                     use_rope=True, d_ff=None, **kwargs):
     """Single transformer block with Multi-Query Attention.
 
@@ -1217,6 +1233,9 @@ def transformer_mqa(d_model, num_query_heads=8, qk_head_dim=128, v_head_dim=192,
         qk_head_dim=qk_head_dim,
         v_head_dim=v_head_dim,
         dropout=dropout,
+        attention_dropout=attention_dropout,
+        ffn_dropout=ffn_dropout,
+        residual_dropout=residual_dropout,
         max_position=max_position,
         norm_type=norm_type,
         activation=activation,
@@ -3173,6 +3192,62 @@ def mlp_block(in_features=None, hidden_features=None, out_features=None, num_lay
                     norm_type=norm_type)
 
 
+class ResidualMLPBlock(nn.Module):
+    """Pre-norm residual MLP for post-fusion shared representation refinement."""
+
+    def __init__(self, d_model, hidden_features, dropout=0.1, activation="gelu"):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden_features),
+            layers.Activation(activation),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_features, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return x + self.mlp(self.norm(x))
+
+
+def residual_mlp_block(
+    d_model, hidden_features, dropout=0.1, activation="gelu", **kwargs
+):
+    return ResidualMLPBlock(
+        d_model=d_model,
+        hidden_features=hidden_features,
+        dropout=dropout,
+        activation=activation,
+    )
+
+
+class SwiGLUResidualBlock(nn.Module):
+    """Pre-norm SwiGLU residual block for gated shared feature interactions."""
+
+    def __init__(self, d_model, hidden_features, dropout=0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.gate = nn.Linear(d_model, hidden_features)
+        self.value = nn.Linear(d_model, hidden_features)
+        self.output = nn.Linear(hidden_features, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        normalized = self.norm(x)
+        hidden = torch.nn.functional.silu(self.gate(normalized)) * self.value(normalized)
+        return x + self.dropout(self.output(hidden))
+
+
+def swiglu_residual_block(
+    d_model, hidden_features, dropout=0.1, **kwargs
+):
+    return SwiGLUResidualBlock(
+        d_model=d_model,
+        hidden_features=hidden_features,
+        dropout=dropout,
+    )
+
+
 ############################################################
 # Pooling Blocks
 ############################################################
@@ -3985,6 +4060,9 @@ class GatedFusionBlock(nn.Module):
         if branch_dims is not None:
             for in_dim in branch_dims:
                 self.branch_projections.append(nn.Linear(in_dim, fusion_dim))
+        else:
+            for _ in range(num_branches):
+                self.branch_projections.append(nn.LazyLinear(fusion_dim))
 
         # Gating mechanism: learn importance weights for each branch
         self.gate_fc = nn.Linear(fusion_dim * num_branches, num_branches)
@@ -4004,13 +4082,6 @@ class GatedFusionBlock(nn.Module):
         batch_size = branch_outputs[0].shape[0]
 
         # Ensure we have the right number of projection layers
-        if len(self.branch_projections) == 0:
-            for branch_out in branch_outputs:
-                in_dim = branch_out.shape[-1]
-                self.branch_projections.append(
-                    nn.Linear(in_dim, self.fusion_dim).to(branch_out.device)
-                )
-
         # Project each branch to common dimension and pool to (batch, fusion_dim)
         projected = []
         for i, branch_out in enumerate(branch_outputs):
@@ -4148,6 +4219,323 @@ def snp_primary_residual_fusion(
     )
 
 
+class EqualMeanFusionBlock(nn.Module):
+    """Project branches to a common width and combine them without learned weights."""
+
+    def __init__(self, fusion_dim, branch_dims=None, num_branches=3, dropout=0.1):
+        super().__init__()
+        dims = branch_dims or [None] * int(num_branches)
+        self.projections = nn.ModuleList(
+            [
+                nn.LazyLinear(int(fusion_dim))
+                if dim is None
+                else nn.Linear(int(dim), int(fusion_dim))
+                for dim in dims
+            ]
+        )
+        self.layer_norm = nn.LayerNorm(int(fusion_dim))
+        self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def _pool(branch_out):
+        return branch_out.mean(dim=1) if branch_out.dim() == 3 else branch_out
+
+    def forward(self, branch_outputs):
+        projected = [
+            projection(self._pool(branch_out))
+            for projection, branch_out in zip(self.projections, branch_outputs)
+        ]
+        fused = torch.stack(projected, dim=1).mean(dim=1)
+        return self.dropout(self.layer_norm(fused))
+
+
+def equal_mean_fusion(
+    fusion_dim, branch_dims=None, num_branches=3, dropout=0.1, **kwargs
+):
+    return EqualMeanFusionBlock(
+        fusion_dim=fusion_dim,
+        branch_dims=branch_dims,
+        num_branches=num_branches,
+        dropout=dropout,
+    )
+
+
+class ConcatFusionBlock(nn.Module):
+    """Concatenate pooled branch features and learn one joint projection."""
+
+    def __init__(self, fusion_dim, branch_dims=None, dropout=0.1):
+        super().__init__()
+        self.projection = (
+            nn.LazyLinear(int(fusion_dim))
+            if branch_dims is None
+            else nn.Linear(sum(map(int, branch_dims)), int(fusion_dim))
+        )
+        self.layer_norm = nn.LayerNorm(int(fusion_dim))
+        self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def _pool(branch_out):
+        return branch_out.mean(dim=1) if branch_out.dim() == 3 else branch_out
+
+    def forward(self, branch_outputs):
+        concatenated = torch.cat(
+            [self._pool(branch_out) for branch_out in branch_outputs],
+            dim=-1,
+        )
+        return self.dropout(self.layer_norm(self.projection(concatenated)))
+
+
+def concat_fusion(fusion_dim, branch_dims=None, dropout=0.1, **kwargs):
+    return ConcatFusionBlock(
+        fusion_dim=fusion_dim,
+        branch_dims=branch_dims,
+        dropout=dropout,
+    )
+
+
+class SNPGlobalGateFusionBlock(nn.Module):
+    """Add projected INDEL/SV features to SNP through global scalar gates."""
+
+    def __init__(
+        self,
+        fusion_dim,
+        branch_dims=None,
+        branch_names=("snp", "indel", "sv"),
+        dropout=0.1,
+        gate_init=-3.0,
+    ):
+        super().__init__()
+        self.branch_names = [str(name).lower() for name in branch_names]
+        if "snp" not in self.branch_names:
+            raise ValueError("SNP global-gate fusion requires an 'snp' branch")
+        if branch_dims is None:
+            branch_dims = [None] * len(self.branch_names)
+        if len(branch_dims) != len(self.branch_names):
+            raise ValueError("branch_dims and branch_names must have equal length")
+        self.projections = nn.ModuleDict(
+            {
+                name: (
+                    nn.LazyLinear(int(fusion_dim))
+                    if dim is None
+                    else nn.Linear(int(dim), int(fusion_dim))
+                )
+                for name, dim in zip(self.branch_names, branch_dims)
+            }
+        )
+        self.gate_logits = nn.ParameterDict(
+            {
+                name: nn.Parameter(torch.tensor(float(gate_init)))
+                for name in self.branch_names
+                if name != "snp"
+            }
+        )
+        self.layer_norm = nn.LayerNorm(int(fusion_dim))
+        self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def _pool(branch_out):
+        return branch_out.mean(dim=1) if branch_out.dim() == 3 else branch_out
+
+    def forward(self, branch_outputs, branch_names=None):
+        names = (
+            [str(name).lower() for name in branch_names]
+            if branch_names is not None
+            else self.branch_names
+        )
+        projected = {
+            name: self.projections[name](self._pool(branch_out))
+            for name, branch_out in zip(names, branch_outputs)
+        }
+        fused = projected["snp"]
+        for name in self.branch_names:
+            if name != "snp" and name in projected:
+                fused = fused + torch.sigmoid(self.gate_logits[name]) * projected[name]
+        return self.dropout(self.layer_norm(fused))
+
+
+def snp_global_gate_fusion(
+    fusion_dim,
+    branch_dims=None,
+    branch_names=("snp", "indel", "sv"),
+    dropout=0.1,
+    gate_init=-3.0,
+    **kwargs,
+):
+    return SNPGlobalGateFusionBlock(
+        fusion_dim=fusion_dim,
+        branch_dims=branch_dims,
+        branch_names=branch_names,
+        dropout=dropout,
+        gate_init=gate_init,
+    )
+
+
+class SNPVectorGateFusionBlock(nn.Module):
+    """Use feature-wise gates for INDEL/SV residuals on the SNP representation."""
+
+    def __init__(
+        self,
+        fusion_dim,
+        branch_dims=None,
+        branch_names=("snp", "indel", "sv"),
+        dropout=0.1,
+        gate_init=-3.0,
+    ):
+        super().__init__()
+        self.fusion_dim = int(fusion_dim)
+        self.branch_names = [str(name).lower() for name in branch_names]
+        if "snp" not in self.branch_names:
+            raise ValueError("SNP vector-gate fusion requires an 'snp' branch")
+        if branch_dims is None:
+            branch_dims = [None] * len(self.branch_names)
+        self.projections = nn.ModuleDict({
+            name: (
+                nn.LazyLinear(self.fusion_dim)
+                if dim is None
+                else nn.Linear(int(dim), self.fusion_dim)
+            )
+            for name, dim in zip(self.branch_names, branch_dims)
+        })
+        self.gates = nn.ModuleDict()
+        self.residuals = nn.ModuleDict()
+        for name in self.branch_names:
+            if name == "snp":
+                continue
+            gate = nn.Linear(2 * self.fusion_dim, self.fusion_dim)
+            nn.init.zeros_(gate.weight)
+            nn.init.constant_(gate.bias, float(gate_init))
+            self.gates[name] = gate
+            self.residuals[name] = nn.Sequential(
+                nn.Linear(2 * self.fusion_dim, self.fusion_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.fusion_dim, self.fusion_dim),
+            )
+        self.norm = nn.LayerNorm(self.fusion_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def _pool(branch_out):
+        return branch_out.mean(dim=1) if branch_out.dim() == 3 else branch_out
+
+    def forward(self, branch_outputs, branch_names=None):
+        names = (
+            [str(name).lower() for name in branch_names]
+            if branch_names is not None
+            else self.branch_names
+        )
+        projected = {
+            name: self.projections[name](self._pool(branch_out))
+            for name, branch_out in zip(names, branch_outputs)
+        }
+        primary = projected["snp"]
+        fused = primary
+        for name in self.branch_names:
+            if name == "snp" or name not in projected:
+                continue
+            context = torch.cat([primary, projected[name]], dim=-1)
+            fused = fused + torch.sigmoid(self.gates[name](context)) * self.residuals[name](context)
+        return self.dropout(self.norm(fused))
+
+
+def snp_vector_gate_fusion(
+    fusion_dim,
+    branch_dims=None,
+    branch_names=("snp", "indel", "sv"),
+    dropout=0.1,
+    gate_init=-3.0,
+    **kwargs,
+):
+    return SNPVectorGateFusionBlock(
+        fusion_dim=fusion_dim,
+        branch_dims=branch_dims,
+        branch_names=branch_names,
+        dropout=dropout,
+        gate_init=gate_init,
+    )
+
+
+class HierarchicalAuxFusionBlock(nn.Module):
+    """Fuse INDEL/SV first, then inject one gated auxiliary residual into SNP."""
+
+    def __init__(
+        self,
+        fusion_dim,
+        branch_dims=None,
+        branch_names=("snp", "indel", "sv"),
+        dropout=0.1,
+        gate_init=-3.0,
+    ):
+        super().__init__()
+        self.fusion_dim = int(fusion_dim)
+        self.branch_names = [str(name).lower() for name in branch_names]
+        required = {"snp", "indel", "sv"}
+        if not required.issubset(self.branch_names):
+            raise ValueError("Hierarchical auxiliary fusion requires SNP, INDEL, and SV")
+        if branch_dims is None:
+            branch_dims = [None] * len(self.branch_names)
+        self.projections = nn.ModuleDict({
+            name: (
+                nn.LazyLinear(self.fusion_dim)
+                if dim is None
+                else nn.Linear(int(dim), self.fusion_dim)
+            )
+            for name, dim in zip(self.branch_names, branch_dims)
+        })
+        self.aux_gate = nn.Linear(2 * self.fusion_dim, self.fusion_dim)
+        self.aux_value = nn.Linear(2 * self.fusion_dim, self.fusion_dim)
+        self.primary_gate = nn.Linear(2 * self.fusion_dim, 1)
+        nn.init.zeros_(self.primary_gate.weight)
+        nn.init.constant_(self.primary_gate.bias, float(gate_init))
+        self.aux_residual = nn.Sequential(
+            nn.Linear(2 * self.fusion_dim, self.fusion_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.fusion_dim, self.fusion_dim),
+        )
+        self.norm = nn.LayerNorm(self.fusion_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def _pool(branch_out):
+        return branch_out.mean(dim=1) if branch_out.dim() == 3 else branch_out
+
+    def forward(self, branch_outputs, branch_names=None):
+        names = (
+            [str(name).lower() for name in branch_names]
+            if branch_names is not None
+            else self.branch_names
+        )
+        projected = {
+            name: self.projections[name](self._pool(branch_out))
+            for name, branch_out in zip(names, branch_outputs)
+        }
+        aux_context = torch.cat([projected["indel"], projected["sv"]], dim=-1)
+        aux = torch.sigmoid(self.aux_gate(aux_context)) * self.aux_value(aux_context)
+        primary_context = torch.cat([projected["snp"], aux], dim=-1)
+        fused = projected["snp"] + torch.sigmoid(
+            self.primary_gate(primary_context)
+        ) * self.aux_residual(primary_context)
+        return self.dropout(self.norm(fused))
+
+
+def hierarchical_aux_fusion(
+    fusion_dim,
+    branch_dims=None,
+    branch_names=("snp", "indel", "sv"),
+    dropout=0.1,
+    gate_init=-3.0,
+    **kwargs,
+):
+    return HierarchicalAuxFusionBlock(
+        fusion_dim=fusion_dim,
+        branch_dims=branch_dims,
+        branch_names=branch_names,
+        dropout=dropout,
+        gate_init=gate_init,
+    )
+
+
 class CrossAttentionFusionBlock(nn.Module):
     """
     Cross-attention fusion block for inter-branch communication.
@@ -4197,6 +4585,9 @@ class CrossAttentionFusionBlock(nn.Module):
         if branch_dims is not None:
             for in_dim in branch_dims:
                 self.branch_projections.append(nn.Linear(in_dim, d_model))
+        else:
+            for _ in range(num_branches):
+                self.branch_projections.append(nn.LazyLinear(d_model))
 
     def forward(self, *branches):
         """
@@ -4210,13 +4601,6 @@ class CrossAttentionFusionBlock(nn.Module):
         batch_size = branches[0].shape[0]
 
         # Ensure we have the right number of projection layers
-        if len(self.branch_projections) == 0:
-            for branch_out in branches:
-                in_dim = branch_out.shape[-1]
-                self.branch_projections.append(
-                    nn.Linear(in_dim, self.d_model).to(branch_out.device)
-                )
-
         # Project each branch to common d_model
         projected = []
         for i, branch_out in enumerate(branches):
@@ -4258,7 +4642,14 @@ class CrossAttentionFusionBlock(nn.Module):
         return output
 
 
-def gated_fusion(fusion_dim, num_branches, dropout=0.1, which_branch_to_add=None, **kwargs):
+def gated_fusion(
+    fusion_dim,
+    num_branches,
+    dropout=0.1,
+    which_branch_to_add=None,
+    branch_dims=None,
+    **kwargs,
+):
     """
     Factory function for GatedFusionBlock.
 
@@ -4287,11 +4678,20 @@ def gated_fusion(fusion_dim, num_branches, dropout=0.1, which_branch_to_add=None
         fusion_dim=fusion_dim,
         num_branches=num_branches,
         dropout=dropout,
-        which_branch_to_add=which_branch_to_add
+        which_branch_to_add=which_branch_to_add,
+        branch_dims=branch_dims,
     )
 
 
-def cross_attention_fusion(d_model, num_heads=4, dropout=0.1, which_branch_as_query=2, num_branches=3, **kwargs):
+def cross_attention_fusion(
+    d_model,
+    num_heads=4,
+    dropout=0.1,
+    which_branch_as_query=2,
+    num_branches=3,
+    branch_dims=None,
+    **kwargs,
+):
     """
     Factory function for CrossAttentionFusionBlock.
 
@@ -4330,7 +4730,8 @@ def cross_attention_fusion(d_model, num_heads=4, dropout=0.1, which_branch_as_qu
         num_heads=num_heads,
         dropout=dropout,
         which_branch_as_query=which_branch_as_query,
-        num_branches=num_branches
+        num_branches=num_branches,
+        branch_dims=branch_dims,
     )
 
 
@@ -4689,6 +5090,8 @@ name_func = {
 
     # MLP
     'mlp_block': mlp_block,
+    'residual_mlp_block': residual_mlp_block,
+    'swiglu_residual_block': swiglu_residual_block,
 
     # Pooling
     'global_pool': global_pool,
@@ -4713,6 +5116,11 @@ name_func = {
     # Fusion (Multi-Branch)
     'gated_fusion': gated_fusion,
     'snp_primary_residual_fusion': snp_primary_residual_fusion,
+    'snp_global_gate_fusion': snp_global_gate_fusion,
+    'snp_vector_gate_fusion': snp_vector_gate_fusion,
+    'hierarchical_aux_fusion': hierarchical_aux_fusion,
+    'equal_mean_fusion': equal_mean_fusion,
+    'concat_fusion': concat_fusion,
     'cross_attention_fusion': cross_attention_fusion,
     'perceiver_cross_fusion': perceiver_cross_fusion,
 

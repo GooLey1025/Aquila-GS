@@ -10,10 +10,6 @@ COHORT=wheat994
 PHENO_FILE=species_data/wheat994/benchmark.pheno
 VCF_FILE=species_data/wheat994/wheat994.coding.ld.vcf.gz
 
-COHORT=Tomato706
-PHENO_FILE=species_data/$COHORT/benchmark.pheno
-VCF_FILE=species_data/$COHORT/Tomato706.LD.vcf.gz
-
 export PATH="$CONDA_PREFIX/bin:$PATH"
 
 conda activate aquila
@@ -97,6 +93,7 @@ cd ../DEM
 #   --output-dir results/DEM-Vars/$COHORT \
 #   --jobs-per-gpu 2
 
+conda activate aquila_dnawhisperer
 cd ../Whisperer_of_DNA
 /usr/bin/time -v -o $COHORT.time.txt python Whisperer_train_cv.py \
   --data-dir ../$COHORT.cv.data \
@@ -114,6 +111,34 @@ cd ../BNNs
 cd ../aquila-snp
 aquila_train_cv.py --data-dir ../$COHORT.cv.data --config 32hpo_budgets.yaml \
   -o results/$COHORT --live-metrics-log --overwrite
+
+# Aquila-SNP single-task benchmark:
+# prepare and train one independent model for every phenotype trait while
+# reusing the same nested-CV split as the multi-task benchmark above.
+IFS=$'\t' read -r -a PHENO_COLUMNS < "../$PHENO_FILE"
+for TRAIT in "${PHENO_COLUMNS[@]:1}"; do
+  SINGLE_TASK_DATA="../$COHORT.single_task.cv.data/$TRAIT"
+  SINGLE_TASK_OUTPUT="results/$COHORT.single_task/$TRAIT"
+
+  echo "Preparing Aquila-SNP single-task data: $COHORT / $TRAIT"
+  aquila_data_cv.py \
+    --vcf "../$VCF_FILE" \
+    --phenotype "../$PHENO_FILE" \
+    --traits "$TRAIT" \
+    --encoding-type diploid_onehot \
+    --variant-type snp \
+    --fold-mapping "../$COHORT.nested_cv.json" \
+    -o "$SINGLE_TASK_DATA" \
+    --overwrite
+
+  echo "Training Aquila-SNP single-task model: $COHORT / $TRAIT"
+  aquila_train_cv.py \
+    --data-dir "$SINGLE_TASK_DATA" \
+    --config 32hpo_budgets.yaml \
+    -o "$SINGLE_TASK_OUTPUT" \
+    --live-metrics-log \
+    --overwrite
+done
 
 cd ..
 python summary_and_plot_benchmark_model.py --benchmark-dir . Maize1404
