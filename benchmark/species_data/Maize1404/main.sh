@@ -5,16 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMMON_SCRIPT_DIR="$(cd "${SCRIPT_DIR}/../scripts" && pwd)"
 P=Maize1404
 THREADS="${THREADS:-$(nproc)}"
-N_SNPS=10000
 FILTER_TAG="max_missing_0.5.maf_0.05.biallelic.filter"
 
 VCF_IN="${P}.vcf.gz"
 VCF_FILT="${P}.${FILTER_TAG}.vcf.gz"
 VCF_IMPUTE="results/${P}.${FILTER_TAG}.impute.biallelic.vcf.gz"
-VCF_MIC="${P}.MIC.vcf.gz"
-VCF_MIC_RENAME="${P}.MIC.rename.vcf.gz"
 PHENO_IN="${P}_GSTP004.pheno"
 PHENO_OUT="${P}.pheno"
+BENCHMARK_PHENO="benchmark.blup.pheno"
+SINGLE_PHENO_DIR="single_phenotypes"
 
 if python3 -c "import pandas" >/dev/null 2>&1; then
     PY=python3
@@ -31,30 +30,10 @@ if [[ ! -f "${VCF_IMPUTE}" ]]; then
     exit 1
 fi
 
-# One shared 10k panel scored on benchmark.pheno (max MIC across its traits).
-"$PY" "${COMMON_SCRIPT_DIR}/mic_select_snps.py" \
-    --vcf "${VCF_IMPUTE}" \
-    --pheno benchmark.pheno \
-    --vcf-out "${VCF_MIC}" \
-    --scores-out "${P}.MIC.scores.tsv" \
-    --cache-dir "${P}.MIC.cache" \
-    --sample-map maize \
-    --n-snps "${N_SNPS}" \
-    --threads "${THREADS}"
-
-# VCF IDs are CUBIC_MG_*; phenotype LINEs are MG_*. Keep the intersection.
-"$PY" "${SCRIPT_DIR}/scripts/rename_ld_vcf_and_pheno.py" \
-    "${VCF_MIC}" "${PHENO_IN}" "${VCF_MIC_RENAME}" "${PHENO_OUT}"
-
 plink2 \
     --vcf "${VCF_IMPUTE}" \
     --pca 2 \
     --out "${P}.impute.pca"
-
-plink2 \
-    --vcf "${VCF_MIC_RENAME}" \
-    --pca 2 \
-    --out "${P}.MIC.rename.pca"
 
 if python3 -c "import matplotlib" >/dev/null 2>&1; then
     PLOT_PY=python3
@@ -62,7 +41,6 @@ else
     PLOT_PY=/data4/gulei/anaconda3/bin/python
 fi
 "$PLOT_PY" plot_pca.py "${P}.impute.pca"
-"$PLOT_PY" plot_pca.py "${P}.MIC.rename.pca"
 
 # Synonymous and missense SNPs, merged, then LD-pruned.
 # Coordinates match B73 RefGen_v3. PLINK REF alleles are flipped onto that
@@ -108,3 +86,20 @@ if [[ ! -s "${FINAL_VCF}" ]]; then
     bcftools index -f "${FINAL_VCF}"
 fi
 echo "[INFO] ${FINAL_VCF}: $(bcftools index -n "${FINAL_VCF}") variants"
+
+# VCF IDs are CUBIC_MG_*; phenotype LINEs are MG_*. Keep their intersection.
+"$PY" "${SCRIPT_DIR}/scripts/rename_ld_vcf_and_pheno.py" \
+    "${FINAL_VCF}" "${PHENO_IN}" "${FINAL_VCF}.renamed.vcf.gz" "${PHENO_OUT}"
+mv -f "${FINAL_VCF}.renamed.vcf.gz" "${FINAL_VCF}"
+mv -f "${FINAL_VCF}.renamed.vcf.gz.csi" "${FINAL_VCF}.csi"
+
+# Representative, nearly complete agronomic traits:
+# flowering time (DTS), plant/ear height (PH/EH), and yield components
+# kernel number and kernel weight per ear (KNPE/KWPE).
+"$PY" "${COMMON_SCRIPT_DIR}/export_benchmark_phenotypes.py" \
+    --input "${PHENO_OUT}" \
+    --output "${BENCHMARK_PHENO}" \
+    --single-dir "${SINGLE_PHENO_DIR}" \
+    --traits DTS PH EH KNPE KWPE \
+    --min-observed 100 \
+    --min-observed-fraction 0.5

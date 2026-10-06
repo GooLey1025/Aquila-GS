@@ -1,13 +1,13 @@
-COHORT=Maize1404
-PHENO_FILE=species_data/Maize1404/benchmark.pheno
+COHORT=Maize1404_blup_pheno
+PHENO_FILE=species_data/Maize1404/benchmark.blup.pheno
 VCF_FILE=species_data/Maize1404/Maize1404.coding.ld.vcf.gz
 
-COHORT=Soybean975
-PHENO_FILE=species_data/$COHORT/benchmark.pheno
-VCF_FILE=species_data/$COHORT/Soybean975.coding.ld.vcf.gz
+COHORT=Soybean975_blup_pheno
+PHENO_FILE=species_data/Soybean975/benchmark.blup.pheno
+VCF_FILE=species_data/Soybean975/Soybean975.coding.ld.vcf.gz
 
-COHORT=wheat994
-PHENO_FILE=species_data/wheat994/benchmark.pheno
+COHORT=wheat994_blup_pheno
+PHENO_FILE=species_data/wheat994/benchmark.blup.pheno
 VCF_FILE=species_data/wheat994/wheat994.coding.ld.vcf.gz
 
 export PATH="$CONDA_PREFIX/bin:$PATH"
@@ -101,6 +101,7 @@ cd ../Whisperer_of_DNA
   --output-dir results/$COHORT \
   --jobs-per-gpu 2 --overwrite
 
+conda activate aquila
 cd ../BNNs
 /usr/bin/time -v -o $COHORT.time.txt python BNNs_train_cv.py \
   --data-dir ../$COHORT.cv.data \

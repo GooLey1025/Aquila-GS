@@ -385,6 +385,32 @@ class NestedCVDataPreparer:
                     and value != self.config.missing_sentinel
                 )
 
+        excluded_missing_target_sample_ids: List[str] = []
+        if self.config.traits is not None:
+            # Explicit --traits selection defines the samples usable by this
+            # prepared dataset. For one trait this requires that trait to be
+            # observed; for multiple traits at least one selected target must
+            # be observed. This keeps all-missing samples out of CV splits and
+            # downstream DataLoaders instead of merely masking their losses.
+            keep_rows = mask.any(axis=1)
+            excluded_missing_target_sample_ids = [
+                sample_id
+                for sample_id, keep in zip(sample_ids, keep_rows)
+                if not keep
+            ]
+            sample_ids = [
+                sample_id
+                for sample_id, keep in zip(sample_ids, keep_rows)
+                if keep
+            ]
+            values = values[keep_rows].copy()
+            mask = mask[keep_rows].copy()
+            if not sample_ids:
+                raise ValueError(
+                    "No phenotype samples have an observed value for any "
+                    "trait selected by --traits"
+                )
+
         return {
             "sample_ids": sample_ids,
             "id_column": id_column,
@@ -394,6 +420,10 @@ class NestedCVDataPreparer:
             "trait_tasks": trait_tasks,
             "values": values,
             "mask": mask,
+            "missing_target_filter_enabled": self.config.traits is not None,
+            "excluded_missing_target_sample_ids": (
+                excluded_missing_target_sample_ids
+            ),
         }
 
     @staticmethod
@@ -727,6 +757,15 @@ class NestedCVDataPreparer:
             "n_traits": len(phenotype["trait_names"]),
             "n_regression_tasks": len(phenotype["regression_tasks"]),
             "n_classification_tasks": len(phenotype["classification_tasks"]),
+            "missing_target_filter_enabled": phenotype[
+                "missing_target_filter_enabled"
+            ],
+            "excluded_missing_target_sample_ids": phenotype[
+                "excluded_missing_target_sample_ids"
+            ],
+            "n_excluded_missing_target_samples": len(
+                phenotype["excluded_missing_target_sample_ids"]
+            ),
             "outer_folds": self.config.outer_folds,
             "inner_folds": self.config.inner_folds,
             "seed": self.config.seed,
