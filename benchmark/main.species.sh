@@ -71,7 +71,7 @@ python CLCNet_train_cv.py \
   --config configs/CLCNet_nested_cv.yaml \
   --jobs-per-gpu 1 \
   -o "results/$COHORT" \
-  --overwrite --live-metrics-log
+  --overwrite
 
 cd ../MENET
 /usr/bin/time -v -o $COHORT.time.txt python MENET_train_cv.py \

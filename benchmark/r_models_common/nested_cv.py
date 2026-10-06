@@ -485,71 +485,86 @@ def run_outer_fold(
     fold_dir.mkdir(parents=True, exist_ok=True)
     candidate_results = []
     inner_audit = []
-    for candidate_id, parameters in enumerate(candidates):
-        fold_results = []
-        for inner_fold in range(inner_count):
-            train = load_split(
-                data_dir,
-                metadata,
-                target_mask,
-                trait_index,
-                outer_fold,
-                inner_fold,
-                "train",
-            )
-            valid = load_split(
-                data_dir,
-                metadata,
-                target_mask,
-                trait_index,
-                outer_fold,
-                inner_fold,
-                "valid",
-            )
-            train_x, valid_x, means = impute_from_training(train, valid)
-            prediction, worker_metadata = worker.run(
-                fold_dir
-                / "inner"
-                / f"candidate_{candidate_id}"
-                / f"inner_fold_{inner_fold}",
-                train_x,
-                train.targets,
-                valid_x,
-                parameters,
-                derive_seed(
-                    base_seed, trait, outer_fold, candidate_id, inner_fold
-                ),
-            )
-            metrics = regression_metrics(valid.targets, prediction)
-            fold_results.append(
-                {
-                    "inner_fold": inner_fold,
-                    "metrics": metrics,
-                    "worker_metadata": worker_metadata,
-                }
-            )
-            if candidate_id == 0:
-                inner_audit.append(
+    if len(candidates) == 1:
+        # A fixed model configuration requires no data-driven model selection.
+        # Fit it once on the complete outer-training partition below.
+        best = {
+            "candidate_id": 0,
+            "parameters": dict(candidates[0]),
+            "mean_valid_pearson": math.nan,
+            "inner_results": [],
+        }
+        candidate_results.append(best)
+        selection_metric = None
+        selection_mode = "fixed_configuration"
+    else:
+        for candidate_id, parameters in enumerate(candidates):
+            fold_results = []
+            for inner_fold in range(inner_count):
+                train = load_split(
+                    data_dir,
+                    metadata,
+                    target_mask,
+                    trait_index,
+                    outer_fold,
+                    inner_fold,
+                    "train",
+                )
+                valid = load_split(
+                    data_dir,
+                    metadata,
+                    target_mask,
+                    trait_index,
+                    outer_fold,
+                    inner_fold,
+                    "valid",
+                )
+                train_x, valid_x, means = impute_from_training(train, valid)
+                prediction, worker_metadata = worker.run(
+                    fold_dir
+                    / "inner"
+                    / f"candidate_{candidate_id}"
+                    / f"inner_fold_{inner_fold}",
+                    train_x,
+                    train.targets,
+                    valid_x,
+                    parameters,
+                    derive_seed(
+                        base_seed, trait, outer_fold, candidate_id, inner_fold
+                    ),
+                )
+                metrics = regression_metrics(valid.targets, prediction)
+                fold_results.append(
                     {
                         "inner_fold": inner_fold,
-                        "train_observed": len(train.sample_ids),
-                        "train_discarded": list(train.discarded_sample_ids),
-                        "valid_observed": len(valid.sample_ids),
-                        "valid_discarded": list(valid.discarded_sample_ids),
-                        "imputation_means": means.tolist(),
+                        "metrics": metrics,
+                        "worker_metadata": worker_metadata,
                     }
                 )
-        candidate_results.append(
-            {
-                "candidate_id": candidate_id,
-                "parameters": dict(parameters),
-                "mean_valid_pearson": mean_finite(
-                    [result["metrics"]["pearson"] for result in fold_results]
-                ),
-                "inner_results": fold_results,
-            }
-        )
-    best = select_candidate(candidate_results)
+                if candidate_id == 0:
+                    inner_audit.append(
+                        {
+                            "inner_fold": inner_fold,
+                            "train_observed": len(train.sample_ids),
+                            "train_discarded": list(train.discarded_sample_ids),
+                            "valid_observed": len(valid.sample_ids),
+                            "valid_discarded": list(valid.discarded_sample_ids),
+                            "imputation_means": means.tolist(),
+                        }
+                    )
+            candidate_results.append(
+                {
+                    "candidate_id": candidate_id,
+                    "parameters": dict(parameters),
+                    "mean_valid_pearson": mean_finite(
+                        [result["metrics"]["pearson"] for result in fold_results]
+                    ),
+                    "inner_results": fold_results,
+                }
+            )
+        best = select_candidate(candidate_results)
+        selection_metric = "mean inner-validation Pearson"
+        selection_mode = "inner_cv"
     train = load_split(
         data_dir,
         metadata,
@@ -591,7 +606,9 @@ def run_outer_fold(
     write_json(
         fold_dir / "hpo_results.json",
         {
-            "selection_metric": "mean inner-validation Pearson",
+            "selection_mode": selection_mode,
+            "selection_metric": selection_metric,
+            "inner_cv_skipped": selection_mode == "fixed_configuration",
             "best_candidate_id": best["candidate_id"],
             "best_parameters": best["parameters"],
             "candidates": candidate_results,
@@ -626,6 +643,7 @@ def run_outer_fold(
     return {
         "trait": trait,
         "outer_fold": outer_fold,
+        "selection_mode": selection_mode,
         "best_candidate_id": best["candidate_id"],
         "best_parameters": best["parameters"],
         "best_valid_pearson_mean": best["mean_valid_pearson"],
@@ -735,9 +753,12 @@ def cli(spec: ModelSpec, default_config: Path) -> None:
     for trait in traits:
         trait_index = list(metadata["trait_names"]).index(trait)
         for outer_fold in outer_folds:
+            selection = "skipped (fixed configuration)"
+            if len(candidates) > 1:
+                selection = f"{inner_count} inner folds"
             print(
                 f"[INFO] {spec.name} trait={trait} outer_fold={outer_fold} "
-                f"candidates={len(candidates)} inner_folds={inner_count}",
+                f"candidates={len(candidates)} model_selection={selection}",
                 flush=True,
             )
             results.append(

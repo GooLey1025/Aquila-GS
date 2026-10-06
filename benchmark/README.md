@@ -25,7 +25,7 @@ $CONDA_PREFIX/bin/Rscript -e 'install.packages("hibayes", repos="https://cloud.r
 
 ## Data Prepare
 
-To ensure a fair comparison, we first generated a fixed nested cross-validation scheme and applied exactly the same sample partitions to all methods. The outer folds were used for final model evaluation, while the inner folds were used for hyperparameter optimization and model selection. All models were therefore evaluated on identical training, validation, and testing sets.
+To ensure a fair comparison, we first generated a fixed nested cross-validation scheme and applied exactly the same outer-fold sample partitions to all methods. The outer folds are used for final model evaluation. Inner folds are used only by methods that compare multiple candidate configurations and therefore require hyperparameter optimization or model selection. Methods with one fixed configuration, currently rrBLUP and BayesCpi, skip inner-fold fitting and train directly on the complete outer-training partition. All models are evaluated on the same held-out outer-test samples.
 
 For Aquila, missing phenotypic observations are handled natively through a masked multi-task learning strategy. Specifically, missing trait values are excluded from the loss calculation while the remaining observed traits continue to contribute to model optimization, allowing the model to exploit correlations among multiple traits without requiring phenotype imputation. For other methods that do not support missing phenotypes, missing observations were handled according to their model assumptions. Single-trait models were trained using only individuals with available phenotypic records for the target trait. Importantly, these models still followed the same predefined cross-validation partitions as Aquila, ensuring that differences in performance reflect model behavior rather than differences in data splitting. This evaluation framework assesses genomic prediction performance under realistic incomplete phenotype conditions encountered in practical breeding programs.
 
@@ -205,6 +205,8 @@ done
 
 ### BayesCpi
 
+BayesCpi uses the single fixed configuration in `bayescpi/configs/nested_cv.yaml`, so the shared R benchmark runner automatically skips inner CV and fits once on the complete outer-training partition. `niter`, `nburn`, and `thin` control MCMC sampling accuracy, convergence, and runtime; they are fixed before evaluation rather than selected using outer-test performance. Convergence should be checked through MCMC diagnostics when changing these values. The historical script name is retained for command-line compatibility.
+
 ```sh
 cd bayescpi
 for FOLD in 0 1 2 3 4; do
@@ -218,6 +220,8 @@ done
 ```
 
 ### rrBLUP
+
+rrBLUP uses the single fixed `REML` configuration in `rrBLUP/configs/nested_cv.yaml`, so the shared R benchmark runner automatically skips inner CV and fits once on the complete outer-training partition. Variance components and marker effects are estimated from that training partition by `mixed.solve`; they are fitted model parameters rather than CV-selected hyperparameters. The historical script name is retained for command-line compatibility.
 
 ```sh
 cd rrBLUP
