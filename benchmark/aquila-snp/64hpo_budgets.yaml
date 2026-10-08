@@ -1,0 +1,101 @@
+hpo:
+  enabled: true
+  method: grid_search
+  metric: best/val_r
+  direction: maximize
+  seed: 42
+  parameters:
+    model.trunk.0.kernel_size:
+      type: categorical
+      choices: [5, 9]
+    model.embedder.0.dropout:
+      type: categorical
+      choices: [0.1, 0.4]
+    model.trunk.0.dropout:
+      type: categorical
+      choices: [0.1, 0.4]
+    model.trunk.1.dropout:
+      type: categorical
+      choices: [0.1, 0.4]
+    model.trunk.2.dropout:
+      type: categorical
+      choices: [0.1, 0.4]
+    model.heads.regression.0.dropout:
+      type: categorical
+      choices: [0.1, 0.4]
+
+train:
+  batch_size: 32
+  optimizer_type: adamw
+  weight_decay: 1e-3
+  loss_type: mse
+  normalize_regression: true
+  uncertainty_weighting: true
+  early_stopping_patience: 40
+  # Ignore tiny valid_r gains; still consume early-stopping patience.
+  early_stopping_min_delta: 0.0001
+  # clip_grad_norm_ syncs each step (~1–2pp util); null favors sustained ~99%.
+  gradient_clip_norm: null
+  scheduler_type: cosine_warmup
+  learning_rate: 1e-3
+  num_epochs: 200
+  scheduler_params:
+    warmup_epochs: 20
+    warmup_start_factor: 0.01
+    min_lr: 1e-5
+  val_split: 0.1
+  test_split: 0.0
+  # Keep fold subsets on GPU. If your batch is large, keep this false.
+  gpu_resident: true
+  # AMP dtype: bf16 enables autocast; fp32 disables it.
+  precision: bf16
+  # CUDA deterministic algorithms. Default off. CLI: --use-deterministic
+  deterministic: false
+  # Shared init + dropout + shuffle seed for every inner/final fit.
+  seed: 42
+
+model:
+  architecture_type: single
+  activation: gelu
+  dropout: 0.4
+  d_model: 256
+  l2_scale: 1.0e-05
+  verbose: false
+  embedder:
+  - name: conv_block
+    in_channels: 8
+    out_channels: d_model
+    kernel_size: 15
+    activation: gelu
+    dropout: 0.4
+    norm_type: layer
+    residual: false
+  trunk:
+  - name: down_conv_tower
+    in_channels: d_model
+    out_channels: d_model
+    activation: gelu
+    dropout: 0.4
+    norm_type: layer
+    order: nac
+    residual: true
+    seq_len_threshold: 1500
+  - name: transformer
+    d_model: d_model
+    num_heads: 8
+    d_ff: d_model
+    activation: gelu
+    dropout: 0.4
+    use_rope: false
+  - name: global_pool
+    pool_type: mean
+    pool_axis: 1
+    dropout: 0.4
+
+  heads:
+    regression:
+    - name: regression_head
+      in_features: null
+      hidden_features: 256
+      activation: gelu
+      dropout: 0.4
