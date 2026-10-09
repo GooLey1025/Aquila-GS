@@ -1,19 +1,19 @@
-COHORT=Maize1404_blup_pheno
+COHORT=Maize1404_blup_pheno_10folds
 PHENO_FILE=species_data/Maize1404/benchmark.blup.pheno
 VCF_FILE=species_data/Maize1404/Maize1404.coding.ld.vcf.gz
 
-COHORT=Soybean975_blup_pheno
+COHORT=Soybean975_blup_pheno_10folds
 PHENO_FILE=species_data/Soybean975/benchmark.blup.pheno
 VCF_FILE=species_data/Soybean975/Soybean975.coding.ld.vcf.gz
 
-COHORT=wheat994_blup_pheno
+COHORT=wheat994_blup_pheno_10folds
 PHENO_FILE=species_data/wheat994/benchmark.blup.pheno
 VCF_FILE=species_data/wheat994/wheat994.coding.ld.vcf.gz
 
 export PATH="$CONDA_PREFIX/bin:$PATH"
 
 conda activate aquila
-aquila_cv.py --phenotype $PHENO_FILE -o $COHORT.nested_cv.json --outer-folds 5 --inner-folds 4 --seed 42 --min-observed 20
+aquila_cv.py --phenotype $PHENO_FILE -o $COHORT.nested_cv.json --outer-folds 10 --inner-folds 4 --seed 42 --min-observed 20
 
 aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.nested_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
 

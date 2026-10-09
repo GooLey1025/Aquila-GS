@@ -14,9 +14,6 @@ hpo:
     model.trunk.0.dropout:
       type: categorical
       choices: [0.1, 0.4]
-    model.trunk.1.dropout:
-      type: categorical
-      choices: [0.1, 0.4]
     model.trunk.2.dropout:
       type: categorical
       choices: [0.1, 0.4]
@@ -87,9 +84,10 @@ model:
     activation: gelu
     dropout: 0.4
     use_rope: false
-  - name: global_pool
-    pool_type: mean
-    pool_axis: 1
+  - name: multi_head_pool
+    d_model: d_model
+    num_heads: 4
+    pool_axis: 2
     dropout: 0.4
 
   heads:
