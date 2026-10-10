@@ -13,32 +13,33 @@ conda activate aquila
 
 # For Aquila-SNP
 aquila_data_cv_production.py \
-  --vcf 655rice.r2_0.045.panel.vcf.gz \
+  --vcf 655rice.msmp_panel.imputed.snp_indel_sv.clean.vcf.gz \
   --phenotype ../benchmark/Rice655.pheno \
   --encoding-type diploid_onehot \
   --variant-type snp \
   --id-prefix SNP- \
   --folds 10 \
   --seed 42 \
-  -o 655rice.r2_0.045.aquila-snp.production.10folds.data \
+  -o 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.production.10folds.data \
   --overwrite
+
 aquila_train_cv_production.py \
-  --data-dir 655rice.r2_0.045.aquila-snp.production.10fods.norm_het.data \
-  --config ../benchmark/aquila-snp/32hpo_budgets.yaml \
-  -o results/655rice.r2_0.045.aquila-snp.10folds.norm_het \
+  --data-dir 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.production.10folds.data \
+  --config 64hpo_budgets.bayesian.yaml \
+  -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.10folds \
   --precision bf16 --live-metrics-log \
   --use-deterministic --overwrite
 
 ./aquila_export_locked_config.py \
-  --summary results/655rice.r2_0.045.aquila-snp.10folds/summary.json \
-  -o 655rice.r2_0.045.aquila-snp.locked.yaml
+  --summary results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.10folds/summary.json \
+  -o 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.locked.yaml
 
 for seed in $(seq 43 51); do
   aquila_train.py \
-    --data-dir 655rice.r2_0.045.aquila-snp.production.10folds.data \
-    --config 655rice.r2_0.045.aquila-snp.locked.yaml \
+    --data-dir 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.production.10folds.data \
+    --config 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.locked.yaml \
     --seed "$seed" \
-    -o "results/655rice.r2_0.045.aquila-snp.10folds/seeds/seed_${seed}" \
+    -o "results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.10folds/seeds/seed_${seed}" \
     --precision bf16 \
     --live-metrics-log \
     --use-deterministic
@@ -46,24 +47,24 @@ done
 
 # rrBLUP: fixed REML parameters, so fit the full reference set directly.
 python rrBLUP/rrblup_production.py \
-  --data-dir 655rice.r2_0.045.aquila-snp.production.10folds.data \
+  --data-dir 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.production.10folds.data \
   --config rrBLUP/configs/production.yaml \
-  -o results/655rice.r2_0.045.aquila-snp.rrblup
+  -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.rrblup
 
 
 # For Aquila-Vars
 aquila_data_cv_production.py \
-  --vcf 655rice.r2_0.045.panel.vcf.gz \
+  --vcf 655rice.msmp_panel.imputed.snp_indel_sv.clean.vcf.gz \
   --phenotype ../benchmark/Rice655.pheno \
   --encoding-type diploid_onehot \
   --folds 5 \
   --seed 42 \
-  -o 655rice.r2_0.045.aquila-vars.production.data \
+  -o 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-vars.production.data \
   --overwrite
 aquila_train_cv_production.py \
-  --data-dir 655rice.r2_0.045.aquila-vars.production.data \
+  --data-dir 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-vars.production.data \
   --config ../benchmark/aquila-vars/32hpo_budgets.aquila-vars.yaml \
-  -o results/655rice.r2_0.045 \
+  -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean \
   --precision bf16 \
   --live-metrics-log \
   --use-deterministic \

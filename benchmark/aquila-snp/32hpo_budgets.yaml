@@ -5,21 +5,19 @@ hpo:
   direction: maximize
   seed: 42
   parameters:
-    train.weight_decay:
-      type: categorical
-      choices: [1e-3, 1e-4]
     model.trunk.0.kernel_size:
       type: categorical
       choices: [5, 9]
-    model.dropout:
+    model.trunk.0.dropout:
       type: categorical
-      choices: [0.4, 0.5]
-    model.heads.regression.0.hidden_features:
+      choices: [0.1, 0.4]
+    model.heads.regression.0.dropout:
       type: categorical
-      choices: [128, 256]
+      choices: [0.1, 0.4]
     model.d_model:
       type: categorical
       choices: [128, 256]
+    
 
 train:
   batch_size: 32
@@ -64,6 +62,7 @@ model:
     out_channels: d_model
     kernel_size: 15
     activation: gelu
+    dropout: 0.4
     norm_type: layer
     residual: false
   trunk:
@@ -71,6 +70,7 @@ model:
     in_channels: d_model
     out_channels: d_model
     activation: gelu
+    dropout: 0.4
     norm_type: layer
     order: nac
     residual: true
@@ -80,11 +80,13 @@ model:
     num_heads: 8
     d_ff: d_model
     activation: gelu
+    dropout: 0.4
     use_rope: false
   - name: multi_head_pool
     d_model: d_model
     num_heads: 4
     pool_axis: 2
+    dropout: 0.4
 
   heads:
     regression:
@@ -92,3 +94,4 @@ model:
       in_features: null
       hidden_features: 256
       activation: gelu
+      dropout: 0.4
