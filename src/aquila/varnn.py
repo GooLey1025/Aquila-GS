@@ -133,6 +133,22 @@ class VariantsNeuralNetwork(nn.Module):
             block_name = block_params.pop('name')
         else:
             raise ValueError(f"Block params must be dict, got {type(block_params)}")
+
+        fixed_length_towers = {
+            "fixed_depth_adaptive_stride_down_conv_tower",
+            "growing_channel_down_conv_tower",
+            "patch_merge_down_conv_tower",
+            "mean_residual_down_conv_tower",
+            "mean_max_residual_down_conv_tower",
+            "blur_pool_down_conv_tower",
+        }
+        if block_name in fixed_length_towers and "seq_length" not in block_params:
+            if isinstance(self.seq_length, dict):
+                raise ValueError(
+                    f"{block_name} requires an "
+                    "explicit scalar seq_length inside multi-branch configs"
+                )
+            block_params["seq_length"] = self.seq_length
         
         # Add global defaults if not specified
         global_vars = ['dropout', 'activation', 'l2_scale', 'kernel_size']
@@ -515,6 +531,19 @@ def _apply_model_d_model(model_params: dict) -> None:
         "conv_block",
         "std_down_conv_tower",
         "down_conv_tower",
+        "fixed_depth_adaptive_stride_down_conv_tower",
+        "growing_channel_down_conv_tower",
+        "patch_merge_down_conv_tower",
+        "mean_residual_down_conv_tower",
+        "raw_mean_residual_down_conv_tower",
+        "raw_attention_residual_down_conv_tower",
+        "raw_gated_mean_residual_down_conv_tower",
+        "raw_mean_attention_residual_down_conv_tower",
+        "raw_max_attention_residual_down_conv_tower",
+        "raw_std_attention_residual_down_conv_tower",
+        "raw_multi_pool_residual_down_conv_tower",
+        "mean_max_residual_down_conv_tower",
+        "blur_pool_down_conv_tower",
     }
     width_names = {
         "transformer",
@@ -526,6 +555,22 @@ def _apply_model_d_model(model_params: dict) -> None:
 
     def _rewrite(block: dict, width: int) -> None:
         name = str(block.get("name") or "")
+        if name in {
+            "fixed_depth_adaptive_stride_down_conv_tower",
+            "growing_channel_down_conv_tower",
+            "patch_merge_down_conv_tower",
+            "mean_residual_down_conv_tower",
+            "raw_mean_residual_down_conv_tower",
+            "raw_attention_residual_down_conv_tower",
+            "raw_gated_mean_residual_down_conv_tower",
+            "raw_mean_attention_residual_down_conv_tower",
+            "raw_max_attention_residual_down_conv_tower",
+            "raw_std_attention_residual_down_conv_tower",
+            "raw_multi_pool_residual_down_conv_tower",
+            "mean_max_residual_down_conv_tower",
+            "blur_pool_down_conv_tower",
+        } and block.get("seq_length") is None:
+            block["seq_length"] = model_params.get("seq_length")
         for key in width_keys:
             if block.get(key) == "d_model" and not (
                 name == "conv_block" and key == "in_channels"
@@ -589,7 +634,11 @@ def _apply_model_d_model(model_params: dict) -> None:
     for head_blocks in (model_params.get("heads") or {}).values():
         blocks = head_blocks if isinstance(head_blocks, list) else [head_blocks]
         for block in blocks:
-            if isinstance(block, dict) and block.get("in_features") not in (None, "null"):
+            if not isinstance(block, dict):
+                continue
+            if block.get("name") == "trait_query_regression_head":
+                block["d_model"] = width
+            if block.get("in_features") not in (None, "null"):
                 block["in_features"] = width
 
 
@@ -607,6 +656,19 @@ def _apply_global_downconv_kernel_size(model_params: dict) -> None:
     downconv_names = {
         "std_down_conv_tower",
         "down_conv_tower",
+        "fixed_depth_adaptive_stride_down_conv_tower",
+        "growing_channel_down_conv_tower",
+        "patch_merge_down_conv_tower",
+        "mean_residual_down_conv_tower",
+        "raw_mean_residual_down_conv_tower",
+        "raw_attention_residual_down_conv_tower",
+        "raw_gated_mean_residual_down_conv_tower",
+        "raw_mean_attention_residual_down_conv_tower",
+        "raw_max_attention_residual_down_conv_tower",
+        "raw_std_attention_residual_down_conv_tower",
+        "raw_multi_pool_residual_down_conv_tower",
+        "mean_max_residual_down_conv_tower",
+        "blur_pool_down_conv_tower",
         "convnext_down_conv_tower",
         "dilated_down_conv_tower",
     }
@@ -645,6 +707,7 @@ def create_model_from_config(
     # Deep copy to avoid modifying original config
     model_params = copy.deepcopy(config.get('model', {}))
     train_config = config.get('train', {})
+    model_params['seq_length'] = seq_length
 
     # Check for multi-branch architecture
     # First check if model has architecture_type, then check if train.branches exists

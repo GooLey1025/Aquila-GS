@@ -39,6 +39,7 @@ from aquila.evolve import (
     load_checkpoint,
     load_model_and_config,
     load_vcf_data,
+    normalize_trait_value,
     pareto_beam_search,
     predict_all_phenos,
     strategy_combinatorial,
@@ -60,7 +61,9 @@ def parse_args():
     )
     parser.add_argument(
         '--model-dir', type=str, required=True,
-        help='Trained model directory containing checkpoint, params.yaml, and normalization_stats.pkl'
+        help='Production model result directory containing best_model.pt, '
+             'config.yaml, and preprocessing.json. Legacy model directories '
+             'with checkpoints/best_checkpoint.pt are also supported.'
     )
     parser.add_argument(
         '--vcf', type=str, required=True,
@@ -935,7 +938,8 @@ def run_evolution(args):
 
     # --- Load model ---
     config, checkpoint_path, norm_stats = load_model_and_config(args.model_dir)
-    print(f"\n[Model] Config: {checkpoint_path.parent}")
+    print(f"\n[Model] Directory: {args.model_dir}")
+    print(f"[Model] Checkpoint: {checkpoint_path}")
 
     encoding_type = config.get('data', {}).get('encoding_type', 'diploid_onehot')
     if encoding_type in ['snp_vcf', 'snp_indel_vcf', 'snp_indel_sv_vcf']:
@@ -998,6 +1002,13 @@ def run_evolution(args):
         regression_tasks = config.get('train', {}).get('regression_tasks', [])
     if not regression_tasks:
         regression_tasks = config.get('model', {}).get('regression_tasks', [])
+    if not regression_tasks:
+        regression_tasks = config.get('data', {}).get('regression_tasks', [])
+    if not regression_tasks:
+        raise ValueError(
+            f"No regression task names found in production model directory: "
+            f"{args.model_dir}"
+        )
     print(f"\n[Model] Regression tasks: {regression_tasks}")
 
     # --- Multi-pheno vs single-pheno ---
@@ -1073,14 +1084,10 @@ def run_evolution(args):
                 target_denorm = baseline_actual * (1.0 + pct / 100.0)
                 numeric_targets_denorm_for_log[t_idx] = target_denorm
                 if isinstance(norm_stats, dict) and 'regression_means' in norm_stats:
-                    reg_means = norm_stats.get('regression_means', {})
-                    reg_stds  = norm_stats.get('regression_stds', {})
                     t_name = regression_tasks[t_idx]
-                    mean = reg_means.get(t_name, 0.0) if isinstance(reg_means, dict) else 0.0
-                    std  = reg_stds.get(t_name, 1.0)  if isinstance(reg_stds, dict) else 1.0
-                    if std == 0:
-                        std = 1.0
-                    numeric_targets_norm[t_idx] = (target_denorm - mean) / std
+                    numeric_targets_norm[t_idx] = normalize_trait_value(
+                        target_denorm, norm_stats, t_name
+                    )
                 else:
                     # No normalization stats: assume baseline is already in Z-score space.
                     numeric_targets_norm[t_idx] = baseline_actual

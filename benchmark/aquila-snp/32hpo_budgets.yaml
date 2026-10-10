@@ -19,12 +19,12 @@ hpo:
       choices: [128, 256]
     model.d_model:
       type: categorical
-      choices: [256, 512]
+      choices: [128, 256]
 
 train:
   batch_size: 32
   optimizer_type: adamw
-  weight_decay: 1e-4
+  weight_decay: 1e-3
   loss_type: mse
   normalize_regression: true
   uncertainty_weighting: true
@@ -67,7 +67,6 @@ model:
     norm_type: layer
     residual: false
   trunk:
-  # Variant 10: traditional down_conv_tower + full MHA + uncertainty weighting.
   - name: down_conv_tower
     in_channels: d_model
     out_channels: d_model

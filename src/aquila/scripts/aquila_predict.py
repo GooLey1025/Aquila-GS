@@ -35,7 +35,7 @@ import json
 from typing import Any, Dict, Optional, List, Tuple
 
 from aquila.varnn import create_model_from_config
-from aquila.encoding import parse_genotype_file
+from aquila.encoding import normalize_heterozygous_order, parse_genotype_file
 from aquila.utils import load_config
 from aquila.metrics import MetricsCalculator
 
@@ -132,6 +132,15 @@ def parse_args():
         default=None,
         help='Keep VCF IDs with this prefix, e.g. "SNP-". '
              'Default: prefix stored in the checkpoint.'
+    )
+
+    parser.add_argument(
+        '--normalize-heterozygous-order',
+        action='store_true',
+        help='Treat unphased heterozygous calls as unordered by normalizing '
+             '1/0 and 1|0 to the same REF/ALT encoding as 0/1. The input VCF '
+             'is not modified. Use this when the training VCF was normalized '
+             'to contain only 0/1 heterozygous calls.'
     )
 
     parser.add_argument(
@@ -322,6 +331,7 @@ def load_vcf_data(
     config: dict,
     include_marker_ids: bool = False,
     id_prefix: Optional[str] = None,
+    normalize_heterozygous: bool = False,
 ) -> Tuple:
     """
     Load and encode VCF data.
@@ -351,6 +361,12 @@ def load_vcf_data(
         variant_data = parse_genotype_file(
             vcf_path, encoding_type, variant_type, id_prefix=id_prefix
         )
+        if normalize_heterozygous:
+            normalized = normalize_heterozygous_order(variant_data)
+            print(
+                f"  Normalized {normalized} ALT/REF heterozygous call(s) "
+                "to REF/ALT order"
+            )
 
         # Extract sample IDs from first variant type
         first_variant_type = list(variant_data.keys())[0]
@@ -376,6 +392,12 @@ def load_vcf_data(
         result = parse_genotype_file(
             vcf_path, encoding_type, variant_type, id_prefix=id_prefix
         )
+        if normalize_heterozygous:
+            normalized = normalize_heterozygous_order(result)
+            print(
+                f"  Normalized {normalized} ALT/REF heterozygous call(s) "
+                "to REF/ALT order"
+            )
         # Handle both new dict format and old tuple format for backward compat
         if isinstance(result, dict):
             snp_matrix = result['matrix']
@@ -1001,7 +1023,12 @@ def main():
     
     # Load VCF data
     variant_data, sample_ids, seq_length, marker_ids = load_vcf_data(
-        vcf_path, encoding_type, config, include_marker_ids=True, id_prefix=id_prefix
+        vcf_path,
+        encoding_type,
+        config,
+        include_marker_ids=True,
+        id_prefix=id_prefix,
+        normalize_heterozygous=args.normalize_heterozygous_order,
     )
     variant_data, marker_ids, seq_length = align_variants_to_checkpoint(
         variant_data, marker_ids, seq_length, metadata

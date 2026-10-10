@@ -194,41 +194,111 @@ def find_file_in_dir(directory: Path, filename_pattern: str) -> Optional[Path]:
     return matches[0] if matches else None
 
 
+def _normalization_stats_from_preprocessing(
+    preprocessing: object,
+) -> Optional[dict]:
+    """Convert production-model preprocessing metadata to the legacy interface."""
+    if not isinstance(preprocessing, dict):
+        return None
+    traits = preprocessing.get('traits')
+    if not isinstance(traits, list):
+        return None
+
+    regression_tasks = []
+    regression_means = {}
+    regression_stds = {}
+    log_transformed_tasks = []
+    log_shifts = {}
+    for trait in traits:
+        if not isinstance(trait, dict) or trait.get('task') != 'regression':
+            continue
+        name = str(trait['name'])
+        regression_tasks.append(name)
+        regression_means[name] = float(trait.get('mean', 0.0))
+        regression_stds[name] = float(trait.get('std', 1.0))
+        if trait.get('use_log1p', False):
+            log_transformed_tasks.append(name)
+            log_shifts[name] = float(trait.get('log_shift', 0.0))
+
+    if not regression_tasks:
+        return None
+    return {
+        'regression_tasks': regression_tasks,
+        'regression_means': regression_means,
+        'regression_stds': regression_stds,
+        'log_transformed_tasks': log_transformed_tasks,
+        'log_shifts': log_shifts,
+        'preprocessing_format': 'per_trait_log1p',
+    }
+
+
 def load_model_and_config(model_dir: str):
     """
-    Load model checkpoint, config, and normalization stats from a model directory.
+    Load an Aquila model from either a production or legacy model directory.
 
-    Searches in model_dir/checkpoints/, model_dir/, and model_dir.parent/
-    for maximum robustness.
+    Production directories contain ``best_model.pt``, ``config.yaml``, and
+    ``preprocessing.json``. Older training directories containing
+    ``checkpoints/best_checkpoint.pt``, ``params.yaml``, and
+    ``normalization_stats.pkl`` remain supported.
     """
     model_dir = Path(model_dir)
+    if not model_dir.is_dir():
+        raise FileNotFoundError(f"Model directory not found: {model_dir}")
 
-    for subdir in [model_dir / 'checkpoints', model_dir.parent / 'checkpoints', model_dir]:
-        checkpoint_path = find_file_in_dir(subdir, 'best_checkpoint.pt')
-        if not checkpoint_path:
-            pt_matches = list(subdir.glob('*.pt'))
-            checkpoint_path = pt_matches[0] if pt_matches else None
-        if checkpoint_path:
-            break
-
-    config_path = find_file_in_dir(model_dir, 'params.yaml')
-    if not config_path:
-        config_path = find_file_in_dir(model_dir.parent, 'params.yaml')
-
-    norm_stats_path = find_file_in_dir(model_dir, 'normalization_stats.pkl')
-    if not norm_stats_path:
-        norm_stats_path = find_file_in_dir(model_dir.parent, 'normalization_stats.pkl')
+    checkpoint_candidates = [
+        model_dir / 'best_model.pt',
+        model_dir / 'checkpoints' / 'best_checkpoint.pt',
+        model_dir / 'best_checkpoint.pt',
+    ]
+    checkpoint_path = next(
+        (path for path in checkpoint_candidates if path.is_file()), None
+    )
+    if checkpoint_path is None:
+        checkpoint_path = find_file_in_dir(model_dir / 'checkpoints', '*.pt')
+    if checkpoint_path is None:
+        checkpoint_path = find_file_in_dir(model_dir, '*.pt')
 
     if not checkpoint_path:
         raise FileNotFoundError(f"Checkpoint not found in {model_dir}")
-    if not config_path:
-        raise FileNotFoundError(f"params.yaml not found in {model_dir}")
 
-    config = load_config(config_path)
+    checkpoint = torch.load(
+        checkpoint_path, map_location='cpu', weights_only=False
+    )
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Checkpoint must contain a dictionary: {checkpoint_path}")
+
+    config_path = next(
+        (
+            path for path in (
+                model_dir / 'config.yaml',
+                model_dir / 'params.yaml',
+                model_dir / 'training_config.yaml',
+            )
+            if path.is_file()
+        ),
+        None,
+    )
+    if config_path is not None:
+        config = load_config(config_path)
+    else:
+        config = checkpoint.get('config')
+        if not isinstance(config, dict):
+            raise FileNotFoundError(
+                f"No config.yaml/params.yaml or embedded config found in {model_dir}"
+            )
+
     norm_stats = None
-    if norm_stats_path:
+    norm_stats_path = model_dir / 'normalization_stats.pkl'
+    if norm_stats_path.is_file():
         with open(norm_stats_path, 'rb') as f:
             norm_stats = pickle.load(f)
+    else:
+        preprocessing = checkpoint.get('preprocessing')
+        preprocessing_path = model_dir / 'preprocessing.json'
+        if preprocessing is None and preprocessing_path.is_file():
+            with preprocessing_path.open(encoding='utf-8') as handle:
+                preprocessing = json.load(handle)
+        norm_stats = _normalization_stats_from_preprocessing(preprocessing)
 
     return config, checkpoint_path, norm_stats
 
@@ -443,6 +513,8 @@ def denormalize_predictions(
         return preds
     reg_means = norm_stats.get('regression_means', {})
     reg_stds  = norm_stats.get('regression_stds',  {})
+    log_shifts = norm_stats.get('log_shifts', {})
+    uses_log1p = norm_stats.get('preprocessing_format') == 'per_trait_log1p'
     for i, task in enumerate(tasks):
         # Handle both dict and array forms: dict by task name, array by position
         if isinstance(reg_means, dict):
@@ -456,10 +528,47 @@ def denormalize_predictions(
         if std == 0:
             std = 1.0
         if task in log_tasks:
-            preds[:, i] = np.exp(preds[:, i] * std + mean)
+            transformed = preds[:, i] * std + mean
+            if uses_log1p:
+                shift = (
+                    log_shifts.get(task, 0.0)
+                    if isinstance(log_shifts, dict)
+                    else 0.0
+                )
+                preds[:, i] = np.expm1(transformed) - shift
+            else:
+                preds[:, i] = np.exp(transformed)
         else:
             preds[:, i] = preds[:, i] * std + mean
     return preds
+
+
+def normalize_trait_value(value: float, norm_stats, task: str) -> float:
+    """Transform one phenotype value into the model's normalized output space."""
+    if not isinstance(norm_stats, dict) or 'regression_means' not in norm_stats:
+        return float(value)
+    reg_means = norm_stats.get('regression_means', {})
+    reg_stds = norm_stats.get('regression_stds', {})
+    mean = reg_means.get(task, 0.0) if isinstance(reg_means, dict) else 0.0
+    std = reg_stds.get(task, 1.0) if isinstance(reg_stds, dict) else 1.0
+    if std == 0:
+        std = 1.0
+
+    transformed = float(value)
+    log_tasks = norm_stats.get('log_transformed_tasks', [])
+    if (
+        task in log_tasks
+        and norm_stats.get('preprocessing_format') == 'per_trait_log1p'
+    ):
+        shifts = norm_stats.get('log_shifts', {})
+        shift = shifts.get(task, 0.0) if isinstance(shifts, dict) else 0.0
+        argument = transformed + shift
+        if argument <= -1.0:
+            raise ValueError(
+                f"Trait {task!r} target {value} is outside the fitted log1p domain"
+            )
+        transformed = float(np.log1p(argument))
+    return (transformed - float(mean)) / float(std)
 
 
 ###############################################################################

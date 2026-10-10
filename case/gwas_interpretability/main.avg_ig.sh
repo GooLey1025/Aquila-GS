@@ -16,6 +16,7 @@ export PNG_DIR=./ig_png_ensemble
 SEEDS=(42 43 44 45 46 47 48 49 50 51)
 TRAITS=(HD_BLUP GW_BLUP PH_BLUP)
 QTN_ANNOT=Final_summary_347_QTNsites_geno_redefined.xlsx
+MARKERS=./655rice.canonical_markers.tsv
 
 mkdir -p "$OUT_DIR" "$PNG_DIR"
 
@@ -146,3 +147,36 @@ cp -f "${LOCUS_PDF%.pdf}.png" "$PNG_DIR/"
 
 echo "Ensemble rankings: ${OUT_DIR}"
 echo "Ensemble PNGs: ${PNG_DIR}"
+
+echo "[upset] HD_BLUP 10-seed ensemble"
+python3 plot_topk_gwas_marker_venn_v3.py \
+  --importance "${OUT_DIR}/HD_BLUP/importance_ranking_HD_BLUP.tsv" \
+  --gwas \
+    "${GWAS_DIR}/HD_BeiJ15.gemma_lmm.assoc.txt" \
+    "${GWAS_DIR}/HD_BLUP.gemma_lmm.assoc.txt" \
+    "${GWAS_DIR}/HD_LingS15.gemma_lmm.assoc.txt" \
+    "${GWAS_DIR}/HD_LingS16.gemma_lmm.assoc.txt" \
+    "${GWAS_DIR}/HD_WenJ15.gemma_lmm.assoc.txt" \
+    "${GWAS_DIR}/HD_YangZ15.gemma_lmm.assoc.txt" \
+  --markers "$MARKERS" \
+  --trait "Heading date related" \
+  --top-k 500 \
+  -o "${OUT_DIR}/${PREFIX}.ensemble.HD_BLUP.top500.upset.pdf" \
+  --summary-tsv "${OUT_DIR}/${PREFIX}.ensemble.HD_BLUP.top500.source_percentage.tsv"
+
+echo "[upset] GW_BLUP 10-seed ensemble"
+python3 plot_topk_gwas_marker_venn_v3.py \
+  --importance "${OUT_DIR}/GW_BLUP/importance_ranking_GW_BLUP.tsv" \
+  --gwas \
+    "${GWAS_DIR}/GW_BeiJ15.gemma_lmm.assoc.txt" \
+    "${GWAS_DIR}/GW_BLUP.gemma_lmm.assoc.txt" \
+    "${GWAS_DIR}/GW_LingS16.gemma_lmm.assoc.txt" \
+    "${GWAS_DIR}/GW_WenJ15.gemma_lmm.assoc.txt" \
+    "${GWAS_DIR}/GW_YangZ15.gemma_lmm.assoc.txt" \
+  --markers "$MARKERS" \
+  --trait "Grain width related" \
+  --top-k 500 \
+  -o "${OUT_DIR}/${PREFIX}.ensemble.GW_BLUP.top500.upset.pdf" \
+  --summary-tsv "${OUT_DIR}/${PREFIX}.ensemble.GW_BLUP.top500.source_percentage.tsv"
+
+echo "Ensemble UpSet plots and summaries: ${OUT_DIR}"

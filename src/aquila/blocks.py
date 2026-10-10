@@ -1881,6 +1881,544 @@ class DownConvBlock(nn.Module):
         return x, mask
 
 
+class AdaptiveStrideDownConvBlock(nn.Module):
+    """Feature extraction followed by a configurable-stride convolution."""
+
+    def __init__(self, in_channels=None, out_channels=None, kernel_size=5,
+                 stride=2, padding='same', activation='gelu', dropout=0.1,
+                 norm_type='layer', order='nac', residual=True):
+        super().__init__()
+        if int(stride) < 1:
+            raise ValueError(f"stride must be >= 1, got {stride}")
+        self.stride = int(stride)
+        self.conv_feat = conv_block(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=padding,
+            activation=activation,
+            dropout=dropout,
+            norm_type=norm_type,
+            order=order,
+            residual=residual,
+        )
+        self.conv_down = conv_block(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=self.stride,
+            padding=padding,
+            activation=activation,
+            dropout=dropout,
+            norm_type=norm_type,
+            order=order,
+            residual=residual,
+        )
+
+    def forward(self, x, mask=None):
+        x, mask = self.conv_feat(x, mask)
+        return self.conv_down(x, mask)
+
+
+def _window_mask(mask, stride, target_length):
+    if mask is None:
+        return None, None
+    pad_length = target_length * stride - mask.size(1)
+    if pad_length:
+        mask = F.pad(mask, (0, pad_length), value=False)
+    grouped = mask.reshape(mask.size(0), target_length, stride)
+    return grouped, grouped.any(dim=-1)
+
+
+def _masked_window_average(x, grouped_mask, stride, target_length):
+    pad_length = target_length * stride - x.size(1)
+    if pad_length:
+        x = F.pad(x, (0, 0, 0, pad_length))
+    grouped = x.reshape(x.size(0), target_length, stride, x.size(2))
+    if grouped_mask is None:
+        return grouped.mean(dim=2)
+    weights = grouped_mask.unsqueeze(-1).to(dtype=x.dtype)
+    return (grouped * weights).sum(dim=2) / weights.sum(dim=2).clamp(min=1)
+
+
+class PatchMergeDownConvBlock(nn.Module):
+    """Use every token in each stride window before learned compression."""
+
+    def __init__(self, in_channels=None, out_channels=None, kernel_size=5,
+                 stride=2, padding='same', activation='gelu', dropout=0.1,
+                 norm_type='layer', order='nac', residual=True,
+                 layer_scale_init=0.1, **kwargs):
+        super().__init__()
+        self.stride = int(stride)
+        self.out_channels = int(out_channels)
+        self.conv_feat = conv_block(
+            in_channels=in_channels, out_channels=out_channels,
+            kernel_size=kernel_size, stride=1, padding=padding,
+            activation=activation, dropout=dropout, norm_type=norm_type,
+            order=order, residual=residual,
+        )
+        merged_channels = self.out_channels * self.stride
+        self.merge_norm = nn.LayerNorm(merged_channels)
+        self.merge_projection = nn.Linear(merged_channels, self.out_channels)
+        self.average_projection = nn.Linear(self.out_channels, self.out_channels)
+        self.residual_scale = nn.Parameter(
+            torch.tensor(float(layer_scale_init))
+        )
+
+    def forward(self, x, mask=None):
+        x, mask = self.conv_feat(x, mask)
+        target_length = math.ceil(x.size(1) / self.stride)
+        grouped_mask, output_mask = _window_mask(
+            mask, self.stride, target_length
+        )
+        pad_length = target_length * self.stride - x.size(1)
+        merged_input = F.pad(x, (0, 0, 0, pad_length)) if pad_length else x
+        merged_input = merged_input.reshape(
+            x.size(0), target_length, self.stride * x.size(2)
+        )
+        merged = self.merge_projection(self.merge_norm(merged_input))
+        average = _masked_window_average(
+            x, grouped_mask, self.stride, target_length
+        )
+        output = merged + self.residual_scale * self.average_projection(average)
+        return output, output_mask
+
+
+class PooledResidualDownConvBlock(nn.Module):
+    """Strided learned path plus information-preserving pooled residual paths."""
+
+    def __init__(self, in_channels=None, out_channels=None, kernel_size=5,
+                 stride=2, padding='same', activation='gelu', dropout=0.1,
+                 norm_type='layer', order='nac', residual=True,
+                 residual_pool='mean', layer_scale_init=0.1, **kwargs):
+        super().__init__()
+        self.stride = int(stride)
+        self.residual_pool = str(residual_pool)
+        if self.residual_pool not in {"mean", "mean_max"}:
+            raise ValueError(
+                "residual_pool must be 'mean' or 'mean_max', got "
+                f"{residual_pool!r}"
+            )
+        self.conv_feat = conv_block(
+            in_channels=in_channels, out_channels=out_channels,
+            kernel_size=kernel_size, stride=1, padding=padding,
+            activation=activation, dropout=dropout, norm_type=norm_type,
+            order=order, residual=residual,
+        )
+        # Disable the ordinary strided projection residual: it samples positions
+        # and is replaced below by residuals that summarize every window token.
+        self.conv_down = conv_block(
+            in_channels=out_channels, out_channels=out_channels,
+            kernel_size=kernel_size, stride=self.stride, padding=padding,
+            activation=activation, dropout=dropout, norm_type=norm_type,
+            order=order, residual=False,
+        )
+        self.mean_projection = nn.Linear(out_channels, out_channels)
+        self.mean_scale = nn.Parameter(torch.tensor(float(layer_scale_init)))
+        if self.residual_pool == "mean_max":
+            self.max_projection = nn.Linear(out_channels, out_channels)
+            self.max_scale = nn.Parameter(torch.tensor(float(layer_scale_init)))
+        else:
+            self.max_projection = None
+            self.register_parameter("max_scale", None)
+
+    def forward(self, x, mask=None):
+        x, feature_mask = self.conv_feat(x, mask)
+        main, output_mask = self.conv_down(x, feature_mask)
+        target_length = main.size(1)
+        grouped_mask, pooled_mask = _window_mask(
+            feature_mask, self.stride, target_length
+        )
+        mean = _masked_window_average(
+            x, grouped_mask, self.stride, target_length
+        )
+        output = main + self.mean_scale * self.mean_projection(mean)
+        if self.max_projection is not None:
+            pad_length = target_length * self.stride - x.size(1)
+            grouped = F.pad(x, (0, 0, 0, pad_length)) if pad_length else x
+            grouped = grouped.reshape(
+                x.size(0), target_length, self.stride, x.size(2)
+            )
+            if grouped_mask is not None:
+                grouped = grouped.masked_fill(
+                    ~grouped_mask.unsqueeze(-1), float("-inf")
+                )
+            maximum = grouped.max(dim=2).values
+            maximum = torch.nan_to_num(maximum, neginf=0.0)
+            output = output + self.max_scale * self.max_projection(maximum)
+        return output, pooled_mask if pooled_mask is not None else output_mask
+
+
+class AttentionResidualDownConvBlock(nn.Module):
+    """Strided convolution with learnable window-attention residuals."""
+
+    def __init__(self, in_channels=None, out_channels=None, kernel_size=5,
+                 stride=2, padding='same', activation='gelu', dropout=0.1,
+                 norm_type='layer', order='nac', residual=True,
+                 residual_mode='attention', layer_scale_init=0.1,
+                 gate_bias_init=-1.0, **kwargs):
+        super().__init__()
+        self.stride = int(stride)
+        self.residual_mode = str(residual_mode)
+        valid_modes = {
+            "attention", "gated_mean", "mean_attention", "max_attention",
+            "std_attention", "multi_pool"
+        }
+        if self.residual_mode not in valid_modes:
+            raise ValueError(
+                f"residual_mode must be one of {sorted(valid_modes)}, got "
+                f"{residual_mode!r}"
+            )
+        self.conv_feat = conv_block(
+            in_channels=in_channels, out_channels=out_channels,
+            kernel_size=kernel_size, stride=1, padding=padding,
+            activation=activation, dropout=dropout, norm_type=norm_type,
+            order=order, residual=residual,
+        )
+        self.conv_down = conv_block(
+            in_channels=out_channels, out_channels=out_channels,
+            kernel_size=kernel_size, stride=self.stride, padding=padding,
+            activation=activation, dropout=dropout, norm_type=norm_type,
+            order=order, residual=False,
+        )
+        self.mean_projection = nn.Linear(out_channels, out_channels)
+        self.mean_scale = nn.Parameter(torch.tensor(float(layer_scale_init)))
+        if self.residual_mode in {
+            "attention", "mean_attention", "max_attention",
+            "std_attention", "multi_pool"
+        }:
+            self.attention_norm = nn.LayerNorm(out_channels)
+            self.attention_score = nn.Linear(out_channels, 1)
+            self.attention_projection = nn.Linear(out_channels, out_channels)
+            self.attention_scale = nn.Parameter(
+                torch.tensor(float(layer_scale_init))
+            )
+        else:
+            self.attention_norm = None
+            self.attention_score = None
+            self.attention_projection = None
+            self.register_parameter("attention_scale", None)
+        if self.residual_mode in {"max_attention", "multi_pool"}:
+            self.max_projection = nn.Linear(out_channels, out_channels)
+            self.max_scale = nn.Parameter(
+                torch.tensor(float(layer_scale_init))
+            )
+        else:
+            self.max_projection = None
+            self.register_parameter("max_scale", None)
+        if self.residual_mode in {"std_attention", "multi_pool"}:
+            self.std_projection = nn.Linear(out_channels, out_channels)
+            self.std_scale = nn.Parameter(
+                torch.tensor(float(layer_scale_init))
+            )
+        else:
+            self.std_projection = None
+            self.register_parameter("std_scale", None)
+        if self.residual_mode == "gated_mean":
+            self.gate = nn.Linear(2 * out_channels, out_channels)
+            nn.init.zeros_(self.gate.weight)
+            nn.init.constant_(self.gate.bias, float(gate_bias_init))
+        else:
+            self.gate = None
+
+    def _group_windows(self, x, target_length):
+        pad_length = target_length * self.stride - x.size(1)
+        if pad_length:
+            x = F.pad(x, (0, 0, 0, pad_length))
+        return x.reshape(
+            x.size(0), target_length, self.stride, x.size(2)
+        )
+
+    def _attention_pool(self, grouped, grouped_mask):
+        scores = self.attention_score(self.attention_norm(grouped)).squeeze(-1)
+        if grouped_mask is not None:
+            scores = scores.masked_fill(~grouped_mask, float("-inf"))
+        weights = torch.softmax(scores, dim=2)
+        weights = torch.nan_to_num(weights, nan=0.0)
+        return (grouped * weights.unsqueeze(-1)).sum(dim=2)
+
+    @staticmethod
+    def _max_pool(grouped, grouped_mask):
+        if grouped_mask is not None:
+            grouped = grouped.masked_fill(
+                ~grouped_mask.unsqueeze(-1), float("-inf")
+            )
+        maximum = grouped.max(dim=2).values
+        return torch.nan_to_num(maximum, neginf=0.0)
+
+    @staticmethod
+    def _std_pool(grouped, grouped_mask, mean):
+        if grouped_mask is None:
+            variance = (grouped - mean.unsqueeze(2)).square().mean(dim=2)
+        else:
+            weights = grouped_mask.unsqueeze(-1).to(dtype=grouped.dtype)
+            count = weights.sum(dim=2).clamp(min=1)
+            variance = (
+                (grouped - mean.unsqueeze(2)).square() * weights
+            ).sum(dim=2) / count
+        return torch.sqrt(variance.clamp(min=0) + 1e-6)
+
+    def forward(self, x, mask=None):
+        x, feature_mask = self.conv_feat(x, mask)
+        main, output_mask = self.conv_down(x, feature_mask)
+        target_length = main.size(1)
+        grouped_mask, pooled_mask = _window_mask(
+            feature_mask, self.stride, target_length
+        )
+        grouped = self._group_windows(x, target_length)
+        mean = _masked_window_average(
+            x, grouped_mask, self.stride, target_length
+        )
+
+        if self.residual_mode == "gated_mean":
+            residual = self.mean_scale * self.mean_projection(mean)
+            gate = torch.sigmoid(self.gate(torch.cat([main, mean], dim=-1)))
+            output = main + gate * residual
+        elif self.residual_mode == "attention":
+            attention = self._attention_pool(grouped, grouped_mask)
+            output = (
+                main
+                + self.attention_scale
+                * self.attention_projection(attention)
+            )
+        elif self.residual_mode == "mean_attention":
+            attention = self._attention_pool(grouped, grouped_mask)
+            output = (
+                main
+                + self.mean_scale * self.mean_projection(mean)
+                + self.attention_scale
+                * self.attention_projection(attention)
+            )
+        elif self.residual_mode == "max_attention":
+            attention = self._attention_pool(grouped, grouped_mask)
+            maximum = self._max_pool(grouped, grouped_mask)
+            output = (
+                main
+                + self.max_scale * self.max_projection(maximum)
+                + self.attention_scale
+                * self.attention_projection(attention)
+            )
+        elif self.residual_mode == "std_attention":
+            attention = self._attention_pool(grouped, grouped_mask)
+            standard_deviation = self._std_pool(
+                grouped, grouped_mask, mean
+            )
+            output = (
+                main
+                + self.std_scale
+                * self.std_projection(standard_deviation)
+                + self.attention_scale
+                * self.attention_projection(attention)
+            )
+        else:
+            attention = self._attention_pool(grouped, grouped_mask)
+            maximum = self._max_pool(grouped, grouped_mask)
+            standard_deviation = self._std_pool(
+                grouped, grouped_mask, mean
+            )
+            output = (
+                main
+                + self.mean_scale * self.mean_projection(mean)
+                + self.max_scale * self.max_projection(maximum)
+                + self.std_scale
+                * self.std_projection(standard_deviation)
+                + self.attention_scale
+                * self.attention_projection(attention)
+            )
+        return output, pooled_mask if pooled_mask is not None else output_mask
+
+
+class BlurPoolDownConvBlock(nn.Module):
+    """Learn local features, low-pass filter every token, then decimate."""
+
+    def __init__(self, in_channels=None, out_channels=None, kernel_size=5,
+                 stride=2, padding='same', activation='gelu', dropout=0.1,
+                 norm_type='layer', order='nac', residual=True, **kwargs):
+        super().__init__()
+        self.stride = int(stride)
+        self.out_channels = int(out_channels)
+        self.conv_feat = conv_block(
+            in_channels=in_channels, out_channels=out_channels,
+            kernel_size=kernel_size, stride=1, padding=padding,
+            activation=activation, dropout=dropout, norm_type=norm_type,
+            order=order, residual=residual,
+        )
+        # Binomial anti-aliasing filter. For stride 2 this is [1, 2, 1]/4;
+        # larger strides use a wider Pascal filter before decimation.
+        filter_order = max(2, 2 * self.stride - 2)
+        coefficients = torch.tensor(
+            [math.comb(filter_order, index) for index in range(filter_order + 1)],
+            dtype=torch.float32,
+        )
+        coefficients /= coefficients.sum()
+        self.register_buffer(
+            "blur_kernel",
+            coefficients.view(1, 1, -1).repeat(self.out_channels, 1, 1),
+        )
+        self.output_projection = nn.Linear(self.out_channels, self.out_channels)
+
+    def forward(self, x, mask=None):
+        x, mask = self.conv_feat(x, mask)
+        target_length = math.ceil(x.size(1) / self.stride)
+        _, output_mask = _window_mask(mask, self.stride, target_length)
+        channels_first = x.transpose(1, 2)
+        padding = self.blur_kernel.size(-1) // 2
+        blurred = F.conv1d(
+            channels_first, self.blur_kernel.to(dtype=x.dtype),
+            padding=padding, groups=self.out_channels,
+        )
+        output = blurred[:, :, ::self.stride].transpose(1, 2)
+        output = output[:, :target_length]
+        return self.output_projection(output), output_mask
+
+
+def select_adaptive_downsample_strides(
+    seq_length,
+    num_stages=2,
+    max_seq_len=1500,
+    stride_choices=(1, 2, 4, 8),
+):
+    """Select fixed-stage strides with the smallest sufficient compression.
+
+    Ties prefer balanced strides and then place the smaller stride earlier.
+    For two stages this gives, for example, ``(2, 4)`` instead of ``(1, 8)``
+    or ``(4, 2)``.
+    """
+    import itertools
+
+    seq_length = int(seq_length)
+    num_stages = int(num_stages)
+    max_seq_len = int(max_seq_len)
+    choices = tuple(sorted({int(value) for value in stride_choices}))
+    if seq_length < 1:
+        raise ValueError(f"seq_length must be >= 1, got {seq_length}")
+    if num_stages < 1:
+        raise ValueError(f"num_stages must be >= 1, got {num_stages}")
+    if max_seq_len < 1:
+        raise ValueError(f"max_seq_len must be >= 1, got {max_seq_len}")
+    if not choices or choices[0] < 1:
+        raise ValueError(
+            f"stride_choices must contain positive integers, got {stride_choices}"
+        )
+
+    candidates = []
+    # Nondecreasing strides give deterministic, progressively stronger
+    # downsampling and remove permutation-equivalent candidates.
+    for strides in itertools.combinations_with_replacement(choices, num_stages):
+        output_length = seq_length
+        for stride in strides:
+            output_length = math.ceil(output_length / stride)
+        if output_length <= max_seq_len:
+            product = math.prod(strides)
+            spread = max(strides) - min(strides)
+            candidates.append((product, spread, max(strides), strides, output_length))
+
+    if not candidates:
+        maximum_compression = max(choices) ** num_stages
+        raise ValueError(
+            "No adaptive stride schedule can reduce "
+            f"seq_length={seq_length} to max_seq_len={max_seq_len} with "
+            f"num_stages={num_stages} and stride_choices={list(choices)}. "
+            f"Maximum compression is {maximum_compression}x."
+        )
+    _, _, _, strides, output_length = min(candidates)
+    return tuple(strides), int(output_length)
+
+
+class FixedDepthAdaptiveStrideDownConvTower(nn.Module):
+    """Fixed-capacity tower whose strides adapt to the configured input length."""
+
+    def __init__(self, seq_length, in_channels=None, out_channels=256,
+                 kernel_size=5, padding='same', activation='gelu', dropout=0.1,
+                 norm_type='layer', order='nac', residual=True, num_stages=2,
+                 max_seq_len=1500, stride_choices=(1, 2, 4, 8)):
+        super().__init__()
+        self.seq_length = int(seq_length)
+        self.num_stages = int(num_stages)
+        self.max_seq_len = int(max_seq_len)
+        self.stride_choices = tuple(int(value) for value in stride_choices)
+        self.strides, self.output_seq_length = select_adaptive_downsample_strides(
+            seq_length=self.seq_length,
+            num_stages=self.num_stages,
+            max_seq_len=self.max_seq_len,
+            stride_choices=self.stride_choices,
+        )
+
+        self.blocks = nn.ModuleList()
+        current_channels = in_channels
+        for stride in self.strides:
+            self.blocks.append(
+                AdaptiveStrideDownConvBlock(
+                    in_channels=current_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    padding=padding,
+                    activation=activation,
+                    dropout=dropout,
+                    norm_type=norm_type,
+                    order=order,
+                    residual=residual,
+                )
+            )
+            current_channels = out_channels
+
+    def forward(self, x, mask=None):
+        if x.size(1) != self.seq_length:
+            raise ValueError(
+                "FixedDepthAdaptiveStrideDownConvTower was built for "
+                f"seq_length={self.seq_length}, but received {x.size(1)}"
+            )
+        for block in self.blocks:
+            x, mask = block(x, mask)
+        return x, mask
+
+
+class FixedDepthInformationPreservingDownConvTower(nn.Module):
+    """Fixed-depth tower with a selectable information-preserving stage."""
+
+    STAGE_TYPES = {
+        "patch_merge": PatchMergeDownConvBlock,
+        "pooled_residual": PooledResidualDownConvBlock,
+        "blur_pool": BlurPoolDownConvBlock,
+    }
+
+    def __init__(self, seq_length, stage_type, in_channels=None,
+                 out_channels=256, kernel_size=5, padding='same',
+                 activation='gelu', dropout=0.1, norm_type='layer',
+                 order='nac', residual=True, num_stages=2, max_seq_len=1500,
+                 stride_choices=(1, 2, 4, 8), **stage_kwargs):
+        super().__init__()
+        self.seq_length = int(seq_length)
+        self.stage_type = str(stage_type)
+        self.strides, self.output_seq_length = select_adaptive_downsample_strides(
+            self.seq_length, num_stages, max_seq_len, stride_choices
+        )
+        if self.stage_type not in self.STAGE_TYPES:
+            raise ValueError(f"Unknown stage_type: {self.stage_type}")
+        stage_class = self.STAGE_TYPES[self.stage_type]
+        self.blocks = nn.ModuleList()
+        current_channels = in_channels
+        for stride in self.strides:
+            self.blocks.append(stage_class(
+                in_channels=current_channels, out_channels=out_channels,
+                kernel_size=kernel_size, stride=stride, padding=padding,
+                activation=activation, dropout=dropout, norm_type=norm_type,
+                order=order, residual=residual, **stage_kwargs,
+            ))
+            current_channels = out_channels
+
+    def forward(self, x, mask=None):
+        if x.size(1) != self.seq_length:
+            raise ValueError(
+                f"Tower expects seq_length={self.seq_length}, got {x.size(1)}"
+            )
+        for block in self.blocks:
+            x, mask = block(x, mask)
+        return x, mask
+
+
 class DownConvTower(nn.Module):
     """Tower of DownConvBlocks that automatically downsamples sequence dimension.
 
@@ -1996,6 +2534,223 @@ class DownConvTower(nn.Module):
         return x, mask
 
 
+class RawMeanResidualDownConvTower(nn.Module):
+    """Original adaptive-depth tower using mean-residual downsampling blocks.
+
+    This preserves ``DownConvTower`` semantics: every stage uses stride 2 and
+    stages are applied until the sequence length is at most
+    ``seq_len_threshold``. The only architectural change is replacing each
+    ordinary ``DownConvBlock`` with ``PooledResidualDownConvBlock`` using a
+    mean-pooled residual branch.
+    """
+
+    def __init__(self, in_channels=None, out_channels=256, kernel_size=5,
+                 padding='same', activation='gelu', dropout=0.1,
+                 norm_type='layer', order='nac', residual=True, repeat=None,
+                 seq_len_threshold=1500, layer_scale_init=0.1,
+                 max_stages=20, **kwargs):
+        super().__init__()
+        self.repeat = None if repeat is None else int(repeat)
+        self.seq_len_threshold = int(seq_len_threshold)
+        num_blocks = self.repeat if self.repeat is not None else int(max_stages)
+        if num_blocks < 0:
+            raise ValueError(f"num_blocks must be >= 0, got {num_blocks}")
+
+        self.blocks = nn.ModuleList()
+        current_channels = in_channels
+        for _ in range(num_blocks):
+            self.blocks.append(
+                PooledResidualDownConvBlock(
+                    in_channels=current_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    stride=2,
+                    padding=padding,
+                    activation=activation,
+                    dropout=dropout,
+                    norm_type=norm_type,
+                    order=order,
+                    residual=residual,
+                    residual_pool="mean",
+                    layer_scale_init=layer_scale_init,
+                )
+            )
+            current_channels = out_channels
+
+    def forward(self, x, mask=None):
+        if self.repeat is not None:
+            blocks_to_use = self.repeat
+        else:
+            blocks_to_use = 0
+            current_seq_len = x.size(1)
+            while (
+                current_seq_len > self.seq_len_threshold
+                and blocks_to_use < len(self.blocks)
+            ):
+                current_seq_len = math.ceil(current_seq_len / 2)
+                blocks_to_use += 1
+
+        for block in self.blocks[:blocks_to_use]:
+            x, mask = block(x, mask)
+
+        if self.repeat is None and x.size(1) > self.seq_len_threshold:
+            import warnings
+            warnings.warn(
+                "RawMeanResidualDownConvTower: Sequence length "
+                f"({x.size(1)}) still exceeds threshold "
+                f"({self.seq_len_threshold}) after using all "
+                f"{len(self.blocks)} blocks. Consider increasing max_stages."
+            )
+        return x, mask
+
+
+class RawAttentionResidualDownConvTower(nn.Module):
+    """Original adaptive-depth tower with selectable window residuals."""
+
+    def __init__(self, residual_mode, in_channels=None, out_channels=256,
+                 kernel_size=5, padding='same', activation='gelu', dropout=0.1,
+                 norm_type='layer', order='nac', residual=True, repeat=None,
+                 seq_len_threshold=1500, layer_scale_init=0.1,
+                 gate_bias_init=-1.0, max_stages=20, **kwargs):
+        super().__init__()
+        self.residual_mode = str(residual_mode)
+        self.repeat = None if repeat is None else int(repeat)
+        self.seq_len_threshold = int(seq_len_threshold)
+        num_blocks = self.repeat if self.repeat is not None else int(max_stages)
+        if num_blocks < 0:
+            raise ValueError(f"num_blocks must be >= 0, got {num_blocks}")
+
+        self.blocks = nn.ModuleList()
+        current_channels = in_channels
+        for _ in range(num_blocks):
+            self.blocks.append(
+                AttentionResidualDownConvBlock(
+                    in_channels=current_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    stride=2,
+                    padding=padding,
+                    activation=activation,
+                    dropout=dropout,
+                    norm_type=norm_type,
+                    order=order,
+                    residual=residual,
+                    residual_mode=self.residual_mode,
+                    layer_scale_init=layer_scale_init,
+                    gate_bias_init=gate_bias_init,
+                )
+            )
+            current_channels = out_channels
+
+    def forward(self, x, mask=None):
+        if self.repeat is not None:
+            blocks_to_use = self.repeat
+        else:
+            blocks_to_use = 0
+            current_seq_len = x.size(1)
+            while (
+                current_seq_len > self.seq_len_threshold
+                and blocks_to_use < len(self.blocks)
+            ):
+                current_seq_len = math.ceil(current_seq_len / 2)
+                blocks_to_use += 1
+        for block in self.blocks[:blocks_to_use]:
+            x, mask = block(x, mask)
+        if self.repeat is None and x.size(1) > self.seq_len_threshold:
+            import warnings
+            warnings.warn(
+                "RawAttentionResidualDownConvTower: Sequence length "
+                f"({x.size(1)}) still exceeds threshold "
+                f"({self.seq_len_threshold}) after using all "
+                f"{len(self.blocks)} blocks. Consider increasing max_stages."
+            )
+        return x, mask
+
+
+class GrowingChannelDownConvTower(nn.Module):
+    """Original adaptive-depth tower with channels growing at every stage.
+
+    Stage ``i`` emits ``base_channels + (i + 1) * channel_growth`` channels.
+    A final projection returns to ``out_channels`` so the following Transformer
+    keeps a stable model width independent of marker count.
+    """
+
+    def __init__(self, seq_length, in_channels=None, out_channels=256,
+                 channel_growth=64, kernel_size=5, padding='same',
+                 activation='gelu', dropout=0.1, norm_type='layer',
+                 order='nac', residual=True, repeat=None,
+                 seq_len_threshold=1500, max_stages=20, **kwargs):
+        super().__init__()
+        self.seq_length = int(seq_length)
+        self.out_channels = int(out_channels)
+        self.channel_growth = int(channel_growth)
+        self.seq_len_threshold = int(seq_len_threshold)
+        if self.channel_growth < 1:
+            raise ValueError(
+                f"channel_growth must be >= 1, got {channel_growth}"
+            )
+        if repeat is None:
+            if self.seq_length <= self.seq_len_threshold:
+                self.num_stages = 0
+            else:
+                self.num_stages = math.ceil(
+                    math.log2(self.seq_length / self.seq_len_threshold)
+                )
+        else:
+            self.num_stages = int(repeat)
+        if self.num_stages > int(max_stages):
+            raise ValueError(
+                f"Need {self.num_stages} stages, exceeding max_stages={max_stages}"
+            )
+
+        self.stage_channels = tuple(
+            self.out_channels + (index + 1) * self.channel_growth
+            for index in range(self.num_stages)
+        )
+        self.blocks = nn.ModuleList()
+        current_channels = in_channels
+        for stage_channels in self.stage_channels:
+            self.blocks.append(
+                DownConvBlock(
+                    in_channels=current_channels,
+                    out_channels=stage_channels,
+                    kernel_size=kernel_size,
+                    padding=padding,
+                    activation=activation,
+                    dropout=dropout,
+                    norm_type=norm_type,
+                    order=order,
+                    residual=residual,
+                )
+            )
+            current_channels = stage_channels
+
+        if self.num_stages == 0:
+            if in_channels is None or int(in_channels) == self.out_channels:
+                self.output_projection = nn.Identity()
+            else:
+                self.output_projection = nn.Linear(
+                    int(in_channels), self.out_channels
+                )
+        elif current_channels == self.out_channels:
+            self.output_projection = nn.Identity()
+        else:
+            self.output_projection = nn.Sequential(
+                nn.LayerNorm(current_channels),
+                nn.Linear(current_channels, self.out_channels),
+            )
+
+    def forward(self, x, mask=None):
+        if x.size(1) != self.seq_length:
+            raise ValueError(
+                f"GrowingChannelDownConvTower expects {self.seq_length} markers, "
+                f"got {x.size(1)}"
+            )
+        for block in self.blocks:
+            x, mask = block(x, mask)
+        return self.output_projection(x), mask
+
+
 def down_conv_block(in_channels=None, out_channels=256, kernel_size=5,
                     padding='same', activation='gelu', dropout=0.1,
                     norm_type='layer', order='nac', residual=True, **kwargs):
@@ -2031,6 +2786,145 @@ def down_conv_block(in_channels=None, out_channels=256, kernel_size=5,
         order=order,
         residual=residual
     )
+
+
+def fixed_depth_adaptive_stride_down_conv_tower(
+    seq_length, in_channels=None, out_channels=256, kernel_size=5,
+    padding='same', activation='gelu', dropout=0.1, norm_type='layer',
+    order='nac', residual=True, num_stages=2, max_seq_len=1500,
+    stride_choices=(1, 2, 4, 8), **kwargs
+):
+    """Build a fixed-depth DownConv tower with input-adaptive stage strides."""
+    return FixedDepthAdaptiveStrideDownConvTower(
+        seq_length=seq_length,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        kernel_size=kernel_size,
+        padding=padding,
+        activation=activation,
+        dropout=dropout,
+        norm_type=norm_type,
+        order=order,
+        residual=residual,
+        num_stages=num_stages,
+        max_seq_len=max_seq_len,
+        stride_choices=stride_choices,
+    )
+
+
+def growing_channel_down_conv_tower(
+    seq_length, in_channels=None, out_channels=256, channel_growth=64,
+    kernel_size=5, padding='same', activation='gelu', dropout=0.1,
+    norm_type='layer', order='nac', residual=True, repeat=None,
+    seq_len_threshold=1500, max_stages=20, **kwargs
+):
+    """Build an adaptive-depth DownConvTower with per-stage channel growth."""
+    return GrowingChannelDownConvTower(
+        seq_length=seq_length, in_channels=in_channels,
+        out_channels=out_channels, channel_growth=channel_growth,
+        kernel_size=kernel_size, padding=padding, activation=activation,
+        dropout=dropout, norm_type=norm_type, order=order,
+        residual=residual, repeat=repeat,
+        seq_len_threshold=seq_len_threshold, max_stages=max_stages,
+    )
+
+
+def _information_preserving_tower(stage_type, seq_length, in_channels=None,
+                                  out_channels=256, kernel_size=5,
+                                  padding='same', activation='gelu', dropout=0.1,
+                                  norm_type='layer', order='nac', residual=True,
+                                  num_stages=2, max_seq_len=1500,
+                                  stride_choices=(1, 2, 4, 8), **kwargs):
+    return FixedDepthInformationPreservingDownConvTower(
+        seq_length=seq_length, stage_type=stage_type,
+        in_channels=in_channels, out_channels=out_channels,
+        kernel_size=kernel_size, padding=padding, activation=activation,
+        dropout=dropout, norm_type=norm_type, order=order,
+        residual=residual, num_stages=num_stages, max_seq_len=max_seq_len,
+        stride_choices=stride_choices, **kwargs,
+    )
+
+
+def patch_merge_down_conv_tower(**kwargs):
+    """Fixed-depth patch-merging tower with an average residual."""
+    return _information_preserving_tower("patch_merge", **kwargs)
+
+
+def mean_residual_down_conv_tower(**kwargs):
+    """Fixed-depth strided-convolution tower with an average-pool residual."""
+    kwargs["residual_pool"] = "mean"
+    return _information_preserving_tower("pooled_residual", **kwargs)
+
+
+def raw_mean_residual_down_conv_tower(
+    in_channels=None, out_channels=256, kernel_size=5, padding='same',
+    activation='gelu', dropout=0.1, norm_type='layer', order='nac',
+    residual=True, repeat=None, seq_len_threshold=1500,
+    layer_scale_init=0.1, max_stages=20, **kwargs
+):
+    """Original adaptive-depth DownConvTower with mean-pooled residuals."""
+    return RawMeanResidualDownConvTower(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        kernel_size=kernel_size,
+        padding=padding,
+        activation=activation,
+        dropout=dropout,
+        norm_type=norm_type,
+        order=order,
+        residual=residual,
+        repeat=repeat,
+        seq_len_threshold=seq_len_threshold,
+        layer_scale_init=layer_scale_init,
+        max_stages=max_stages,
+    )
+
+
+def _raw_attention_residual_tower(residual_mode, **kwargs):
+    return RawAttentionResidualDownConvTower(
+        residual_mode=residual_mode, **kwargs
+    )
+
+
+def raw_attention_residual_down_conv_tower(**kwargs):
+    """Raw DownConvTower with learned attention pooling residuals."""
+    return _raw_attention_residual_tower("attention", **kwargs)
+
+
+def raw_gated_mean_residual_down_conv_tower(**kwargs):
+    """Raw DownConvTower with dynamically gated mean residuals."""
+    return _raw_attention_residual_tower("gated_mean", **kwargs)
+
+
+def raw_mean_attention_residual_down_conv_tower(**kwargs):
+    """Raw DownConvTower with parallel mean and attention residuals."""
+    return _raw_attention_residual_tower("mean_attention", **kwargs)
+
+
+def raw_max_attention_residual_down_conv_tower(**kwargs):
+    """Raw DownConvTower with parallel max and attention residuals."""
+    return _raw_attention_residual_tower("max_attention", **kwargs)
+
+
+def raw_std_attention_residual_down_conv_tower(**kwargs):
+    """Raw DownConvTower with parallel std and attention residuals."""
+    return _raw_attention_residual_tower("std_attention", **kwargs)
+
+
+def raw_multi_pool_residual_down_conv_tower(**kwargs):
+    """Raw tower with parallel mean, max, std, and attention residuals."""
+    return _raw_attention_residual_tower("multi_pool", **kwargs)
+
+
+def mean_max_residual_down_conv_tower(**kwargs):
+    """Fixed-depth tower with average- and max-pool residual branches."""
+    kwargs["residual_pool"] = "mean_max"
+    return _information_preserving_tower("pooled_residual", **kwargs)
+
+
+def blur_pool_down_conv_tower(**kwargs):
+    """Fixed-depth anti-aliased tower using binomial BlurPool filters."""
+    return _information_preserving_tower("blur_pool", **kwargs)
 
 
 def down_conv_tower(in_channels=None, out_channels=256, kernel_size=5,
@@ -3270,7 +4164,7 @@ def global_pool(pool_type='mean', d_model=None, pool_axis=1, dropout=0.1, **kwar
 
 
 def multi_head_pool(d_model, num_heads=4, dropout=0.1, pool_axis=1,
-                    attn_normalize="softmax", **kwargs):
+                    attn_normalize="softmax", pool_types=None, **kwargs):
     """Multi-head pooling block.
 
     Combines mean, max, attention, and std pooling strategies in parallel,
@@ -3292,6 +4186,7 @@ def multi_head_pool(d_model, num_heads=4, dropout=0.1, pool_axis=1,
         dropout=dropout,
         pool_axis=pool_axis,
         attn_normalize=attn_normalize,
+        pool_types=pool_types,
     )
 
 
@@ -5074,6 +5969,26 @@ name_func = {
     'conv_tower': conv_tower,
     'down_conv_block': down_conv_block,
     'down_conv_tower': down_conv_tower,
+    'fixed_depth_adaptive_stride_down_conv_tower':
+        fixed_depth_adaptive_stride_down_conv_tower,
+    'growing_channel_down_conv_tower': growing_channel_down_conv_tower,
+    'patch_merge_down_conv_tower': patch_merge_down_conv_tower,
+    'mean_residual_down_conv_tower': mean_residual_down_conv_tower,
+    'raw_mean_residual_down_conv_tower': raw_mean_residual_down_conv_tower,
+    'raw_attention_residual_down_conv_tower':
+        raw_attention_residual_down_conv_tower,
+    'raw_gated_mean_residual_down_conv_tower':
+        raw_gated_mean_residual_down_conv_tower,
+    'raw_mean_attention_residual_down_conv_tower':
+        raw_mean_attention_residual_down_conv_tower,
+    'raw_max_attention_residual_down_conv_tower':
+        raw_max_attention_residual_down_conv_tower,
+    'raw_std_attention_residual_down_conv_tower':
+        raw_std_attention_residual_down_conv_tower,
+    'raw_multi_pool_residual_down_conv_tower':
+        raw_multi_pool_residual_down_conv_tower,
+    'mean_max_residual_down_conv_tower': mean_max_residual_down_conv_tower,
+    'blur_pool_down_conv_tower': blur_pool_down_conv_tower,
 
     # Dense blocks (DenseNet)
     'dense_block': dense_block,

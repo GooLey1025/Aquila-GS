@@ -551,35 +551,57 @@ class MultiHeadPooling(nn.Module):
     """
 
     def __init__(self, d_model, num_heads=4, dropout=0.1, pool_axis=1,
-                 attn_normalize="softmax"):
+                 attn_normalize="softmax", pool_types=None):
         super().__init__()
         self.d_model = d_model
-        self.num_heads = num_heads
         self.pool_axis = pool_axis
         self.attn_normalize = attn_normalize
+        if pool_types is None:
+            pool_types = ("mean", "max", "attention", "std")
+        self.pool_types = tuple(str(pool_type) for pool_type in pool_types)
+        valid_pool_types = {"mean", "max", "attention", "std"}
+        unknown_pool_types = set(self.pool_types) - valid_pool_types
+        if unknown_pool_types:
+            raise ValueError(
+                "Unknown pooling types: "
+                f"{sorted(unknown_pool_types)}; expected a subset of "
+                f"{sorted(valid_pool_types)}"
+            )
+        if not self.pool_types:
+            raise ValueError("pool_types must contain at least one pooling type")
+        if len(set(self.pool_types)) != len(self.pool_types):
+            raise ValueError(f"pool_types contains duplicates: {self.pool_types}")
+        if num_heads != len(self.pool_types) and num_heads != 4:
+            raise ValueError(
+                f"num_heads={num_heads} does not match "
+                f"len(pool_types)={len(self.pool_types)}"
+            )
+        self.num_heads = len(self.pool_types)
 
         # Attention pooling head
-        if pool_axis == 1:
+        if "attention" in self.pool_types and pool_axis == 1:
             # Pool over sequence dimension
             self.attention_pool = nn.Sequential(
                 # nn.Linear(d_model, d_model),
                 # nn.Tanh(),
                 nn.Linear(d_model, 1)
             )
-        else:
+        elif "attention" in self.pool_types:
             # Pool over feature dimension
             self.attention_pool = nn.Linear(1, 1)
+        else:
+            self.attention_pool = None
 
         # Fusion layer to combine all pooling heads
         if pool_axis == 1:
             # Output shape: (batch, d_model)
-            self.fusion = nn.Linear(d_model * num_heads, d_model)
+            self.fusion = nn.Linear(d_model * self.num_heads, d_model)
             self.layer_norm = nn.LayerNorm(d_model)
         else:
             # Output shape: (batch, seq_len)
             # Fusion layer: (batch, seq_len, num_heads) -> (batch, seq_len, 1)
             # This doesn't depend on seq_len, so we can create it in __init__
-            self.fusion = nn.Linear(num_heads, 1)
+            self.fusion = nn.Linear(self.num_heads, 1)
             # LayerNorm requires fixed size, so we'll skip it for variable-length sequences
             self.layer_norm = None
 
@@ -606,7 +628,8 @@ class MultiHeadPooling(nn.Module):
                     dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
             else:
                 mean_pooled = x.mean(dim=1)
-            pooled.append(mean_pooled)
+            if "mean" in self.pool_types:
+                pooled.append(mean_pooled)
 
             # 2. Max pooling
             if mask is not None:
@@ -614,18 +637,20 @@ class MultiHeadPooling(nn.Module):
                 max_pooled = x_masked.max(dim=1)[0]
             else:
                 max_pooled = x.max(dim=1)[0]
-            pooled.append(max_pooled)
+            if "max" in self.pool_types:
+                pooled.append(max_pooled)
 
             # 3. Attention pooling
-            attn_logits = self.attention_pool(
-                x).squeeze(-1)  # (batch, seq_len)
-            if mask is not None:
-                attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
-            attn_weights = attention_normalize(
-                attn_logits, dim=1, normalize=self.attn_normalize
-            ).unsqueeze(-1)  # (batch, seq_len, 1)
-            attn_pooled = (x * attn_weights).sum(dim=1)
-            pooled.append(attn_pooled)
+            if "attention" in self.pool_types:
+                attn_logits = self.attention_pool(
+                    x).squeeze(-1)  # (batch, seq_len)
+                if mask is not None:
+                    attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
+                attn_weights = attention_normalize(
+                    attn_logits, dim=1, normalize=self.attn_normalize
+                ).unsqueeze(-1)  # (batch, seq_len, 1)
+                attn_pooled = (x * attn_weights).sum(dim=1)
+                pooled.append(attn_pooled)
 
             # 4. Std pooling (capture variability)
             if mask is not None:
@@ -637,7 +662,8 @@ class MultiHeadPooling(nn.Module):
                                         mask_expanded.sum(dim=1).clamp(min=1))
             else:
                 std_pooled = x.std(dim=1)
-            pooled.append(std_pooled)
+            if "std" in self.pool_types:
+                pooled.append(std_pooled)
 
             # Concatenate all pooling results
             concat = torch.cat(pooled, dim=-1)  # (batch, d_model * num_heads)
@@ -655,25 +681,29 @@ class MultiHeadPooling(nn.Module):
 
             # 1. Mean pooling over feature dimension
             mean_pooled = x.mean(dim=2)  # (batch, seq_len)
-            pooled.append(mean_pooled)
+            if "mean" in self.pool_types:
+                pooled.append(mean_pooled)
 
             # 2. Max pooling over feature dimension
             max_pooled = x.max(dim=2)[0]  # (batch, seq_len)
-            pooled.append(max_pooled)
+            if "max" in self.pool_types:
+                pooled.append(max_pooled)
 
             # 3. Attention pooling over feature dimension
-            x_reshaped = x.unsqueeze(-1)  # (batch, seq_len, d_model, 1)
-            attn_logits = self.attention_pool(
-                x_reshaped).squeeze(-1)  # (batch, seq_len, d_model)
-            attn_weights = attention_normalize(
-                attn_logits, dim=2, normalize=self.attn_normalize
-            )  # (batch, seq_len, d_model)
-            attn_pooled = (x * attn_weights).sum(dim=2)  # (batch, seq_len)
-            pooled.append(attn_pooled)
+            if "attention" in self.pool_types:
+                x_reshaped = x.unsqueeze(-1)  # (batch, seq_len, d_model, 1)
+                attn_logits = self.attention_pool(
+                    x_reshaped).squeeze(-1)  # (batch, seq_len, d_model)
+                attn_weights = attention_normalize(
+                    attn_logits, dim=2, normalize=self.attn_normalize
+                )  # (batch, seq_len, d_model)
+                attn_pooled = (x * attn_weights).sum(dim=2)  # (batch, seq_len)
+                pooled.append(attn_pooled)
 
             # 4. Std pooling over feature dimension
             std_pooled = x.std(dim=2)  # (batch, seq_len)
-            pooled.append(std_pooled)
+            if "std" in self.pool_types:
+                pooled.append(std_pooled)
 
             # Stack all pooling results
             concat = torch.stack(pooled, dim=-1)  # (batch, seq_len, num_heads)

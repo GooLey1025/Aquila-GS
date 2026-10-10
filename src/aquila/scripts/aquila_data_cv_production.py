@@ -36,6 +36,7 @@ class DeploymentPreparationConfig:
     encoding_type: str = "diploid_onehot"
     variant_type: str | None = None
     id_prefix: str | None = None
+    normalize_heterozygous_order: bool = False
     sample_id_column: str | None = None
     traits: Sequence[str] | None = None
     classification_tasks: Sequence[str] | None = None
@@ -166,6 +167,9 @@ class DeploymentDataPreparer(NestedCVDataPreparer):
                 "data_mode": "deployment",
                 "cv_folds": len(folds),
                 "cv_seed": self.deployment_config.seed,
+                "normalize_heterozygous_order": (
+                    self.deployment_config.normalize_heterozygous_order
+                ),
                 "preprocessing": {
                     "skew_threshold": self.deployment_config.skew_threshold,
                     "epsilon": self.deployment_config.preprocessing_epsilon,
@@ -180,14 +184,24 @@ class DeploymentDataPreparer(NestedCVDataPreparer):
         return metadata
 
     def _parse_genotypes(self) -> Any:
-        from aquila.encoding import parse_genotype_file
+        from aquila.encoding import (
+            normalize_heterozygous_order,
+            parse_genotype_file,
+        )
 
-        return parse_genotype_file(
+        parsed = parse_genotype_file(
             str(self.deployment_config.genotype_file),
             encoding_type=self.deployment_config.encoding_type,
             variant_type=self.deployment_config.variant_type,
             id_prefix=self.deployment_config.id_prefix,
         )
+        if self.deployment_config.normalize_heterozygous_order:
+            normalized = normalize_heterozygous_order(parsed)
+            print(
+                f"Normalized {normalized} ALT/REF heterozygous call(s) "
+                "to REF/ALT order"
+            )
+        return parsed
 
     def _validate_deployment_inputs(self) -> None:
         config = self.deployment_config
@@ -354,6 +368,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--normalize-heterozygous-order",
+        action="store_true",
+        help=(
+            "Treat heterozygous allele order as unphased by normalizing 1/0 "
+            "and 1|0 to the same REF/ALT encoding as 0/1 before saving X.pt. "
+            "The input VCF is not modified."
+        ),
+    )
+    parser.add_argument(
         "--sample-id-column",
         default=None,
         help="Phenotype sample ID column; defaults to the first column.",
@@ -417,6 +440,7 @@ def main() -> None:
         encoding_type=args.encoding,
         variant_type=args.variant_type,
         id_prefix=args.id_prefix,
+        normalize_heterozygous_order=args.normalize_heterozygous_order,
         sample_id_column=args.sample_id_column,
         traits=args.traits,
         classification_tasks=args.classification_tasks,

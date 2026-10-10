@@ -18,39 +18,37 @@ aquila_data_cv_production.py \
   --encoding-type diploid_onehot \
   --variant-type snp \
   --id-prefix SNP- \
-  --folds 5 \
+  --folds 10 \
   --seed 42 \
-  -o 655rice.r2_0.045.aquila-snp.production.data \
+  -o 655rice.r2_0.045.aquila-snp.production.10folds.data \
   --overwrite
 aquila_train_cv_production.py \
-  --data-dir 655rice.r2_0.045.aquila-snp.production.data \
+  --data-dir 655rice.r2_0.045.aquila-snp.production.10fods.norm_het.data \
   --config ../benchmark/aquila-snp/32hpo_budgets.yaml \
-  -o results/655rice.r2_0.045.aquila-snp \
+  -o results/655rice.r2_0.045.aquila-snp.10folds.norm_het \
   --precision bf16 --live-metrics-log \
   --use-deterministic --overwrite
 
 ./aquila_export_locked_config.py \
-  --summary results/655rice.r2_0.045.aquila-snp/summary.json \
+  --summary results/655rice.r2_0.045.aquila-snp.10folds/summary.json \
   -o 655rice.r2_0.045.aquila-snp.locked.yaml
 
 for seed in $(seq 43 51); do
   aquila_train.py \
-    --data-dir 655rice.r2_0.045.aquila-snp.production.data \
+    --data-dir 655rice.r2_0.045.aquila-snp.production.10folds.data \
     --config 655rice.r2_0.045.aquila-snp.locked.yaml \
     --seed "$seed" \
-    -o "results/655rice.r2_0.045.aquila-snp/seeds/seed_${seed}" \
+    -o "results/655rice.r2_0.045.aquila-snp.10folds/seeds/seed_${seed}" \
     --precision bf16 \
     --live-metrics-log \
     --use-deterministic
 done
 
-# rrBLUP: same production protocol on the Aquila-SNP full reference set.
-# Five folds select the grid point; the saved model is refit on every sample.
+# rrBLUP: fixed REML parameters, so fit the full reference set directly.
 python rrBLUP/rrblup_production.py \
-  --data-dir 655rice.r2_0.045.aquila-snp.production.data \
+  --data-dir 655rice.r2_0.045.aquila-snp.production.10folds.data \
   --config rrBLUP/configs/production.yaml \
-  -o results/655rice.r2_0.045.rrblup \
-  --overwrite
+  -o results/655rice.r2_0.045.aquila-snp.rrblup
 
 
 # For Aquila-Vars

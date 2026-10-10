@@ -54,6 +54,63 @@ def variant_id_matches_prefixes(
 _ACGT = frozenset("ACGT")
 
 
+def normalize_heterozygous_order(parsed: object) -> int:
+    """Normalize ALT/REF heterozygotes to REF/ALT in parsed VCF encodings.
+
+    Diploid SNP one-hot uses two four-channel nucleotide blocks, while
+    INDEL/SV genotype-class one-hot uses channels 1 and 2 for 0/1 and 1/0.
+    The parsed structure is updated in place and the number of normalized
+    genotype calls is returned.
+    """
+    if not isinstance(parsed, dict):
+        return 0
+    if "matrix" not in parsed:
+        return sum(
+            normalize_heterozygous_order(branch)
+            for branch in parsed.values()
+            if branch is not None
+        )
+
+    matrix = np.asarray(parsed["matrix"])
+    if matrix.ndim != 3:
+        return 0
+
+    normalized = 0
+    if matrix.shape[2] == 8:
+        nucleotide_index = {"A": 0, "C": 1, "G": 2, "T": 3}
+        refs = parsed.get("refs") or []
+        alts = parsed.get("alts") or []
+        for marker_index in range(matrix.shape[1]):
+            if marker_index >= len(refs) or marker_index >= len(alts):
+                continue
+            ref_index = nucleotide_index.get(str(refs[marker_index]).upper())
+            alt_index = nucleotide_index.get(str(alts[marker_index]).upper())
+            if ref_index is None or alt_index is None:
+                continue
+            reverse = (
+                (matrix[:, marker_index, alt_index] > 0.5)
+                & (matrix[:, marker_index, 4 + ref_index] > 0.5)
+            )
+            if not np.any(reverse):
+                continue
+            first = matrix[reverse, marker_index, :4].copy()
+            matrix[reverse, marker_index, :4] = matrix[
+                reverse, marker_index, 4:
+            ]
+            matrix[reverse, marker_index, 4:] = first
+            normalized += int(np.count_nonzero(reverse))
+    elif matrix.shape[2] == 4:
+        reverse = matrix[:, :, 2] > 0.5
+        if np.any(reverse):
+            reversed_calls = matrix[reverse].copy()
+            matrix[reverse, 1] = reversed_calls[:, 2]
+            matrix[reverse, 2] = reversed_calls[:, 1]
+            normalized = int(np.count_nonzero(reverse))
+
+    parsed["matrix"] = matrix
+    return normalized
+
+
 def _is_star_allele(ref: str | None, alt: str | None) -> bool:
     """True when REF or ALT is VCF ``*`` (spanning deletion); encode as all-zero."""
     if ref is None or alt is None:

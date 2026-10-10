@@ -36,7 +36,7 @@ For Aquila, missing phenotypic observations are handled natively through a maske
 wget https://iagr.genomics.cn/static/gstool/data/GSTP008/population/GSTP008.pheno
 # However, the 705rice have a total of 50 low-depth duplicated samples, filtering required.
 
-aquila_cv.py --phenotype Rice655.pheno -o 655rice_nested_cv.json --outer-folds 5 --inner-folds 4 --seed 42
+aquila_cv.py --phenotype Rice655.pheno -o 655rice_nested_cv_10folds.json --outer-folds 10 --inner-folds 4 --seed 42
 ```
 
 The JSON mapping fixes both outer and inner folds and was used throughout the pipeline, including [GWAS lead-variant selection](https://github.com/GooLey1025/Multi_Source_Marker_Panel_generation), to avoid information leakage. Specifically, GWAS discovery and lead-variant selection were performed using only the training samples within each outer fold, while test samples were completely excluded from this process.
