@@ -1,13 +1,13 @@
-rsync -rlthP 6000:/data3/home/gulei/projects/GraphPan/Multi_Source_Marker_Panel_generation/655rice.wg_ld_r2_scan/runs/r2_0.045/panel_output/final_panel/655rice.final.imputed.panel.vcf.gz .
+rsync -rlthP 6000:/data3/home/gulei/projects/GraphPan/Multi_Source_Marker_Panel_generation/655rice.wg_ld_r2_scan/runs/r2_0.035/panel_output/final_panel/655rice.final.imputed.panel.vcf.gz ./655rice.msmp_panel.imputed.snp_indel_sv.vcf.gz
 
-bcftools annotate -x 'INFO,^FORMAT/GT' -Ou 655rice.final.imputed.panel.vcf.gz \
+bcftools annotate -x 'INFO,^FORMAT/GT' -Ou 655rice.msmp_panel.imputed.snp_indel_sv.vcf.gz \
 | bcftools view \
 | awk '
   /^##fileformat=/ || /^##contig=/ || /^##FORMAT=<ID=GT,/ { print; next }
   /^##ALT=<ID=/ && $0 !~ /;/ { print; next }
   /^##/ { next }
   { print }
-' | bgzip -c > 655rice.r2_0.045.panel.vcf.gz
+' | bgzip -c > 655rice.msmp_panel.imputed.snp_indel_sv.clean.vcf.gz
 
 conda activate aquila
 
