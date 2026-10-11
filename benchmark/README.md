@@ -122,7 +122,7 @@ for FOLD in {0..9}; do
   aquila_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config  32hpo_budgets.yaml \
-    -o "results/Rice655/fold_${FOLD}" \
+    -o "results/Rice655_10folds/fold_${FOLD}" \
     --live-metrics-log \
     --use-deterministic \
     --overwrite
@@ -140,7 +140,7 @@ for FOLD in {0..9}; do
   aquila_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.vars.cv.data/fold_${FOLD}" \
     --config 32hpo_budgets.aquila-vars.yaml \
-    -o "results/Rice655/fold_${FOLD}" \
+    -o "results/Rice655_10folds/fold_${FOLD}" \
     --live-metrics-log \
     --use-deterministic \
     --overwrite
@@ -161,7 +161,7 @@ for FOLD in {0..9}; do
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
-    -o "results/Rice655/fold_${FOLD}" \
+    -o "results/Rice655_10folds/fold_${FOLD}" \
     --jobs-per-gpu 2 \
     --overwrite
 done
@@ -182,7 +182,7 @@ for FOLD in {0..9}; do
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
-    -o "results/Rice655/fold_${FOLD}" \
+    -o "results/Rice655_10folds/fold_${FOLD}" \
     --jobs-per-gpu 2 \
     --overwrite
 done
@@ -197,7 +197,7 @@ for FOLD in {0..9}; do
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/xgboost_nested_cv.yaml \
     --outer-folds "$FOLD" \
-    -o "results/Rice655/fold_${FOLD}" \
+    -o "results/Rice655_10folds/fold_${FOLD}" \
     --n-jobs 32 \
     --overwrite
 done
@@ -214,7 +214,7 @@ for FOLD in {0..9}; do
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
-    -o "results/Rice655/fold_${FOLD}" \
+    -o "results/Rice655_10folds/fold_${FOLD}" \
     --overwrite
 done
 ```
@@ -230,7 +230,7 @@ for FOLD in {0..9}; do
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
-    -o "results/Rice655/fold_${FOLD}" \
+    -o "results/Rice655_10folds/fold_${FOLD}" \
     --overwrite
 done
 ```
@@ -244,7 +244,7 @@ for FOLD in {0..9}; do
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
-    -o "results/Rice655/fold_${FOLD}" \
+    -o "results/Rice655_10folds/fold_${FOLD}" \
     --overwrite
 done
 ```
@@ -258,7 +258,7 @@ for FOLD in {0..9}; do
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
-    -o "results/Rice655/fold_${FOLD}" \
+    -o "results/Rice655_10folds/fold_${FOLD}" \
     --overwrite
 done
 ```
@@ -275,7 +275,7 @@ for FOLD in {0..9}; do
     --config configs/CLCNet_nested_cv.yaml \
     --outer-folds "$FOLD" \
     --jobs-per-gpu 2 \
-    -o "results/Rice655/fold_${FOLD}" \
+    -o "results/Rice655_10folds/fold_${FOLD}" \
     --overwrite
 done
 ```
@@ -292,7 +292,7 @@ for FOLD in {0..9}; do
     --config configs/MeNet_nested_cv.yaml \
     --outer-folds "$FOLD" \
     --jobs-per-gpu 2 \
-    -o "results/Rice655/fold_${FOLD}" \
+    -o "results/Rice655_10folds/fold_${FOLD}" \
     --overwrite
 done
 ```
@@ -311,7 +311,7 @@ for FOLD in {0..9}; do
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/Whisperer_nested_cv.yaml \
     --outer-folds "$FOLD" \
-    --output-dir "results/Rice655/fold_${FOLD}" \
+    --output-dir "results/Rice655_10folds/fold_${FOLD}" \
     --jobs-per-gpu 2 \
     --overwrite
 done
@@ -330,7 +330,7 @@ for FOLD in {0..9}; do
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/BNNs_nested_cv.yaml \
     --outer-folds "$FOLD" \
-    --output-dir "results/Rice655/fold_${FOLD}" \
+    --output-dir "results/Rice655_10folds/fold_${FOLD}" \
     --jobs-per-gpu 2 \
     --overwrite
 done
