@@ -420,6 +420,7 @@ class PersistentGPUPool:
         self._workers: list[Any] = []
         self._closed = False
         self._aborted = False
+        self._submitted_job_ids: set[int] = set()
         for device in self._devices:
             process = self._context.Process(
                 target=_gpu_job_worker,
@@ -440,9 +441,18 @@ class PersistentGPUPool:
     def devices(self) -> tuple[str, ...]:
         return tuple(self._devices)
 
+    @property
+    def workers_alive(self) -> bool:
+        """Return whether at least one worker process is still alive."""
+        return any(process.is_alive() for process in self._workers)
+
     def submit(self, job: Any) -> None:
         if self._closed:
             raise RuntimeError("PersistentGPUPool is already shut down")
+        job_id = int(getattr(job, self._job_id_attr))
+        if job_id in self._submitted_job_ids:
+            raise ValueError(f"Duplicate GPU job id: {job_id}")
+        self._submitted_job_ids.add(job_id)
         self._task_queue.put(job)
 
     def submit_many(self, jobs: Sequence[Any]) -> None:

@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import platform
 import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty
 from typing import Any, Dict, Mapping, Sequence
 
 import numpy as np
@@ -45,6 +47,8 @@ from aquila.training.cuda_runtime import (
     train_deterministic_enabled,
 )
 from aquila.training.distributed import (
+    GPUWorkResult,
+    PersistentGPUPool,
     detect_gpu_ids,
     execute_gpu_jobs,
     share_memory_tensors,
@@ -54,11 +58,14 @@ from aquila.training.hpo import (
     HPOResult,
     InnerFoldResult,
     evaluate_candidate,
+    finite_parameter_candidates,
     generate_grid_candidates,
     merge_config,
     normalize_hpo_config,
+    parameter_key,
     run_hpo,
     select_best_candidate,
+    unique_bayesian_trial,
 )
 from aquila.training.trainer import (
     NestedCVTrainer,
@@ -72,6 +79,16 @@ class DeploymentCandidateJob:
     """One grid-search candidate evaluated across every deployment CV fold."""
 
     job_id: int
+    parameters: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DeploymentFoldJob:
+    """One Bayesian trial evaluated on one deployment validation fold."""
+
+    job_id: int
+    candidate_id: int
+    fold_id: int
     parameters: Dict[str, Any]
 
 
@@ -390,11 +407,212 @@ def _deployment_candidate_worker(
     return _evaluate_candidate(job.job_id, job.parameters, context, device)
 
 
+def _deployment_fold_worker(
+    job: DeploymentFoldJob,
+    device: str,
+    context: DeploymentHPOContext,
+) -> Dict[str, Any]:
+    """Train one Bayesian candidate on one fold in a persistent GPU worker."""
+    metrics_log_path = None
+    if context.live_metrics_log:
+        metrics_log_path = (
+            Path(context.output_directory)
+            / f"candidate_{job.candidate_id}"
+            / f"fold_{job.fold_id}"
+            / "metrics.jsonl"
+        )
+    training = _train_deployment_fold(
+        prepared=context.prepared_data,
+        config=context.config,
+        split=context.folds[job.fold_id],
+        candidate_id=job.candidate_id,
+        parameters=job.parameters,
+        device=device,
+        regression_tasks=context.regression_tasks,
+        classification_tasks=context.classification_tasks,
+        metric=context.metric,
+        direction=context.direction,
+        patience=context.patience,
+        loader_options=context.loader_options,
+        metrics_log_path=metrics_log_path,
+    )
+    metrics = copy.deepcopy(dict(training.best_metrics))
+    metric_value = metrics.get("avg_pearson")
+    if metric_value is None:
+        metric_path = context.metric.replace("/", ".")
+        current: Any = metrics
+        for part in metric_path.split("."):
+            if isinstance(current, Mapping) and part in current:
+                current = current[part]
+            else:
+                aliases = {
+                    "best.val_r": "avg_pearson",
+                    "val_r": "avg_pearson",
+                    "pearson": "avg_pearson",
+                }
+                alias = aliases.get(metric_path) or aliases.get(part)
+                if alias not in metrics:
+                    raise KeyError(f"Metric path '{context.metric}' is not present")
+                current = metrics[alias]
+                break
+        metric_value = current
+    return {
+        "candidate_id": int(job.candidate_id),
+        "fold_id": int(job.fold_id),
+        "metric": float(metric_value),
+        "best_epoch": int(training.best_epoch),
+        "metrics": metrics,
+    }
+
+
+def _run_bayesian_hpo_on_gpus(
+    context: DeploymentHPOContext,
+    gpu_ids: Sequence[int],
+) -> HPOResult:
+    """Run strict sequential TPE trials with folds spread across all GPUs."""
+    try:
+        import optuna
+    except ImportError as error:
+        raise ImportError("Bayesian HPO requires optuna") from error
+
+    normalized = normalize_hpo_config(context.config.get("hpo", {}))
+    sampler = optuna.samplers.TPESampler(seed=normalized["seed"])
+    study = optuna.create_study(
+        direction=normalized["direction"],
+        sampler=sampler,
+    )
+    candidates: list[CandidateResult] = []
+    seen: set[tuple[tuple[str, Any], ...]] = set()
+    finite_candidates = finite_parameter_candidates(normalized["parameters"])
+    if finite_candidates is not None:
+        if normalized["n_trials"] > len(finite_candidates):
+            raise ValueError(
+                f"Requested {normalized['n_trials']} unique Bayesian trials, "
+                f"but the finite search space contains only "
+                f"{len(finite_candidates)} combinations"
+            )
+        rng = np.random.default_rng(normalized["seed"])
+        rng.shuffle(finite_candidates)
+    fold_count = len(context.folds)
+    print(
+        f"[INFO] Persistent Bayesian GPU pool on {list(gpu_ids)}; "
+        f"{normalized['n_trials']} sequential TPE trials, "
+        f"{fold_count} fold jobs per trial",
+        flush=True,
+    )
+    with PersistentGPUPool(
+        gpu_ids,
+        _deployment_fold_worker,
+        worker_args=(context,),
+        deterministic=train_deterministic_enabled(context.config),
+    ) as pool:
+        while len(candidates) < normalized["n_trials"]:
+            trial, parameters, duplicate_count = unique_bayesian_trial(
+                study,
+                normalized["parameters"],
+                seen,
+                finite_candidates,
+            )
+            if duplicate_count:
+                print(
+                    f"[Bayesian HPO] skipped {duplicate_count} duplicate "
+                    f"suggestion(s) before unique candidate "
+                    f"{len(candidates) + 1}/{normalized['n_trials']}",
+                    flush=True,
+                )
+            jobs = [
+                DeploymentFoldJob(
+                    job_id=int(trial.number) * fold_count + fold_id,
+                    candidate_id=int(trial.number),
+                    fold_id=fold_id,
+                    parameters=copy.deepcopy(parameters),
+                )
+                for fold_id in range(fold_count)
+            ]
+            pool.submit_many(jobs)
+            by_fold: Dict[int, InnerFoldResult] = {}
+            while len(by_fold) < fold_count:
+                try:
+                    work_result = pool.get(timeout=1.0)
+                except Empty:
+                    if pool.workers_alive:
+                        continue
+                    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                    raise RuntimeError(
+                        f"All GPU workers exited during Bayesian trial {trial.number}"
+                    )
+                if not work_result.succeeded:
+                    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                    raise RuntimeError(
+                        f"Bayesian trial {trial.number} GPU job "
+                        f"{work_result.job_id} failed on {work_result.device}: "
+                        f"{work_result.error}\n{work_result.traceback or ''}"
+                    )
+                payload = dict(work_result.value)
+                if int(payload.get("candidate_id", -1)) != int(trial.number):
+                    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                    raise RuntimeError(
+                        f"Received result for candidate "
+                        f"{payload.get('candidate_id')} while waiting for "
+                        f"trial {trial.number}"
+                    )
+                fold_id = int(payload["fold_id"])
+                if fold_id < 0 or fold_id >= fold_count or fold_id in by_fold:
+                    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                    raise RuntimeError(
+                        f"Invalid or duplicate fold result {fold_id} "
+                        f"for Bayesian trial {trial.number}"
+                    )
+                metric = float(payload["metric"])
+                if not math.isfinite(metric):
+                    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                    raise RuntimeError(
+                        f"Non-finite fold metric in Bayesian trial "
+                        f"{trial.number}, fold {fold_id}"
+                    )
+                by_fold[fold_id] = InnerFoldResult(
+                    inner_fold=fold_id,
+                    metric=metric,
+                    best_epoch=int(payload["best_epoch"]),
+                    metrics=copy.deepcopy(dict(payload["metrics"])),
+                )
+            inner_results = tuple(by_fold[index] for index in range(fold_count))
+            objective = float(
+                np.mean([result.metric for result in inner_results])
+            )
+            candidate = CandidateResult(
+                candidate_id=int(trial.number),
+                parameters=copy.deepcopy(parameters),
+                objective=objective,
+                inner_results=inner_results,
+            )
+            candidates.append(candidate)
+            seen.add(parameter_key(parameters))
+            trial.set_user_attr(
+                "inner_best_epochs", list(candidate.best_epochs)
+            )
+            study.tell(trial, objective)
+            print(
+                f"[Bayesian HPO] unique={len(candidates)}/"
+                f"{normalized['n_trials']} optuna_trial={trial.number + 1} "
+                f"objective={objective:.6f} "
+                f"final_epoch={candidate.final_epoch}",
+                flush=True,
+            )
+    return select_best_candidate(
+        candidates,
+        normalized["direction"],
+        method="bayesian",
+    )
+
+
 def _run_hpo(
     context: DeploymentHPOContext,
     gpu_ids: Sequence[int],
 ) -> HPOResult:
     normalized = normalize_hpo_config(context.config.get("hpo", {}))
+    if normalized["method"] == "bayesian" and len(gpu_ids) > 1:
+        return _run_bayesian_hpo_on_gpus(context, gpu_ids)
     if normalized["method"] == "grid" and len(gpu_ids) > 1:
         parameter_sets = generate_grid_candidates(normalized["parameters"])
         jobs = [
@@ -754,7 +972,7 @@ def main() -> None:
         print("[INFO] CUDA deterministic algorithms enabled")
     if len(gpu_ids) > 1 and normalize_hpo_config(config.get("hpo", {}))[
         "method"
-    ] == "grid":
+    ] in {"grid", "bayesian"}:
         prepared = PreparedData(
             features=share_memory_tensors(prepared.features),
             targets=prepared.targets.share_memory_(),

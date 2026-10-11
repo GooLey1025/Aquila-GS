@@ -246,6 +246,86 @@ def suggest_parameters(
     return suggested
 
 
+def parameter_key(parameters: Mapping[str, Any]) -> tuple[tuple[str, Any], ...]:
+    """Return a stable hashable identity for one HPO parameter combination."""
+
+    def freeze(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return tuple(
+                (str(key), freeze(item))
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(freeze(item) for item in value)
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    return tuple(
+        (str(name), freeze(value))
+        for name, value in sorted(parameters.items(), key=lambda pair: str(pair[0]))
+    )
+
+
+def finite_parameter_candidates(
+    parameter_space: Mapping[str, Mapping[str, Any]],
+) -> list[Dict[str, Any]] | None:
+    """Enumerate a finite discrete search space, or return ``None``."""
+    for definition in parameter_space.values():
+        kind = str(definition.get("type", "categorical")).lower()
+        if (
+            "values" not in definition
+            and kind not in {"categorical", "int_uniform", "int"}
+            and "step" not in definition
+        ):
+            return None
+    return generate_grid_candidates(parameter_space)
+
+
+def unique_bayesian_trial(
+    study: Any,
+    parameter_space: Mapping[str, Mapping[str, Any]],
+    seen: set[tuple[tuple[str, Any], ...]],
+    fallback_candidates: list[Dict[str, Any]] | None,
+    *,
+    max_duplicate_attempts: int = 1000,
+) -> tuple[Any, Dict[str, Any], int]:
+    """Ask until an unseen combination is found without training duplicates.
+
+    Duplicate Optuna trials are marked pruned. For finite discrete spaces, an
+    unseen fallback is enqueued so a converged TPE sampler cannot repeatedly
+    propose the same best combination forever.
+    """
+    try:
+        import optuna
+    except ImportError as error:
+        raise ImportError("Bayesian HPO requires optuna") from error
+
+    duplicate_count = 0
+    while duplicate_count <= max_duplicate_attempts:
+        trial = study.ask()
+        parameters = suggest_parameters(trial, parameter_space)
+        key = parameter_key(parameters)
+        if key not in seen:
+            return trial, parameters, duplicate_count
+        study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+        duplicate_count += 1
+        if fallback_candidates is not None:
+            while fallback_candidates:
+                fallback = fallback_candidates.pop()
+                if parameter_key(fallback) not in seen:
+                    study.enqueue_trial(copy.deepcopy(fallback))
+                    break
+            else:
+                raise RuntimeError(
+                    "Bayesian HPO exhausted every unique parameter combination"
+                )
+    raise RuntimeError(
+        "Bayesian HPO could not sample a unique parameter combination after "
+        f"{max_duplicate_attempts} duplicate attempts"
+    )
+
+
 def evaluate_candidate(
     candidate_id: int,
     parameters: Mapping[str, Any],
@@ -322,9 +402,25 @@ def run_bayesian_hpo(
         sampler=sampler,
     )
     candidates: list[CandidateResult] = []
+    seen: set[tuple[tuple[str, Any], ...]] = set()
+    finite_candidates = finite_parameter_candidates(config["parameters"])
+    if finite_candidates is not None:
+        if config["n_trials"] > len(finite_candidates):
+            raise ValueError(
+                f"Requested {config['n_trials']} unique Bayesian trials, but "
+                f"the finite search space contains only "
+                f"{len(finite_candidates)} combinations"
+            )
+        rng = np.random.default_rng(config["seed"])
+        rng.shuffle(finite_candidates)
 
-    def objective(trial: Any) -> float:
-        parameters = suggest_parameters(trial, config["parameters"])
+    while len(candidates) < config["n_trials"]:
+        trial, parameters, _ = unique_bayesian_trial(
+            study,
+            config["parameters"],
+            seen,
+            finite_candidates,
+        )
         result = evaluate_candidate(
             trial.number,
             parameters,
@@ -332,15 +428,15 @@ def run_bayesian_hpo(
             callback,
             metric=config["metric"],
         )
-        candidates.append(result)
         trial.set_user_attr(
             "inner_best_epochs", list(result.best_epochs)
         )
         if not math.isfinite(result.objective):
+            study.tell(trial, state=optuna.trial.TrialState.FAIL)
             raise ValueError("HPO objective is non-finite")
-        return result.objective
-
-    study.optimize(objective, n_trials=config["n_trials"])
+        study.tell(trial, result.objective)
+        candidates.append(result)
+        seen.add(parameter_key(parameters))
     return _finish_search(candidates, config["direction"], "bayesian")
 
 

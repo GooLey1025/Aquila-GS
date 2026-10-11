@@ -11,8 +11,11 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
+import json
 import math
 import random
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -41,6 +44,7 @@ from aquila.benchmark.common import (
     aggregate_outer_folds,
     build_sample_audit,
     evaluate_two_scales,
+    sanitize_json,
     serialize_hpo,
     write_json,
     write_predictions_csv,
@@ -103,6 +107,7 @@ class TraitFoldContext:
     candidates: tuple[dict[str, Any], ...]
     inner_folds: tuple[int, ...]
     seed: int
+    resume: bool
 
 
 class DeterministicPairDataset(Dataset):
@@ -154,11 +159,7 @@ def expand_gpu_workers(gpu_ids: Sequence[int], jobs_per_gpu: int) -> list[int]:
 
     if jobs_per_gpu < 1:
         raise ValueError("--jobs-per-gpu must be at least 1")
-    return [
-        gpu_id
-        for gpu_id in gpu_ids
-        for _ in range(jobs_per_gpu)
-    ]
+    return [gpu_id for gpu_id in gpu_ids for _ in range(jobs_per_gpu)]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -196,6 +197,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Reuse completed trait/fold outputs and completed candidate/inner-fold "
+            "cache entries from an interrupted run."
+        ),
+    )
     parser.add_argument("--max-candidates", type=int, default=None)
     parser.add_argument("--max-inner-folds", type=int, default=None)
     parser.add_argument(
@@ -223,6 +232,166 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _read_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _cache_signature(value: Mapping[str, Any]) -> str:
+    """Return a stable signature for one resumable HPO unit."""
+    payload = json.dumps(
+        sanitize_json(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _sequence_signature(values: Sequence[Any]) -> str:
+    """Hash ordered split/schema values without embedding them in cache files."""
+    payload = json.dumps(
+        sanitize_json(values),
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _inner_cache_path(
+    fold_path: Path,
+    candidate_id: int,
+    inner_fold: int,
+) -> Path:
+    return (
+        fold_path
+        / "hpo_cache"
+        / f"candidate_{candidate_id}"
+        / f"inner_{inner_fold}.json"
+    )
+
+
+def _inner_cache_context(
+    *,
+    trait_name: str,
+    outer_fold: int,
+    inner_fold: int,
+    candidate_id: int,
+    candidate_config: Mapping[str, Any],
+    seed: int,
+    data_directory: Path,
+    train_sample_ids: Sequence[str],
+    valid_sample_ids: Sequence[str],
+    variants: Sequence[tuple[str, str, str, str, str]],
+) -> dict[str, Any]:
+    return {
+        "schema": "clcnet_inner_hpo_cache",
+        "version": 1,
+        "trait": trait_name,
+        "outer_fold": int(outer_fold),
+        "inner_fold": int(inner_fold),
+        "candidate_id": int(candidate_id),
+        "candidate_config": candidate_config,
+        "training_seed": int(seed),
+        "data_directory": str(data_directory),
+        "train_sample_ids_sha256": _sequence_signature(train_sample_ids),
+        "valid_sample_ids_sha256": _sequence_signature(valid_sample_ids),
+        "variant_schema_sha256": _sequence_signature(variants),
+    }
+
+
+def _load_completed_inner_result(
+    path: Path,
+    expected_context: Mapping[str, Any],
+) -> tuple[InnerFoldResult, list[dict[str, Any]]] | None:
+    """Recover one fully written candidate/inner-fold result."""
+    if not path.is_file():
+        return None
+    try:
+        payload = _read_json(path)
+        if payload.get("signature") != _cache_signature(expected_context):
+            return None
+        if not bool(payload.get("completed")):
+            return None
+        metric_value = payload.get("metric")
+        metric = float("nan") if metric_value is None else float(metric_value)
+        best_epoch = int(payload["best_epoch"])
+        metrics = payload["metrics"]
+        history = payload["history"]
+        if (
+            best_epoch < 1
+            or not isinstance(metrics, dict)
+            or not isinstance(history, list)
+        ):
+            return None
+        return (
+            InnerFoldResult(
+                inner_fold=int(expected_context["inner_fold"]),
+                metric=metric,
+                best_epoch=best_epoch,
+                metrics=metrics,
+            ),
+            history,
+        )
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _write_completed_inner_result(
+    path: Path,
+    context: Mapping[str, Any],
+    result: TrainingResult,
+) -> None:
+    """Atomically persist the validation evidence needed to resume HPO."""
+    payload = {
+        "completed": True,
+        "signature": _cache_signature(context),
+        "context": context,
+        "metric": result.best_metrics.get("avg_pearson"),
+        "best_epoch": result.best_epoch,
+        "metrics": result.best_metrics,
+        "history": list(result.history),
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    write_json(temporary, payload)
+    temporary.replace(path)
+
+
+def _load_completed_outer_fold(
+    output_directory: Path,
+    trait_name: str,
+    outer_fold: int,
+) -> dict[str, Any] | None:
+    """Recover a complete trait/fold result without retraining it."""
+    fold_path = output_directory / trait_name / f"fold_{outer_fold}"
+    required = (
+        fold_path / "best_model.pt",
+        fold_path / "hpo_results.json",
+        fold_path / "metrics.json",
+        fold_path / "runtime.json",
+        fold_path / "predictions.csv",
+    )
+    if not all(path.is_file() for path in required):
+        return None
+    try:
+        hpo = _read_json(fold_path / "hpo_results.json")
+        metrics = _read_json(fold_path / "metrics.json")
+        runtime = _read_json(fold_path / "runtime.json")
+        best = hpo["best"]
+        return {
+            "trait": trait_name,
+            "outer_fold": int(outer_fold),
+            "best_candidate_id": int(hpo["best_candidate_id"]),
+            "best_parameters": dict(best["parameters"]),
+            "best_inner_pearson": best["objective"],
+            "final_epoch": int(best["final_epoch"]),
+            "metrics": metrics,
+            "runtime_seconds": float(runtime["total_seconds"]),
+        }
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
 def encode_upstream_genotypes(values: Any, missing_value: float = 3.0) -> np.ndarray:
     """Preserve VCF dosage and map missing calls to upstream CLCNet's value 3."""
     array = np.asarray(values, dtype=np.float32)
@@ -231,9 +400,7 @@ def encode_upstream_genotypes(values: Any, missing_value: float = 3.0) -> np.nda
     finite = array[np.isfinite(array)]
     if finite.size and not np.isin(finite, (0.0, 1.0, 2.0)).all():
         raise ValueError("CLCNet benchmark requires diploid dosage values 0, 1, or 2")
-    return np.where(np.isfinite(array), array, float(missing_value)).astype(
-        np.float32
-    )
+    return np.where(np.isfinite(array), array, float(missing_value)).astype(np.float32)
 
 
 def chromosome_groups(
@@ -312,7 +479,9 @@ def fit_feature_selector(
     try:
         import lightgbm as lgb
     except ImportError as error:
-        raise ImportError("CLCNet chromosome-aware selection requires lightgbm") from error
+        raise ImportError(
+            "CLCNet chromosome-aware selection requires lightgbm"
+        ) from error
 
     rounds = int(config.get("num_boost_round", 100))
     parameters = {
@@ -331,7 +500,12 @@ def fit_feature_selector(
 
     def train_importances(matrix: np.ndarray, local_seed: int) -> np.ndarray:
         local_parameters = dict(parameters)
-        for name in ("seed", "feature_fraction_seed", "bagging_seed", "data_random_seed"):
+        for name in (
+            "seed",
+            "feature_fraction_seed",
+            "bagging_seed",
+            "data_random_seed",
+        ):
             local_parameters[name] = int(local_seed)
         model = lgb.train(
             local_parameters,
@@ -416,8 +590,7 @@ def _metrics(predictions: np.ndarray, targets: np.ndarray) -> dict[str, Any]:
 
 def _cpu_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     return {
-        name: value.detach().cpu().clone()
-        for name, value in model.state_dict().items()
+        name: value.detach().cpu().clone() for name, value in model.state_dict().items()
     }
 
 
@@ -459,8 +632,7 @@ def _train_epoch(
         loss = (
             mse(first_prediction, first_y)
             + mse(second_prediction, second_y)
-            + contrastive_weight
-            * mse(representation_distance, difference)
+            + contrastive_weight * mse(representation_distance, difference)
         )
         loss.backward()
         optimizer.step()
@@ -557,9 +729,9 @@ def predict_clcnet(
     state_dict: Mapping[str, torch.Tensor],
     device: torch.device,
 ) -> np.ndarray:
-    model = CLCNetBenchmark(
-        int(genotypes.shape[1]), _shared_dimensions(config)
-    ).to(device)
+    model = CLCNetBenchmark(int(genotypes.shape[1]), _shared_dimensions(config)).to(
+        device
+    )
     model.load_state_dict(state_dict)
     predictions, _ = _predict(
         model,
@@ -634,6 +806,7 @@ def run_outer_fold(
     inner_folds: Sequence[int],
     device: torch.device,
     seed: int,
+    resume: bool = False,
 ) -> dict[str, Any]:
     fold_start = time.perf_counter()
     fold_path = output_directory / trait_name / f"fold_{outer_fold}"
@@ -678,6 +851,41 @@ def run_outer_fold(
         )
         for candidate_id, parameters in enumerate(candidates):
             candidate_config = merge_config(base_config, parameters)
+            training_seed = derive_seed(seed, outer_fold, candidate_id, inner_fold)
+            cache_path = _inner_cache_path(fold_path, candidate_id, inner_fold)
+            cache_context = _inner_cache_context(
+                trait_name=trait_name,
+                outer_fold=outer_fold,
+                inner_fold=inner_fold,
+                candidate_id=candidate_id,
+                candidate_config=candidate_config,
+                seed=training_seed,
+                data_directory=benchmark.directory,
+                train_sample_ids=train.sample_ids,
+                valid_sample_ids=valid.sample_ids,
+                variants=train.variants,
+            )
+            recovered = (
+                _load_completed_inner_result(cache_path, cache_context)
+                if resume
+                else None
+            )
+            if recovered is not None:
+                recovered_result, recovered_history = recovered
+                inner_results[candidate_id].append(recovered_result)
+                inner_histories[f"candidate_{candidate_id}_inner_{inner_fold}"] = (
+                    recovered_history
+                )
+                print(
+                    f"[INFO] CLCNet trait={trait_name} outer={outer_fold} "
+                    f"inner={inner_fold} candidate={candidate_id} recovered "
+                    f"best_valid_pearson={recovered_result.metric:.6f} "
+                    f"best_epoch={recovered_result.best_epoch}",
+                    flush=True,
+                )
+                continue
+            if resume and cache_path.exists():
+                cache_path.unlink()
             candidate_start = time.perf_counter()
             result = train_clcnet(
                 train_genotypes,
@@ -686,7 +894,7 @@ def run_outer_fold(
                 valid.processed_targets,
                 candidate_config,
                 device,
-                derive_seed(seed, outer_fold, candidate_id, inner_fold),
+                training_seed,
             )
             hpo_training_seconds += time.perf_counter() - candidate_start
             metric = float(result.best_metrics.get("avg_pearson", float("nan")))
@@ -701,6 +909,8 @@ def run_outer_fold(
             inner_histories[f"candidate_{candidate_id}_inner_{inner_fold}"] = list(
                 result.history
             )
+            if resume:
+                _write_completed_inner_result(cache_path, cache_context, result)
             del result
             gc.collect()
             if device.type == "cuda":
@@ -710,7 +920,9 @@ def run_outer_fold(
     for candidate_id, parameters in enumerate(candidates):
         results = tuple(inner_results[candidate_id])
         metrics = np.asarray([result.metric for result in results], dtype=np.float64)
-        objective = float(metrics.mean()) if np.isfinite(metrics).all() else float("nan")
+        objective = (
+            float(metrics.mean()) if np.isfinite(metrics).all() else float("nan")
+        )
         candidate_results.append(
             CandidateResult(candidate_id, dict(parameters), objective, results)
         )
@@ -798,9 +1010,9 @@ def run_outer_fold(
     write_json(
         fold_path / "hpo_results.json",
         {
-            **serialize_hpo(HPOResult(
-                hpo.best, tuple(candidate_results), "maximize", "grid"
-            )),
+            **serialize_hpo(
+                HPOResult(hpo.best, tuple(candidate_results), "maximize", "grid")
+            ),
             "candidate_budget": len(candidates),
             "inner_fold_count": len(inner_folds),
         },
@@ -810,9 +1022,7 @@ def run_outer_fold(
         "original": evaluation.original,
     }
     write_json(fold_path / "metrics.json", metrics)
-    benchmark.load_preprocessor(outer_fold).save_json(
-        fold_path / "preprocessing.json"
-    )
+    benchmark.load_preprocessor(outer_fold).save_json(fold_path / "preprocessing.json")
     write_json(
         fold_path / "feature_selection.json",
         feature_selection_payload(
@@ -827,9 +1037,7 @@ def run_outer_fold(
     write_json(
         fold_path / "sample_audit.json",
         {
-            "outer": build_sample_audit(
-                outer_train, outer_test, held_out_name="test"
-            ),
+            "outer": build_sample_audit(outer_train, outer_test, held_out_name="test"),
             "inner_folds": inner_audits,
         },
     )
@@ -898,19 +1106,29 @@ def _run_trait_fold(
         worker_context.inner_folds,
         device,
         worker_context.seed,
+        worker_context.resume,
     )
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
     data_directory = Path(args.data_dir).resolve()
     output_directory = Path(args.output_dir).resolve()
+    if args.overwrite and args.resume:
+        raise ValueError("--overwrite and --resume are mutually exclusive")
     if output_directory.exists() and any(output_directory.iterdir()):
-        if not args.overwrite:
-            raise FileExistsError(f"Output directory is not empty: {output_directory}")
-        import shutil
-
-        shutil.rmtree(output_directory)
+        if args.overwrite:
+            shutil.rmtree(output_directory)
+        elif args.resume:
+            print(
+                f"[INFO] Resuming from existing results in {output_directory}",
+                flush=True,
+            )
+        else:
+            raise FileExistsError(
+                f"Output directory is not empty: {output_directory}; "
+                "use --resume to reuse completed work or --overwrite to restart"
+            )
     output_directory.mkdir(parents=True, exist_ok=True)
     with Path(args.config).open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -930,7 +1148,9 @@ def main() -> None:
     traits = list(args.traits or benchmark.regression_traits)
     if not traits:
         raise ValueError("Prepared data contain no regression traits")
-    invalid_traits = [trait for trait in traits if trait not in benchmark.regression_traits]
+    invalid_traits = [
+        trait for trait in traits if trait not in benchmark.regression_traits
+    ]
     if invalid_traits:
         raise ValueError(f"Unknown traits: {invalid_traits}")
     outer_folds = resolve_outer_folds(args.outer_folds, benchmark.metadata)
@@ -939,22 +1159,39 @@ def main() -> None:
         inner_folds = inner_folds[: args.max_inner_folds]
     candidates = generate_grid_candidates(config["hpo"]["parameters"])
     if len(candidates) != 64:
-        raise ValueError(f"CLCNet HPO grid must contain exactly 64 candidates, got {len(candidates)}")
+        raise ValueError(
+            f"CLCNet HPO grid must contain exactly 64 candidates, got {len(candidates)}"
+        )
     if args.max_candidates is not None:
         candidates = candidates[: args.max_candidates]
     if not candidates or not inner_folds:
         raise ValueError("At least one HPO candidate and inner fold are required")
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
     worker_gpu_ids = expand_gpu_workers(gpu_ids, args.jobs_per_gpu)
-    jobs = [
-        TraitFoldJob(
-            job_id=trait_index * len(outer_folds) + fold_index,
-            trait_name=trait,
-            outer_fold=outer_fold,
-        )
-        for trait_index, trait in enumerate(traits)
-        for fold_index, outer_fold in enumerate(outer_folds)
-    ]
+    completed_results = []
+    jobs = []
+    for trait_index, trait in enumerate(traits):
+        for fold_index, outer_fold in enumerate(outer_folds):
+            completed = (
+                _load_completed_outer_fold(output_directory, trait, outer_fold)
+                if args.resume
+                else None
+            )
+            if completed is not None:
+                completed_results.append(completed)
+                print(
+                    f"[INFO] CLCNet trait={trait} outer_fold={outer_fold} "
+                    "recovered completed fold",
+                    flush=True,
+                )
+                continue
+            jobs.append(
+                TraitFoldJob(
+                    job_id=trait_index * len(outer_folds) + fold_index,
+                    trait_name=trait,
+                    outer_fold=outer_fold,
+                )
+            )
     worker_context = TraitFoldContext(
         data_directory=str(data_directory),
         output_directory=str(output_directory),
@@ -962,6 +1199,7 @@ def main() -> None:
         candidates=tuple(candidates),
         inner_folds=tuple(inner_folds),
         seed=args.seed,
+        resume=args.resume,
     )
     work_results = execute_gpu_jobs(
         jobs,
@@ -970,7 +1208,8 @@ def main() -> None:
         worker_args=(worker_context,),
         raise_on_error=True,
     )
-    summaries = [result.value for result in work_results]
+    summaries = completed_results + [result.value for result in work_results]
+    summaries.sort(key=lambda item: (item["trait"], item["outer_fold"]))
     by_trait = {}
     for trait in traits:
         trait_results = [item for item in summaries if item["trait"] == trait]

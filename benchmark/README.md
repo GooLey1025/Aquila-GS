@@ -57,7 +57,7 @@ Single-trait benchmark models that do not natively support missing phenotypes, s
 
 For regression benchmarks, both Aquila-GS and the integrated comparison models report Pearson r, R², MSE, RMSE, and MAE on the available test observations. Fold outputs include metrics on both the standardized phenotype scale and the inverse-transformed original scale. The comparison summary uses within-trait Pearson: for each phenotype, Pearson correlation is calculated across its held-out samples and then averaged across outer folds. This is distinct from Aquila's optional within-accession Pearson, which correlates traits within a sample and is undefined for independent single-trait models such as DEM-SNP and DEM-Vars.
 
-`summary_and_plot_benchmark_model.py` reads this per-trait Pearson contract from all benchmark models, including Aquila-SNP, Aquila-Vars, DEM-SNP, and DEM-Vars. It supports both complete cohort result directories and the `fold_0` to `fold_4` result shards produced for fold-specific GWAS data. Its long-form output labels the metric as `within_trait_pearson`.
+`summary_and_plot_benchmark_model.py` reads this per-trait Pearson contract from all benchmark models, including Aquila-SNP, Aquila-Vars, DEM-SNP, and DEM-Vars. It supports both complete cohort result directories and the `fold_0` to `fold_9` result shards produced for fold-specific GWAS data. Its long-form output labels the metric as `within_trait_pearson`.
 
 ## Benchmark methodology
 
@@ -78,14 +78,14 @@ GWAS lead variants are selected independently from the training samples of each 
 #### Prepare Aquila-SNP data
 
 ```sh
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   aquila_data_cv.py \
-    --vcf "species_data/Rice655-current_fold_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
+    --vcf "./species_data/Rice655-current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
     --phenotype Rice655.pheno \
     --encoding-type diploid_onehot \
     --variant-type snp \
     --id-prefix "SNP-" \
-    --fold-mapping 655rice_nested_cv.json \
+    --fold-mapping 655rice_nested_cv_10folds.json \
     --fold-specific-gwas-fold "$FOLD" \
     -o "Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --save-raw-genotype \
@@ -98,12 +98,12 @@ done
 Aquila-Vars uses separate SNP, INDEL, and SV branches, so its prepared data are generated without forcing SNP-only encoding or applying an ID-prefix filter:
 
 ```sh
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   aquila_data_cv.py \
-    --vcf "species_data/Rice655-current_fold_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
+    --vcf "./species_data/Rice655-current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
     --phenotype Rice655.pheno \
     --encoding-type diploid_onehot \
-    --fold-mapping 655rice_nested_cv.json \
+    --fold-mapping 655rice_nested_cv_10folds.json \
     --fold-specific-gwas-fold "$FOLD" \
     -o "Rice655.current_fold_GWAS.vars.cv.data/fold_${FOLD}" \
     --save-raw-genotype \
@@ -118,7 +118,7 @@ Each output directory records its bound outer fold in `metadata.json`. Training 
 ```sh
 cd aquila-snp
 
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   aquila_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config  32hpo_budgets.yaml \
@@ -136,7 +136,7 @@ cd ..
 ```sh
 cd aquila-vars
 
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   aquila_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.vars.cv.data/fold_${FOLD}" \
     --config 32hpo_budgets.aquila-vars.yaml \
@@ -156,7 +156,7 @@ Some scripts from CropARNet were copied or adapted into our project repository. 
 ```sh
 cd croparnet
 
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   python src_benchmark/adapter.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
@@ -177,7 +177,7 @@ The upstream pipeline uses MIC-based SNP filtering and limits the selected set t
 
 ```sh
 cd cropformer
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   python src_benchmark/adapter.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
@@ -192,7 +192,7 @@ done
 
 ```sh
 cd xgboost
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   python xgboost_train_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/xgboost_nested_cv.yaml \
@@ -209,7 +209,7 @@ BayesCpi uses the single fixed configuration in `bayescpi/configs/nested_cv.yaml
 
 ```sh
 cd bayescpi
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   python bayescpi_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
@@ -225,7 +225,7 @@ rrBLUP uses the single fixed `REML` configuration in `rrBLUP/configs/nested_cv.y
 
 ```sh
 cd rrBLUP
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   python rrblup_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
@@ -239,7 +239,7 @@ done
 
 ```sh
 cd Lasso
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   python lasso_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
@@ -253,7 +253,7 @@ done
 
 ```sh
 cd ElasticNet
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   python elasticnet_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
@@ -269,7 +269,7 @@ Some scripts from CLCNet were copied or adapted into our project repository. The
 
 ```sh
 cd CLCNet
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   python CLCNet_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/CLCNet_nested_cv.yaml \
@@ -286,7 +286,7 @@ Some scripts from MENET were copied or adapted into our project repository. The 
 
 ```sh
 cd MENET
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   python MENET_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/MeNet_nested_cv.yaml \
@@ -306,7 +306,7 @@ Some scripts from Whisperer of DNA were copied or adapted into our project repos
 ```sh
 cd Whisperer_of_DNA
 conda activate aquila_dnawhisperer
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   python Whisperer_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/Whisperer_nested_cv.yaml \
@@ -325,7 +325,7 @@ BNNs retains its internal Lasso-based feature-selection module because it is tre
 
 ```sh
 cd BNNs
-for FOLD in 0 1 2 3 4; do
+for FOLD in {0..9}; do
   python BNNs_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/BNNs_nested_cv.yaml \

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -17,7 +18,9 @@ import yaml
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parents[1]
 MODULE_PATH = SCRIPT_DIRECTORY.parent / "CLCNet_train_cv.py"
-SPEC = importlib.util.spec_from_file_location("clcnet_train_cv_test_module", MODULE_PATH)
+SPEC = importlib.util.spec_from_file_location(
+    "clcnet_train_cv_test_module", MODULE_PATH
+)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
@@ -49,6 +52,7 @@ def test_gpu_cli_defaults_to_detection() -> None:
     assert arguments.jobs_per_gpu == 1
     assert arguments.traits is None
     assert arguments.lightgbm_selection is False
+    assert arguments.resume is False
 
 
 def test_gpu_cli_selection_and_cpu_mode() -> None:
@@ -157,6 +161,7 @@ def test_training_loader_discards_incomplete_final_batch(monkeypatch) -> None:
         np.arange(5, dtype=np.float32),
         seed=42,
     )
+
     class TinyModel(MODULE.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -302,3 +307,106 @@ def test_disabled_selector_keeps_all_markers_without_lightgbm() -> None:
     assert payload["union_selected_count"] == 3
     assert payload["num_boost_round"] == 0
     assert payload["importance_type"] is None
+
+
+def test_resume_cli_is_supported() -> None:
+    arguments = MODULE.parse_args(["--data-dir", "data", "-o", "output", "--resume"])
+    assert arguments.resume is True
+
+
+def test_completed_inner_result_cache_is_recovered(tmp_path: Path) -> None:
+    context = MODULE._inner_cache_context(
+        trait_name="TraitA",
+        outer_fold=2,
+        inner_fold=1,
+        candidate_id=3,
+        candidate_config={"train": {"max_epochs": 10}},
+        seed=17,
+        data_directory=tmp_path / "data",
+        train_sample_ids=("train_a", "train_b"),
+        valid_sample_ids=("valid_a",),
+        variants=(("1", "1", "v1", "A", "G"),),
+    )
+    result = MODULE.TrainingResult(
+        state_dict={},
+        best_epoch=4,
+        best_metrics={"avg_pearson": 0.75},
+        history=({"epoch": 1, "train_loss": 1.0},),
+    )
+    path = tmp_path / "candidate_3" / "inner_1.json"
+    MODULE._write_completed_inner_result(path, context, result)
+
+    recovered = MODULE._load_completed_inner_result(path, context)
+    assert recovered is not None
+    recovered_result, history = recovered
+    assert recovered_result.inner_fold == 1
+    assert recovered_result.metric == pytest.approx(0.75)
+    assert recovered_result.best_epoch == 4
+    assert history == [{"epoch": 1, "train_loss": 1.0}]
+
+    changed_context = {**context, "training_seed": 18}
+    assert MODULE._load_completed_inner_result(path, changed_context) is None
+
+
+def test_incomplete_or_corrupt_inner_cache_is_rejected(tmp_path: Path) -> None:
+    context = MODULE._inner_cache_context(
+        trait_name="TraitA",
+        outer_fold=0,
+        inner_fold=0,
+        candidate_id=0,
+        candidate_config={"train": {"max_epochs": 10}},
+        seed=42,
+        data_directory=tmp_path / "data",
+        train_sample_ids=("train_a", "train_b"),
+        valid_sample_ids=("valid_a",),
+        variants=(("1", "1", "v1", "A", "G"),),
+    )
+    path = tmp_path / "inner_0.json"
+    path.write_text("{broken", encoding="utf-8")
+    assert MODULE._load_completed_inner_result(path, context) is None
+
+    path.write_text(
+        json.dumps(
+            {
+                "completed": False,
+                "signature": MODULE._cache_signature(context),
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert MODULE._load_completed_inner_result(path, context) is None
+
+
+def test_completed_outer_fold_is_recovered(tmp_path: Path) -> None:
+    fold = tmp_path / "TraitA" / "fold_2"
+    fold.mkdir(parents=True)
+    (fold / "best_model.pt").touch()
+    (fold / "predictions.csv").touch()
+    (fold / "hpo_results.json").write_text(
+        json.dumps(
+            {
+                "best_candidate_id": 4,
+                "best": {
+                    "parameters": {"train.batch_size": 16},
+                    "objective": 0.6,
+                    "final_epoch": 7,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (fold / "metrics.json").write_text(
+        '{"processed": {}, "original": {}}',
+        encoding="utf-8",
+    )
+    (fold / "runtime.json").write_text(
+        '{"total_seconds": 12.5}',
+        encoding="utf-8",
+    )
+
+    recovered = MODULE._load_completed_outer_fold(tmp_path, "TraitA", 2)
+    assert recovered is not None
+    assert recovered["trait"] == "TraitA"
+    assert recovered["best_candidate_id"] == 4
+    assert recovered["final_epoch"] == 7
+    assert MODULE._load_completed_outer_fold(tmp_path, "TraitA", 3) is None
