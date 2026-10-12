@@ -4,21 +4,38 @@ hpo:
   metric: best/val_r
   direction: maximize
   seed: 42
-  # 2 x 3 x 2 = 12 candidates. No shared trunk: fusion feeds the
-  # regression head directly.
+  # 64 candidates = 2 x 2 x 2 x 2 x 2 x 2.
+  #
+  # The architecture is fixed to the best Aquila-Vars design from the
+  # Rice655 fold-0 architecture/width/fusion screens:
+  #   SNP 256 (Aquila-SNP Conv/DownConv/Transformer/Pool, pool axis 2)
+  #   INDEL 32/64 (MHA, pool axis 1)
+  #   SV 16/32 (MHA, pool axis 1)
+  #   SNP-primary residual fusion, no shared trunk
+  #
+  # SNP dropout is fixed at 0.4. indel/sv_dropout are grouped aliases that
+  # apply the selected value to the embedder, down-conv, transformer
+  # residual, and pooling dropout of that branch. Branch-local d_model is
+  # propagated to embedder, DownConv, Transformer d_model/d_ff, and Pool.
   parameters:
-    # HPO alias for model.downconv_kernel_size. This changes the global
-    # fallback only; an explicit train.branches.*.trunk.0.kernel_size wins.
-    branches_downconv_kernel_size:
+    train.branches.indel.d_model:
       type: categorical
-      choices: [5, 9]
-    model.dropout:
+      choices: [32, 64]
+    train.branches.sv.d_model:
       type: categorical
-      choices: [0.3, 0.4, 0.5]
-    model.d_model:
+      choices: [16, 32]
+    indel_dropout:
       type: categorical
-      choices: [256, 512]
-
+      choices: [0.4, 0.5]
+    sv_dropout:
+      type: categorical
+      choices: [0.1, 0.2]
+    train.fusion.0.dropout:
+      type: categorical
+      choices: [0.1, 0.3]
+    train.heads.regression.0.dropout:
+      type: categorical
+      choices: [0.1, 0.3]
 
 train:
   batch_size: 16
@@ -41,7 +58,7 @@ train:
   test_split: 0.0
   gpu_resident: true
   precision: bf16
-  deterministic: false
+  deterministic: true
   seed: 42
 
   branches:
@@ -54,92 +71,111 @@ train:
         activation: gelu
         norm_type: layer
         residual: false
+        dropout: 0.4
       trunk:
-      - name: std_down_conv_tower
+      - name: down_conv_tower
         in_channels: 256
         out_channels: 256
+        activation: gelu
+        norm_type: layer
+        order: nac
         residual: true
         seq_len_threshold: 1500
-        gain: 1.0
-        bn_momentum: 0.1
-      - name: transformer_mqa
+        kernel_size: 5
+        dropout: 0.4
+      - name: transformer
         d_model: 256
-        num_query_heads: 8
-        qk_head_dim: 32
-        v_head_dim: 32
+        num_heads: 8
         activation: gelu
         use_rope: false
         d_ff: 256
+        dropout: 0.4
+        ffn_dropout: 0.4
       - name: multi_head_pool
         d_model: 256
         num_heads: 4
         pool_axis: 2
+        dropout: 0.4
+      d_model: 256
+      dropout: 0.4
 
     indel:
       embedder:
       - name: conv_block
         in_channels: 4
-        out_channels: 256
+        out_channels: 32
         kernel_size: 15
         activation: gelu
         norm_type: layer
         residual: false
+        dropout: 0.5
       trunk:
-      - name: std_down_conv_tower
-        in_channels: 256
-        out_channels: 256
+      - name: down_conv_tower
+        in_channels: 32
+        out_channels: 32
         residual: true
         seq_len_threshold: 1500
-        gain: 1.0
-        bn_momentum: 0.1
-      - name: transformer_mqa
-        d_model: 256
-        num_query_heads: 8
-        qk_head_dim: 32
-        v_head_dim: 32
+        kernel_size: 5
+        dropout: 0.5
+      - name: transformer
+        d_model: 32
+        num_heads: 4
+        d_ff: 32
         activation: gelu
         use_rope: false
-        d_ff: 256
+        dropout: 0.5
+        ffn_dropout: 0.4
       - name: multi_head_pool
-        d_model: 256
+        d_model: 32
         num_heads: 4
-        pool_axis: 2
+        pool_axis: 1
+        dropout: 0.5
+      d_model: 32
+      dropout: 0.5
 
     sv:
       embedder:
       - name: conv_block
         in_channels: 4
-        out_channels: 256
+        out_channels: 16
         kernel_size: 15
         activation: gelu
         norm_type: layer
         residual: false
+        dropout: 0.1
       trunk:
-      - name: std_down_conv_tower
-        in_channels: 256
-        out_channels: 256
+      - name: down_conv_tower
+        in_channels: 16
+        out_channels: 16
         residual: true
         seq_len_threshold: 1500
-        gain: 1.0
-        bn_momentum: 0.1
-      - name: transformer_mqa
-        d_model: 256
-        num_query_heads: 8
-        qk_head_dim: 32
-        v_head_dim: 32
+        kernel_size: 5
+        dropout: 0.1
+      - name: transformer
+        d_model: 16
+        num_heads: 4
+        d_ff: 16
         activation: gelu
         use_rope: false
-        d_ff: 256
+        dropout: 0.1
+        ffn_dropout: 0.4
       - name: multi_head_pool
-        d_model: 256
+        d_model: 16
         num_heads: 4
-        pool_axis: 2
+        pool_axis: 1
+        dropout: 0.1
+      d_model: 16
+      dropout: 0.1
 
   fusion:
-  - name: gated_fusion
+  - name: snp_primary_residual_fusion
     fusion_dim: 256
-    num_branches: 3
-    which_branch_to_add: null
+    branch_names:
+    - snp
+    - indel
+    - sv
+    gate_init: -3.0
+    dropout: 0.3
 
   heads:
     regression:
@@ -148,15 +184,15 @@ train:
       num_targets: null
       hidden_features: 256
       activation: gelu
+      dropout: 0.1
+
+  live_metrics_log: true
 
 model:
   architecture_type: multi_branch
-  # Global block defaults. Explicit values inside train.branches, fusion,
-  # shared_trunk, or heads have higher priority.
   activation: gelu
-  dropout: 0.4
+  dropout: 0.3
   d_model: 256
   l2_scale: 1.0e-05
-  # Used only when a branch down-conv tower omits kernel_size.
-  downconv_kernel_size: 9
+  downconv_kernel_size: 5
   verbose: false
