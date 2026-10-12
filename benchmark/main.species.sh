@@ -15,7 +15,10 @@ export PATH="$CONDA_PREFIX/bin:$PATH"
 conda activate aquila
 aquila_cv.py --phenotype $PHENO_FILE -o $COHORT.nested_cv.json --outer-folds 10 --inner-folds 4 --seed 42 --min-observed 20
 
+# For Aquila-SNP data
 aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.nested_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
+# For Aquila-Vars data
+aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.nested_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
 
 cd croparnet
 /usr/bin/time -v -o $COHORT.time.txt python src_benchmark/adapter.py \
@@ -113,9 +116,14 @@ cd ../aquila-snp
 aquila_train_cv.py --data-dir ../$COHORT.cv.data --config 32hpo_budgets.yaml \
   -o results/$COHORT --live-metrics-log --overwrite
 
+cd ../aquila-vars
+aquila_train_cv.py --data-dir ../$COHORT.vars.cv.data --config 32hpo_budgets.aquila-vars.yaml \
+  -o results/$COHORT --live-metrics-log --use-deterministic --overwrite
+
 # Aquila-SNP single-task benchmark:
 # prepare and train one independent model for every phenotype trait while
 # reusing the same nested-CV split as the multi-task benchmark above.
+cd ../aquila-snp
 IFS=$'\t' read -r -a PHENO_COLUMNS < "../$PHENO_FILE"
 for TRAIT in "${PHENO_COLUMNS[@]:1}"; do
   SINGLE_TASK_DATA="../$COHORT.single_task.cv.data/$TRAIT"

@@ -4,7 +4,7 @@ hpo:
   metric: best/val_r
   direction: maximize
   seed: 42
-  # 64 candidates = 2 x 2 x 2 x 2 x 2 x 2.
+  # 32 candidates = 2 x 2 x 2 x 2 x 2.
   #
   # The architecture is fixed to the best Aquila-Vars design from the
   # Rice655 fold-0 architecture/width/fusion screens:
@@ -31,9 +31,6 @@ hpo:
       type: categorical
       choices: [0.1, 0.2]
     train.fusion.0.dropout:
-      type: categorical
-      choices: [0.1, 0.3]
-    train.heads.regression.0.dropout:
       type: categorical
       choices: [0.1, 0.3]
 
