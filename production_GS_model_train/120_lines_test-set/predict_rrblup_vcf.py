@@ -105,6 +105,37 @@ def _inverse_transform(values, preprocessing, trait):
     return restored
 
 
+def average_predictions(predictions):
+    """Average aligned original-scale predictions from multiple fold models."""
+    stacked = np.stack(
+        [np.asarray(values, dtype=np.float64) for values in predictions],
+        axis=0,
+    )
+    if stacked.ndim != 2 or stacked.shape[0] < 2:
+        raise ValueError("At least two aligned fold predictions are required")
+    if not np.isfinite(stacked).all():
+        raise ValueError("Fold predictions contain non-finite values")
+    return stacked.mean(axis=0)
+
+
+def _fold_model_dirs(model_dir, trait):
+    """Return contiguous fold directories that each contain a fitted model."""
+    root = Path(model_dir) / trait / "cv"
+    discovered = []
+    if root.is_dir():
+        for path in root.glob("fold_*"):
+            suffix = path.name.removeprefix("fold_")
+            if path.is_dir() and suffix.isdigit() and (path / "model.rds").is_file():
+                discovered.append((int(suffix), path))
+    discovered.sort(key=lambda item: item[0])
+    fold_ids = [fold_id for fold_id, _ in discovered]
+    if len(fold_ids) < 2 or fold_ids != list(range(len(fold_ids))):
+        raise FileNotFoundError(
+            f"{trait} does not have contiguous fold models under {root}"
+        )
+    return [path for _, path in discovered]
+
+
 def _training_means(train_x_path, n_markers):
     train_x = np.loadtxt(train_x_path, dtype=np.float64)
     if train_x.ndim != 2 or train_x.shape[1] != n_markers:
@@ -115,7 +146,28 @@ def _training_means(train_x_path, n_markers):
     return train_x.mean(axis=0)
 
 
-def predict(vcf_path, model_dir, traits, rscript, id_prefix):
+def _predict_model(model_dir, dosage, trait, rscript):
+    """Score one fitted model and return original-scale predictions."""
+    model_dir = Path(model_dir)
+    model_path = model_dir / "model.rds"
+    if not model_path.is_file():
+        raise FileNotFoundError(f"No rrBLUP model for {trait}: {model_path}")
+    beta, effects = _load_effects(model_path, rscript)
+    if len(effects) != dosage.shape[1]:
+        raise ValueError(
+            f"{trait} has {len(effects)} marker effects for "
+            f"{dosage.shape[1]} dosages"
+        )
+    means = _training_means(model_dir / "train_x.tsv", dosage.shape[1])
+    filled = np.where(np.isnan(dosage), means, dosage)
+    normalized = beta + filled @ effects
+    preprocessing = json.loads(
+        (model_dir / "preprocessing.json").read_text(encoding="utf-8")
+    )
+    return _inverse_transform(normalized, preprocessing, trait)
+
+
+def predict(vcf_path, model_dir, traits, rscript, id_prefix, average_folds=False):
     model_dir = Path(model_dir)
     coding_path = model_dir / "dosage_coding.json"
     coding = json.loads(coding_path.read_text(encoding="utf-8"))
@@ -135,23 +187,18 @@ def predict(vcf_path, model_dir, traits, rscript, id_prefix):
         )
     columns = {"Sample_ID": sample_ids}
     for trait in traits:
-        full_dir = model_dir / trait / "full"
-        model_path = full_dir / "model.rds"
-        if not model_path.is_file():
-            raise FileNotFoundError(f"No rrBLUP model for {trait}: {model_path}")
-        beta, effects = _load_effects(model_path, rscript)
-        if len(effects) != dosage.shape[1]:
-            raise ValueError(
-                f"{trait} has {len(effects)} marker effects for "
-                f"{dosage.shape[1]} dosages"
+        if average_folds:
+            fold_dirs = _fold_model_dirs(model_dir, trait)
+            print(f"[PRED] {trait}: averaging {len(fold_dirs)} fold models")
+            fold_predictions = [
+                _predict_model(fold_dir, dosage, trait, rscript)
+                for fold_dir in fold_dirs
+            ]
+            columns[trait] = average_predictions(fold_predictions)
+        else:
+            columns[trait] = _predict_model(
+                model_dir / trait / "full", dosage, trait, rscript
             )
-        means = _training_means(full_dir / "train_x.tsv", dosage.shape[1])
-        filled = np.where(np.isnan(dosage), means, dosage)
-        normalized = beta + filled @ effects
-        preprocessing = json.loads(
-            (full_dir / "preprocessing.json").read_text(encoding="utf-8")
-        )
-        columns[trait] = _inverse_transform(normalized, preprocessing, trait)
         print(f"[PRED] {trait}: mean={columns[trait].mean():.4g}")
     return pd.DataFrame(columns)
 
@@ -177,9 +224,19 @@ def main():
         default=None,
         help="VCF ID prefix to keep. Default: SNP- when the model used SNP IDs.",
     )
+    parser.add_argument(
+        "--average-folds",
+        action="store_true",
+        help="Average original-scale predictions from contiguous cv/fold_* models.",
+    )
     args = parser.parse_args()
     predictions = predict(
-        args.vcf, args.model_dir, args.traits, args.rscript, args.id_prefix
+        args.vcf,
+        args.model_dir,
+        args.traits,
+        args.rscript,
+        args.id_prefix,
+        average_folds=args.average_folds,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

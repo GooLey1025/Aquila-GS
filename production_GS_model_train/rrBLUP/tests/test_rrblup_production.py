@@ -15,9 +15,12 @@ import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 RRBLUP_DIR = Path(__file__).resolve().parents[1]
+PREDICT_DIR = PROJECT_ROOT / "production_GS_model_train" / "120_lines_test-set"
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(RRBLUP_DIR))
+sys.path.insert(0, str(PREDICT_DIR))
 
+from predict_rrblup_vcf import average_predictions  # noqa: E402
 from rrblup_production import (  # noqa: E402
     _alt_alleles,
     _marker_ids,
@@ -51,6 +54,17 @@ class _RecordingWorker:
 def _write_processed(path: Path, indices: list[int]) -> None:
     targets = np.asarray(indices, dtype=np.float32).reshape(-1, 1)
     torch.save(torch.tensor(targets), path)
+
+
+def test_original_scale_fold_predictions_are_averaged() -> None:
+    averaged = average_predictions(
+        [
+            np.asarray([1.0, 3.0]),
+            np.asarray([3.0, 5.0]),
+            np.asarray([5.0, 7.0]),
+        ]
+    )
+    assert np.allclose(averaged, [3.0, 5.0])
 
 
 def test_marker_ids_come_from_the_main_branch() -> None:
@@ -96,6 +110,43 @@ def test_non_nucleotide_markers_are_excluded_from_dosage(tmp_path: Path) -> None
     dosage = dosages_from_diploid_onehot(parsed["matrix"][:, keep, :], indices)
     assert dosage.shape == (2, 1)
     assert np.allclose(dosage[:, 0], [0.0, 1.0])
+
+
+def test_fold_models_train_only_on_fold_training_samples(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    full_path = data_dir / "full"
+    full_path.mkdir(parents=True)
+    _write_processed(full_path / "Y_processed.pt", list(range(6)))
+    (full_path / "preprocessing.json").write_text("{}\n", encoding="utf-8")
+    for fold_id, train_indices in ((0, [0, 1, 2, 3]), (1, [2, 3, 4, 5])):
+        fold_path = data_dir / "cv" / f"fold_{fold_id}"
+        fold_path.mkdir(parents=True)
+        np.save(fold_path / "train_idx.npy", np.asarray(train_indices))
+        _write_processed(fold_path / "Y_train_processed.pt", train_indices)
+        (fold_path / "preprocessing.json").write_text(
+            json.dumps({"fold": fold_id}), encoding="utf-8"
+        )
+    worker = _RecordingWorker()
+    summary = run_trait(
+        worker=worker,
+        dosage=np.arange(12, dtype=np.float64).reshape(6, 2),
+        sample_ids=[f"S{index}" for index in range(6)],
+        mask=np.ones((6, 1), dtype=bool),
+        data_dir=data_dir,
+        output_dir=tmp_path / "out",
+        trait="GYP_BLUP",
+        trait_index=0,
+        parameters={"method": "REML"},
+        base_seed=42,
+        variants=("m0", "m1"),
+    )
+    assert [call["train_rows"] for call in worker.calls] == [6, 4, 4]
+    assert summary["n_folds"] == 2
+    for fold_id in (0, 1):
+        fold_dir = tmp_path / "out" / "GYP_BLUP" / "cv" / f"fold_{fold_id}"
+        assert (fold_dir / "model.rds").is_file()
+        assert (fold_dir / "preprocessing.json").is_file()
+        assert not (fold_dir / "predictions.tsv").exists()
 
 
 def test_training_uses_all_observed_samples_without_folds(tmp_path: Path) -> None:

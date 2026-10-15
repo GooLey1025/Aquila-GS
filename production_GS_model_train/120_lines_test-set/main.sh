@@ -12,12 +12,23 @@ cd "$(dirname "$0")"
 MAP=300lines_map.txt
 VCF_IN=Rice655_ref.snp.indel.sv.impute.biallelic.vcf.gz
 PHENO=3605rice_Phenotype.tsv
-RRBLUP_DIR=../results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.rrblup
+RRBLUP_DIR=../results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.GYP_BLUP.rrblup
 AQUILA_DIR=../results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.GYP_BLUP.10folds
 VCF_120=120rice.snp.indel.sv.vcf.gz
-TRAITS=(GYP_BLUP HD_BLUP)
+TRAITS=(GYP_BLUP)
+RRBLUP_PREDICTIONS=predictions/rrblup.GYP_BLUP.10fold-mean.120rice.tsv
+RRBLUP_FIGURES=figures/rrblup.GYP_BLUP.10fold-mean
+AQUILA_PREDICTIONS=predictions/aquila-snp.GYP_BLUP.single-trait.120rice.tsv
+AQUILA_FIGURES=figures/aquila-snp.GYP_BLUP.single-trait
 
 mkdir -p predictions figures
+
+RSCRIPT="${RSCRIPT:-Rscript}"
+if ! "$RSCRIPT" -e 'quit(status=!requireNamespace("jsonlite", quietly=TRUE))' >/dev/null 2>&1; then
+  if [[ -x "${HOME}/anaconda3/envs/aquila/bin/Rscript" ]]; then
+    RSCRIPT="${HOME}/anaconda3/envs/aquila/bin/Rscript"
+  fi
+fi
 
 AQUILA_CHECKPOINT="${AQUILA_DIR}/best_model.pt"
 AQUILA_CONFIG="${AQUILA_DIR}/config.yaml"
@@ -55,24 +66,26 @@ python predict_rrblup_vcf.py \
   --vcf "$VCF_120" \
   --model-dir "$RRBLUP_DIR" \
   --traits "${TRAITS[@]}" \
-  -o predictions/rrblup.120rice.tsv
+  --average-folds \
+  --rscript "$RSCRIPT" \
+  -o "$RRBLUP_PREDICTIONS"
 
 aquila_predict.py \
   --checkpoint "$AQUILA_CHECKPOINT" \
   --config "$AQUILA_CONFIG" \
   --vcf "$VCF_120" \
-  -o predictions/aquila-snp.120rice.tsv
+  -o "$AQUILA_PREDICTIONS"
 
 python correlation_analysis.py \
-  --preds predictions/rrblup.120rice.tsv \
+  --preds "$RRBLUP_PREDICTIONS" \
   --blup 120rice_Phenotype_BLUP.tsv \
   --meta "$MAP" \
-  --model-name rrBLUP \
-  --output-dir figures/rrblup
+  --model-name "rrBLUP (10-fold mean)" \
+  --output-dir "$RRBLUP_FIGURES"
 
 python correlation_analysis.py \
-  --preds predictions/aquila-snp.120rice.tsv \
+  --preds "$AQUILA_PREDICTIONS" \
   --blup 120rice_Phenotype_BLUP.tsv \
   --meta "$MAP" \
-  --model-name Aquila-SNP \
-  --output-dir figures/aquila-snp
+  --model-name "Aquila-SNP (GYP_BLUP single-trait)" \
+  --output-dir "$AQUILA_FIGURES"

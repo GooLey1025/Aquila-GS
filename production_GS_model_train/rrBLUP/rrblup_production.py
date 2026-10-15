@@ -187,7 +187,7 @@ def _observed_split(
     )
 
 
-def _fit_full(
+def _fit_split(
     worker: RWorker,
     work_dir: Path,
     train: SplitData,
@@ -203,6 +203,28 @@ def _fit_full(
         parameters,
         seed,
     )
+    insample_predictions = work_dir / "predictions.tsv"
+    if insample_predictions.exists():
+        insample_predictions.rename(work_dir / "insample_predictions.tsv")
+
+
+def _deployment_folds(data_dir: Path) -> list[tuple[int, Path]]:
+    """Return deployment folds in contiguous numeric order."""
+    folds = []
+    for path in data_dir.glob("cv/fold_*"):
+        if not path.is_dir():
+            continue
+        suffix = path.name.removeprefix("fold_")
+        if suffix.isdigit():
+            folds.append((int(suffix), path))
+    folds.sort(key=lambda item: item[0])
+    fold_ids = [fold_id for fold_id, _ in folds]
+    if fold_ids != list(range(len(fold_ids))):
+        raise ValueError(
+            "Deployment folds must be contiguous from fold_0; "
+            f"found {fold_ids}"
+        )
+    return folds
 
 
 def run_trait(
@@ -237,16 +259,13 @@ def run_trait(
     full_dir = trait_dir / "full"
     # The worker always scores predict_x. Reusing the training matrix only
     # satisfies that interface; those rows stay in-sample and are not metrics.
-    _fit_full(
+    _fit_split(
         worker,
         full_dir,
         train,
         parameters,
         derive_seed(base_seed, trait, 0, 0, 999),
     )
-    insample_predictions = full_dir / "predictions.tsv"
-    if insample_predictions.exists():
-        insample_predictions.rename(full_dir / "insample_predictions.tsv")
     write_json(
         full_dir / "fit.json",
         {
@@ -256,11 +275,57 @@ def run_trait(
         },
     )
     shutil.copy2(full_path / "preprocessing.json", full_dir / "preprocessing.json")
+    fold_results = []
+    for fold_id, fold_path in _deployment_folds(data_dir):
+        indices = np.load(fold_path / "train_idx.npy", allow_pickle=False)
+        processed = _load_tensor(fold_path / "Y_train_processed.pt").numpy()
+        fold_train = _observed_split(
+            dosage,
+            sample_ids,
+            indices,
+            processed,
+            mask,
+            trait_index,
+            variants,
+        )
+        fold_dir = trait_dir / "cv" / f"fold_{fold_id}"
+        print(
+            f"[INFO] rrBLUP trait={trait} fold={fold_id} "
+            f"train={len(fold_train.sample_ids)} valid=unused",
+            flush=True,
+        )
+        _fit_split(
+            worker,
+            fold_dir,
+            fold_train,
+            parameters,
+            derive_seed(base_seed, trait, fold_id, 0, 0),
+        )
+        shutil.copy2(fold_path / "preprocessing.json", fold_dir / "preprocessing.json")
+        write_json(
+            fold_dir / "fit.json",
+            {
+                "evaluation_set": "none",
+                "fold": fold_id,
+                "split": "train",
+                "n_train_observed": len(fold_train.sample_ids),
+                "parameters": dict(parameters),
+            },
+        )
+        fold_results.append(
+            {
+                "fold": fold_id,
+                "n_train_observed": len(fold_train.sample_ids),
+                "model": str((fold_dir / "model.rds").resolve()),
+            }
+        )
     write_json(trait_dir / "selected_parameters.json", dict(parameters))
     return {
         "trait": trait,
         "parameters": dict(parameters),
         "n_train_observed": len(train.sample_ids),
+        "n_folds": len(fold_results),
+        "folds": fold_results,
         "model": str((full_dir / "model.rds").resolve()),
         "elapsed_seconds": time.time() - started,
     }
