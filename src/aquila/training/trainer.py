@@ -156,6 +156,7 @@ class NestedCVTrainer:
         direction: str = "maximize",
         min_delta: float = 1e-4,
         metrics_log_path: str | Path | None = None,
+        materialize_checkpoint: bool = True,
     ) -> TrainingResult:
         """Early-stop on an inner validation fold and restore its best model."""
         if max_epochs < 1:
@@ -234,18 +235,26 @@ class NestedCVTrainer:
         if best_state is None:
             raise RuntimeError("Inner training produced no validated checkpoint")
         self.model.load_state_dict(best_state)
-        best_state_cpu = {
-            name: tensor.detach().cpu().clone()
-            for name, tensor in best_state.items()
-        }
+        if materialize_checkpoint:
+            result_state = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in best_state.items()
+            }
+            checkpoint_state = self.checkpoint_state(
+                epoch=best_epoch, metrics=best_metrics
+            )
+        else:
+            # Per-fold HPO keeps this single model copy on its assigned GPU.
+            # The caller only transfers it to CPU when the trial becomes the
+            # study winner; ordinary trials avoid model/optimizer CPU copies.
+            result_state = best_state
+            checkpoint_state = {}
         return TrainingResult(
             best_epoch=best_epoch,
             best_metrics=dict(best_metrics),
-            best_state_dict=best_state_cpu,
+            best_state_dict=result_state,
             history=history,
-            checkpoint_state=self.checkpoint_state(
-                epoch=best_epoch, metrics=best_metrics
-            ),
+            checkpoint_state=checkpoint_state,
         )
 
     def train_fixed_epochs(

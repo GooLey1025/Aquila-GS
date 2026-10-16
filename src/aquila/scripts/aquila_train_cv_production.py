@@ -3,7 +3,7 @@
 # Author: Lei Gu
 # Contact: goley04@foxmail.com
 
-"""Select hyperparameters by K-fold CV and refit a production model on all data."""
+"""Run per-fold production HPO or legacy K-fold HPO with full-data refit."""
 
 from __future__ import annotations
 
@@ -27,7 +27,6 @@ from aquila.data.dataset import PreparedData, load_prepared_data
 from aquila.data.preprocessing import PerTraitPreprocessor
 from aquila.scripts.aquila_data_cv_production import (
     DeploymentFold,
-    generate_deployment_folds,
     validate_deployment_folds,
 )
 from aquila.scripts.aquila_train_cv import (
@@ -47,7 +46,6 @@ from aquila.training.cuda_runtime import (
     train_deterministic_enabled,
 )
 from aquila.training.distributed import (
-    GPUWorkResult,
     PersistentGPUPool,
     detect_gpu_ids,
     execute_gpu_jobs,
@@ -69,6 +67,7 @@ from aquila.training.hpo import (
 )
 from aquila.training.trainer import (
     NestedCVTrainer,
+    TrainingResult,
     resolve_training_seed,
 )
 from aquila.utils import load_config
@@ -93,6 +92,14 @@ class DeploymentFoldJob:
 
 
 @dataclass(frozen=True)
+class PerFoldHPOJob:
+    """One complete, independent Bayesian study for a deployment fold."""
+
+    job_id: int
+    fold_id: int
+
+
+@dataclass(frozen=True)
 class DeploymentHPOContext:
     """Spawn-safe inputs shared by multi-GPU deployment HPO workers."""
 
@@ -107,13 +114,14 @@ class DeploymentHPOContext:
     loader_options: Dict[str, Any]
     output_directory: str
     live_metrics_log: bool = False
+    resume: bool = False
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Select Aquila hyperparameters with K-fold CV, then train one "
-            "production model on the complete prepared dataset."
+            "Run independent Bayesian HPO on train/validation folds, or use "
+            "the legacy cross-fold HPO plus full-data refit workflow."
         )
     )
     parser.add_argument("--data-dir", required=True, help="Prepared dataset directory.")
@@ -123,6 +131,37 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default="production_experiment",
         help="Production run output directory.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("per-fold", "cv-refit"),
+        default="cv-refit",
+        help=(
+            "cv-refit preserves the legacy cross-fold HPO and full-data refit "
+            "workflow (default); per-fold runs an independent study on each "
+            "selected train/valid split and saves its early-stopping checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--fold",
+        "--folds",
+        dest="folds",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "In per-fold mode, run these zero-based prepared folds, for "
+            "example --fold 0 1 2 3. Omit to run every fold."
+        ),
+    )
+    parser.add_argument(
+        "--n-trials",
+        type=int,
+        default=None,
+        help=(
+            "Override hpo.n_trials. Per-fold mode defaults to 500 when this "
+            "option is omitted; cv-refit otherwise keeps the YAML value."
+        ),
     )
     parser.add_argument(
         "--gpus",
@@ -135,6 +174,14 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Replace an existing nonempty production output directory.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume per-fold Bayesian studies from output-dir SQLite storage. "
+            "Completed trials and the current best checkpoint are reused."
+        ),
     )
     parser.add_argument(
         "--precision",
@@ -172,42 +219,59 @@ def load_deployment_folds(prepared: PreparedData) -> list[DeploymentFold]:
     return folds
 
 
-def _trait_tasks(
-    prepared: PreparedData,
-    regression_tasks: Sequence[str],
-    classification_tasks: Sequence[str],
-) -> list[str]:
-    trait_names = list(prepared.metadata["trait_names"])
-    tasks = ["regression"] * len(regression_tasks) + ["classification"] * len(
-        classification_tasks
-    )
-    if len(tasks) != len(trait_names):
-        raise ValueError("Prepared trait task metadata does not match target columns")
-    return tasks
+def select_deployment_folds(
+    folds: Sequence[DeploymentFold],
+    fold_ids: Sequence[int] | None,
+) -> list[DeploymentFold]:
+    """Select prepared folds or return all folds in their persisted order."""
+    if fold_ids is None:
+        return list(folds)
+    selected_ids = [int(fold_id) for fold_id in fold_ids]
+    if not selected_ids:
+        raise ValueError("At least one fold must be selected")
+    if len(set(selected_ids)) != len(selected_ids):
+        raise ValueError("Selected folds must be unique")
+    invalid = [
+        fold_id
+        for fold_id in selected_ids
+        if fold_id < 0 or fold_id >= len(folds)
+    ]
+    if invalid:
+        raise ValueError(
+            f"folds must be between 0 and {len(folds) - 1}, got {invalid}"
+        )
+    return [folds[fold_id] for fold_id in selected_ids]
 
 
-def _fit_processor(
-    prepared: PreparedData,
+def configure_hpo_mode(
     config: Mapping[str, Any],
-    indices: np.ndarray,
-    regression_tasks: Sequence[str],
-    classification_tasks: Sequence[str],
-) -> PerTraitPreprocessor:
-    preprocessing = config.get("preprocessing", {})
-    return PerTraitPreprocessor(
-        skew_threshold=float(preprocessing.get("skew_threshold", 2.0)),
-        epsilon=float(preprocessing.get("epsilon", 1e-8)),
-    ).fit(
-        prepared.targets,
-        prepared.target_mask,
-        indices,
-        prepared.metadata["trait_names"],
-        trait_tasks=_trait_tasks(
-            prepared,
-            regression_tasks,
-            classification_tasks,
-        ),
-    )
+    *,
+    mode: str,
+    n_trials: int | None,
+) -> Dict[str, Any]:
+    """Apply CLI HPO defaults while preserving legacy cv-refit behavior."""
+    configured = copy.deepcopy(dict(config))
+    hpo = configured.setdefault("hpo", {})
+    if not isinstance(hpo, dict):
+        raise TypeError("hpo configuration must be a mapping")
+    normalized = normalize_hpo_config(hpo)
+    if mode == "per-fold":
+        if normalized["method"] != "bayesian":
+            raise ValueError("per-fold mode requires hpo.method: bayesian")
+        resolved_trials = 500 if n_trials is None else int(n_trials)
+        if resolved_trials < 1:
+            raise ValueError("n-trials must be positive")
+        hpo["enabled"] = True
+        hpo["method"] = "bayesian"
+        hpo["n_trials"] = resolved_trials
+    elif mode == "cv-refit":
+        if n_trials is not None:
+            if int(n_trials) < 1:
+                raise ValueError("n-trials must be positive")
+            hpo["n_trials"] = int(n_trials)
+    else:
+        raise ValueError(f"Unsupported production mode: {mode}")
+    return configured
 
 
 def _processed_subset(
@@ -256,24 +320,14 @@ def _load_processed_targets(
     return targets
 
 
-def _train_deployment_fold(
+def _prepare_deployment_fold_data(
     *,
     prepared: PreparedData,
-    config: Mapping[str, Any],
     split: DeploymentFold,
-    candidate_id: int,
-    parameters: Mapping[str, Any],
     device: str,
-    regression_tasks: Sequence[str],
-    classification_tasks: Sequence[str],
-    metric: str,
-    direction: str,
-    patience: int,
-    loader_options: Mapping[str, Any],
-    metrics_log_path: str | Path | None = None,
-):
-    """Train one HPO candidate on one runtime-generated CV split."""
-    candidate_config = merge_config(config, parameters)
+    gpu_resident: bool,
+) -> tuple[PreparedData, PreparedData]:
+    """Load, subset, and optionally transfer one fold exactly once."""
     fold_path = prepared.directory / "cv" / f"fold_{split.fold}"
     train_data = _processed_subset(
         prepared,
@@ -295,15 +349,48 @@ def _train_deployment_fold(
         ),
         targets_are_subset=True,
     )
+    if gpu_resident and str(device).startswith("cuda"):
+        train_data = _prepared_on_device(train_data, device)
+        valid_data = _prepared_on_device(valid_data, device)
+    return train_data, valid_data
+
+
+def _train_deployment_fold(
+    *,
+    prepared: PreparedData,
+    config: Mapping[str, Any],
+    split: DeploymentFold,
+    candidate_id: int,
+    parameters: Mapping[str, Any],
+    device: str,
+    regression_tasks: Sequence[str],
+    classification_tasks: Sequence[str],
+    metric: str,
+    direction: str,
+    patience: int,
+    loader_options: Mapping[str, Any],
+    metrics_log_path: str | Path | None = None,
+    fold_data: tuple[PreparedData, PreparedData] | None = None,
+    materialize_checkpoint: bool = True,
+):
+    """Train one HPO candidate on one runtime-generated CV split."""
+    candidate_config = merge_config(config, parameters)
     train_config = candidate_config.get("train", {})
     batch_size = int(train_config.get("batch_size", 32))
     effective_loader_options = dict(loader_options)
     gpu_resident = bool(train_config.get("gpu_resident", True)) and str(
         device
     ).startswith("cuda")
+    if fold_data is None:
+        train_data, valid_data = _prepare_deployment_fold_data(
+            prepared=prepared,
+            split=split,
+            device=device,
+            gpu_resident=gpu_resident,
+        )
+    else:
+        train_data, valid_data = fold_data
     if gpu_resident:
-        train_data = _prepared_on_device(train_data, device)
-        valid_data = _prepared_on_device(valid_data, device)
         effective_loader_options = {"num_workers": 0, "pin_memory": False}
     train_loader = train_data.loader(
         np.arange(len(split.train)),
@@ -348,6 +435,7 @@ def _train_deployment_fold(
         direction=direction,
         min_delta=float(train_config.get("early_stopping_min_delta", 1e-4)),
         metrics_log_path=metrics_log_path,
+        materialize_checkpoint=materialize_checkpoint,
     )
 
 
@@ -437,9 +525,21 @@ def _deployment_fold_worker(
         metrics_log_path=metrics_log_path,
     )
     metrics = copy.deepcopy(dict(training.best_metrics))
+    metric_value = _metric_from_metrics(metrics, context.metric)
+    return {
+        "candidate_id": int(job.candidate_id),
+        "fold_id": int(job.fold_id),
+        "metric": float(metric_value),
+        "best_epoch": int(training.best_epoch),
+        "metrics": metrics,
+    }
+
+
+def _metric_from_metrics(metrics: Mapping[str, Any], metric: str) -> float:
+    """Resolve configured HPO metric names using the shared legacy aliases."""
     metric_value = metrics.get("avg_pearson")
     if metric_value is None:
-        metric_path = context.metric.replace("/", ".")
+        metric_path = metric.replace("/", ".")
         current: Any = metrics
         for part in metric_path.split("."):
             if isinstance(current, Mapping) and part in current:
@@ -452,17 +552,521 @@ def _deployment_fold_worker(
                 }
                 alias = aliases.get(metric_path) or aliases.get(part)
                 if alias not in metrics:
-                    raise KeyError(f"Metric path '{context.metric}' is not present")
+                    raise KeyError(f"Metric path '{metric}' is not present")
                 current = metrics[alias]
                 break
         metric_value = current
-    return {
-        "candidate_id": int(job.candidate_id),
-        "fold_id": int(job.fold_id),
-        "metric": float(metric_value),
-        "best_epoch": int(training.best_epoch),
-        "metrics": metrics,
+    return float(metric_value)
+
+
+def _per_fold_checkpoint(
+    *,
+    prepared: PreparedData,
+    split: DeploymentFold,
+    config: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+    training: TrainingResult,
+    processor: PerTraitPreprocessor,
+    cv_seed: int,
+) -> Dict[str, Any]:
+    """Build a prediction-compatible checkpoint for one validation-selected model."""
+    selected_config = merge_config(config, parameters)
+    regression_tasks, classification_tasks = _task_lists(prepared)
+    selected_config.setdefault("data", {})
+    selected_config["data"].update(
+        {
+            "encoding_type": prepared.metadata["encoding_type"],
+            "variant_type": prepared.metadata.get("variant_type"),
+            "regression_tasks": list(regression_tasks),
+            "classification_tasks": list(classification_tasks),
+        }
+    )
+    checkpoint_metadata = copy.deepcopy(prepared.metadata)
+    checkpoint_metadata["sequence_lengths"] = _sequence_lengths(prepared.features)
+    checkpoint_metadata["deployment_cv"] = {
+        "folds": int(prepared.metadata["cv_folds"]),
+        "fold": int(split.fold),
+        "seed": int(cv_seed),
+        "evaluation_set": "validation",
+        "train_samples": int(len(split.train)),
+        "validation_samples": int(len(split.valid)),
+        "refit_full_dataset": False,
     }
+    return {
+        **training.checkpoint_state,
+        "config": selected_config,
+        "metadata": checkpoint_metadata,
+        "preprocessing": processor.to_dict(),
+        "deployment_model": True,
+        "deployment_cv_folds": int(prepared.metadata["cv_folds"]),
+        "deployment_cv_fold": int(split.fold),
+        "deployment_cv_seed": int(cv_seed),
+        "selected_hyperparameters": dict(parameters),
+        "final_epoch": int(training.best_epoch),
+        "scheduler_epochs": int(
+            selected_config.get("train", {}).get(
+                "num_epochs", training.best_epoch
+            )
+        ),
+        "evaluation_set": "validation",
+        "refit_full_dataset": False,
+    }
+
+
+def _materialize_best_training(training: TrainingResult) -> TrainingResult:
+    """Copy only a winning trial's model state from GPU to CPU."""
+    state = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in training.best_state_dict.items()
+    }
+    checkpoint_state = {
+        "epoch": int(training.best_epoch),
+        "model_state_dict": state,
+        "metrics": copy.deepcopy(dict(training.best_metrics)),
+    }
+    return TrainingResult(
+        best_epoch=int(training.best_epoch),
+        best_metrics=copy.deepcopy(dict(training.best_metrics)),
+        best_state_dict=state,
+        history=copy.deepcopy(training.history),
+        checkpoint_state=checkpoint_state,
+    )
+
+
+def _atomic_torch_save(value: Any, path: Path) -> None:
+    """Atomically replace a checkpoint so interruption leaves a valid winner."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(value, temporary)
+    temporary.replace(path)
+
+
+def _save_running_per_fold_best(
+    *,
+    context: DeploymentHPOContext,
+    split: DeploymentFold,
+    candidate: CandidateResult,
+    training: TrainingResult,
+) -> None:
+    """Persist the current study winner immediately for safe resume."""
+    fold_directory = Path(context.output_directory) / f"fold_{split.fold}"
+    processor = PerTraitPreprocessor.load_json(
+        context.prepared_data.directory
+        / "cv"
+        / f"fold_{split.fold}"
+        / "preprocessing.json"
+    )
+    cv_seed = int(
+        context.prepared_data.metadata.get(
+            "cv_seed", context.prepared_data.metadata.get("seed", 42)
+        )
+    )
+    checkpoint = _per_fold_checkpoint(
+        prepared=context.prepared_data,
+        split=split,
+        config=context.config,
+        parameters=candidate.parameters,
+        training=training,
+        processor=processor,
+        cv_seed=cv_seed,
+    )
+    checkpoint["hpo_candidate_id"] = int(candidate.candidate_id)
+    checkpoint["hpo_objective"] = float(candidate.objective)
+    _atomic_torch_save(checkpoint, fold_directory / "best_model.pt")
+    _write_json(fold_directory / "training_history.json", training.history)
+
+
+def _candidate_from_optuna_trial(
+    trial: Any,
+    *,
+    fold_id: int,
+) -> CandidateResult:
+    """Reconstruct one completed candidate from persistent Optuna attributes."""
+    metrics = copy.deepcopy(dict(trial.user_attrs.get("metrics") or {}))
+    best_epoch = int(trial.user_attrs["best_epoch"])
+    objective = float(trial.value)
+    return CandidateResult(
+        candidate_id=int(trial.number),
+        parameters=copy.deepcopy(dict(trial.params)),
+        objective=objective,
+        inner_results=(
+            InnerFoldResult(
+                inner_fold=int(fold_id),
+                metric=objective,
+                best_epoch=best_epoch,
+                metrics=metrics,
+            ),
+        ),
+    )
+
+
+def _load_running_best_training(
+    fold_output: Path,
+) -> tuple[int, TrainingResult] | None:
+    """Load the checkpoint required to continue a previously interrupted study."""
+    checkpoint_path = fold_output / "best_model.pt"
+    history_path = fold_output / "training_history.json"
+    if not checkpoint_path.is_file():
+        return None
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    candidate_id = int(checkpoint["hpo_candidate_id"])
+    state = dict(checkpoint["model_state_dict"])
+    history = (
+        json.loads(history_path.read_text(encoding="utf-8"))
+        if history_path.is_file()
+        else []
+    )
+    training = TrainingResult(
+        best_epoch=int(checkpoint["epoch"]),
+        best_metrics=copy.deepcopy(dict(checkpoint.get("metrics") or {})),
+        best_state_dict=state,
+        history=history,
+        checkpoint_state={
+            "epoch": int(checkpoint["epoch"]),
+            "model_state_dict": state,
+            "metrics": copy.deepcopy(dict(checkpoint.get("metrics") or {})),
+        },
+    )
+    return candidate_id, training
+
+
+def _run_per_fold_study(
+    *,
+    context: DeploymentHPOContext,
+    split: DeploymentFold,
+    device: str,
+) -> tuple[HPOResult, TrainingResult]:
+    """Run or resume one TPE study with fold data resident on its GPU."""
+    try:
+        import optuna
+    except ImportError as error:
+        raise ImportError("Bayesian HPO requires optuna") from error
+
+    normalized = normalize_hpo_config(context.config.get("hpo", {}))
+    if normalized["method"] != "bayesian":
+        raise ValueError("per-fold mode requires Bayesian HPO")
+    sampler = optuna.samplers.TPESampler(seed=normalized["seed"])
+    fold_output = Path(context.output_directory) / f"fold_{split.fold}"
+    fold_output.mkdir(parents=True, exist_ok=True)
+    storage = None
+    study_name = None
+    if context.resume:
+        storage = f"sqlite:///{(fold_output / 'optuna.db').resolve()}"
+        study_name = f"aquila-production-fold-{split.fold}"
+    study = optuna.create_study(
+        direction=normalized["direction"],
+        sampler=sampler,
+        storage=storage,
+        study_name=study_name,
+        load_if_exists=context.resume,
+    )
+    finite_candidates = finite_parameter_candidates(normalized["parameters"])
+    if (
+        finite_candidates is not None
+        and normalized["n_trials"] > len(finite_candidates)
+    ):
+        raise ValueError(
+            f"Requested {normalized['n_trials']} unique Bayesian trials, but "
+            f"the finite search space contains only {len(finite_candidates)} "
+            "combinations"
+        )
+    if finite_candidates is not None:
+        rng = np.random.default_rng(normalized["seed"])
+        rng.shuffle(finite_candidates)
+
+    completed_trials = [
+        trial
+        for trial in study.trials
+        if trial.state == optuna.trial.TrialState.COMPLETE
+        and trial.value is not None
+        and "best_epoch" in trial.user_attrs
+    ]
+    candidates = [
+        _candidate_from_optuna_trial(trial, fold_id=split.fold)
+        for trial in completed_trials
+    ]
+    seen = {parameter_key(candidate.parameters) for candidate in candidates}
+    best_training: TrainingResult | None = None
+    best_candidate = (
+        select_best_candidate(
+            candidates,
+            normalized["direction"],
+            method="bayesian",
+        ).best
+        if candidates
+        else None
+    )
+    if best_candidate is not None:
+        loaded = _load_running_best_training(fold_output)
+        if loaded is None or loaded[0] != best_candidate.candidate_id:
+            raise RuntimeError(
+                f"Fold {split.fold} has persistent trials but no matching "
+                "best_model.pt; restart with --overwrite"
+            )
+        best_training = loaded[1]
+    maximize = normalized["direction"] == "maximize"
+    base_train = context.config.get("train", {})
+    fold_data = _prepare_deployment_fold_data(
+        prepared=context.prepared_data,
+        split=split,
+        device=device,
+        gpu_resident=bool(base_train.get("gpu_resident", True)),
+    )
+    print(
+        f"[INFO] Fold {split.fold}: {len(candidates)}/"
+        f"{normalized['n_trials']} completed TPE trials; fold data cached on "
+        f"{device}",
+        flush=True,
+    )
+    while len(candidates) < normalized["n_trials"]:
+        trial, parameters, duplicate_count = unique_bayesian_trial(
+            study,
+            normalized["parameters"],
+            seen,
+            finite_candidates,
+        )
+        metrics_log_path = None
+        if context.live_metrics_log:
+            metrics_log_path = (
+                fold_output / f"candidate_{trial.number}" / "metrics.jsonl"
+            )
+        training = _train_deployment_fold(
+            prepared=context.prepared_data,
+            config=context.config,
+            split=split,
+            candidate_id=int(trial.number),
+            parameters=parameters,
+            device=device,
+            regression_tasks=context.regression_tasks,
+            classification_tasks=context.classification_tasks,
+            metric=context.metric,
+            direction=context.direction,
+            patience=context.patience,
+            loader_options=context.loader_options,
+            metrics_log_path=metrics_log_path,
+            fold_data=fold_data,
+            materialize_checkpoint=False,
+        )
+        objective = _metric_from_metrics(training.best_metrics, context.metric)
+        if not math.isfinite(objective):
+            study.tell(trial, state=optuna.trial.TrialState.FAIL)
+            raise ValueError(
+                f"Non-finite HPO objective in fold {split.fold}, "
+                f"trial {trial.number}"
+            )
+        inner = InnerFoldResult(
+            inner_fold=int(split.fold),
+            metric=float(objective),
+            best_epoch=int(training.best_epoch),
+            metrics=copy.deepcopy(dict(training.best_metrics)),
+        )
+        candidate = CandidateResult(
+            candidate_id=int(trial.number),
+            parameters=copy.deepcopy(parameters),
+            objective=float(objective),
+            inner_results=(inner,),
+        )
+        candidates.append(candidate)
+        seen.add(parameter_key(parameters))
+        trial.set_user_attr("best_epoch", int(training.best_epoch))
+        trial.set_user_attr(
+            "metrics",
+            _json_safe(dict(training.best_metrics)),
+        )
+        study.tell(trial, objective)
+        is_better = best_candidate is None or (
+            objective > best_candidate.objective
+            if maximize
+            else objective < best_candidate.objective
+        )
+        if is_better:
+            best_candidate = candidate
+            best_training = _materialize_best_training(training)
+            _save_running_per_fold_best(
+                context=context,
+                split=split,
+                candidate=candidate,
+                training=best_training,
+            )
+        duplicate_note = (
+            f" skipped_duplicates={duplicate_count}" if duplicate_count else ""
+        )
+        print(
+            f"[Fold {split.fold} Bayesian HPO] unique={len(candidates)}/"
+            f"{normalized['n_trials']} optuna_trial={trial.number + 1} "
+            f"objective={objective:.6f} best_epoch={training.best_epoch}"
+            f"{duplicate_note}",
+            flush=True,
+        )
+    result = select_best_candidate(
+        candidates,
+        normalized["direction"],
+        method="bayesian",
+    )
+    if best_training is None or best_candidate is None:
+        raise RuntimeError(f"Fold {split.fold} HPO completed without a model")
+    if result.best.candidate_id != best_candidate.candidate_id:
+        raise RuntimeError("In-memory best checkpoint does not match HPO winner")
+    return result, best_training
+
+
+def _persist_per_fold_result(
+    *,
+    context: DeploymentHPOContext,
+    split: DeploymentFold,
+    hpo_result: HPOResult,
+    training: TrainingResult,
+    device: str,
+    elapsed_seconds: float,
+) -> Dict[str, Any]:
+    """Persist one fold's best validation-selected checkpoint and reports."""
+    fold_directory = Path(context.output_directory) / f"fold_{split.fold}"
+    fold_directory.mkdir(parents=True, exist_ok=True)
+    selected_config = merge_config(context.config, hpo_result.best.parameters)
+    selected_config.setdefault("data", {})
+    selected_config["data"].update(
+        {
+            "encoding_type": context.prepared_data.metadata["encoding_type"],
+            "variant_type": context.prepared_data.metadata.get("variant_type"),
+            "regression_tasks": list(context.regression_tasks),
+            "classification_tasks": list(context.classification_tasks),
+        }
+    )
+    processor = PerTraitPreprocessor.load_json(
+        context.prepared_data.directory
+        / "cv"
+        / f"fold_{split.fold}"
+        / "preprocessing.json"
+    )
+    cv_seed = int(
+        context.prepared_data.metadata.get(
+            "cv_seed", context.prepared_data.metadata.get("seed", 42)
+        )
+    )
+    checkpoint = _per_fold_checkpoint(
+        prepared=context.prepared_data,
+        split=split,
+        config=context.config,
+        parameters=hpo_result.best.parameters,
+        training=training,
+        processor=processor,
+        cv_seed=cv_seed,
+    )
+    checkpoint["hpo_candidate_id"] = int(hpo_result.best.candidate_id)
+    checkpoint["hpo_objective"] = float(hpo_result.best.objective)
+    _atomic_torch_save(checkpoint, fold_directory / "best_model.pt")
+    processor.save_json(fold_directory / "preprocessing.json")
+    with (fold_directory / "config.yaml").open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(selected_config, handle, sort_keys=False)
+    _write_json(fold_directory / "training_history.json", training.history)
+    normalized = normalize_hpo_config(context.config.get("hpo", {}))
+    _write_json(
+        fold_directory / "hpo_results.json",
+        {
+            "method": hpo_result.method,
+            "metric": normalized["metric"],
+            "direction": hpo_result.direction,
+            "fold": int(split.fold),
+            "n_trials": len(hpo_result.candidates),
+            "best_candidate_id": hpo_result.best.candidate_id,
+            "best_parameters": dict(hpo_result.best.parameters),
+            "best_validation": hpo_result.best.objective,
+            "best_epoch": training.best_epoch,
+            "candidates": _candidate_records(hpo_result),
+        },
+    )
+    training_seed = resolve_training_seed(
+        selected_config,
+        fallback=int(context.prepared_data.metadata.get("seed", 42)),
+    )
+    runtime = {
+        "device": device,
+        "gpu_name": (
+            torch.cuda.get_device_name(torch.device(device))
+            if device.startswith("cuda")
+            else None
+        ),
+        "cv_seed": cv_seed,
+        "training_seed": training_seed,
+        "elapsed_seconds": elapsed_seconds,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+    }
+    _write_json(fold_directory / "runtime.json", runtime)
+    summary = {
+        "status": "completed",
+        "mode": "per-fold",
+        "model_type": "production",
+        "evaluation_set": "validation",
+        "refit_full_dataset": False,
+        "fold": int(split.fold),
+        "folds": int(context.prepared_data.metadata["cv_folds"]),
+        "train_samples": int(len(split.train)),
+        "validation_samples": int(len(split.valid)),
+        "hpo_trials": len(hpo_result.candidates),
+        "hpo_metric": normalized["metric"],
+        "hpo_direction": hpo_result.direction,
+        "best_validation": hpo_result.best.objective,
+        "best_epoch": int(training.best_epoch),
+        "selected_hyperparameters": dict(hpo_result.best.parameters),
+        "checkpoint": str((fold_directory / "best_model.pt").resolve()),
+        "runtime": runtime,
+    }
+    _write_json(fold_directory / "summary.json", summary)
+    return summary
+
+
+def _per_fold_hpo_worker(
+    job: PerFoldHPOJob,
+    device: str,
+    context: DeploymentHPOContext,
+) -> Dict[str, Any]:
+    """Run and persist one complete fold-local study."""
+    started = time.time()
+    configure_cuda_runtime(
+        device,
+        deterministic=train_deterministic_enabled(context.config),
+    )
+    split_by_id = {split.fold: split for split in context.folds}
+    split = split_by_id[job.fold_id]
+    hpo_result, training = _run_per_fold_study(
+        context=context,
+        split=split,
+        device=device,
+    )
+    return _persist_per_fold_result(
+        context=context,
+        split=split,
+        hpo_result=hpo_result,
+        training=training,
+        device=device,
+        elapsed_seconds=time.time() - started,
+    )
+
+
+def _run_per_fold_mode(
+    context: DeploymentHPOContext,
+    gpu_ids: Sequence[int],
+) -> list[Dict[str, Any]]:
+    """Schedule independent fold studies across available GPUs."""
+    jobs = [
+        PerFoldHPOJob(job_id=int(split.fold), fold_id=int(split.fold))
+        for split in context.folds
+    ]
+    results = execute_gpu_jobs(
+        jobs,
+        _per_fold_hpo_worker,
+        gpu_ids,
+        worker_args=(context,),
+        raise_on_error=True,
+        deterministic=train_deterministic_enabled(context.config),
+    )
+    return [dict(result.value) for result in results]
 
 
 def _run_bayesian_hpo_on_gpus(
@@ -675,12 +1279,21 @@ def _run_hpo(
     )
 
 
-def _prepare_output(output_directory: Path, overwrite: bool) -> None:
+def _prepare_output(
+    output_directory: Path,
+    overwrite: bool,
+    *,
+    resume: bool = False,
+) -> None:
+    if overwrite and resume:
+        raise ValueError("--overwrite and --resume are mutually exclusive")
     if output_directory.exists() and any(output_directory.iterdir()):
+        if resume:
+            return
         if not overwrite:
             raise FileExistsError(
                 f"Production output already exists: {output_directory}; "
-                "use --overwrite to replace it"
+                "use --overwrite to replace it or --resume to continue it"
             )
         shutil.rmtree(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -928,64 +1541,26 @@ def train_prepared_model(
     )
 
 
-def main() -> None:
-    args = parse_args()
-    started = time.time()
-    prepared = load_prepared_data(args.data_dir)
-    config = load_config(args.config)
-    config.setdefault("train", {})
-    config["train"]["precision"] = args.precision
-    resolve_train_deterministic(
-        config,
-        True if args.use_deterministic else None,
-    )
-    if args.live_metrics_log:
-        config["train"]["live_metrics_log"] = True
-    config["train"].pop("mixed_precision", None)
-    _validate_preprocessing_cache(prepared, config)
-
-    regression_tasks, classification_tasks = _task_lists(prepared)
-    if not regression_tasks:
-        raise ValueError(
-            "Prepared data contains no regression tasks; production CV HPO "
-            "currently requires at least one regression trait"
-        )
-    if prepared.metadata.get("data_mode") != "deployment":
-        raise ValueError(
-            "aquila-train-cv-production requires data prepared by "
-            "aquila-data-cv-production"
-        )
-    folds = load_deployment_folds(prepared)
+def _run_cv_refit_mode(
+    *,
+    args: argparse.Namespace,
+    prepared: PreparedData,
+    config: Mapping[str, Any],
+    folds: Sequence[DeploymentFold],
+    regression_tasks: Sequence[str],
+    classification_tasks: Sequence[str],
+    output_directory: Path,
+    gpu_ids: Sequence[int],
+    started: float,
+) -> None:
+    """Preserve the original cross-fold HPO and full-data refit workflow."""
     cv_seed = int(prepared.metadata.get("cv_seed", prepared.metadata["seed"]))
-
-    output_directory = Path(args.output_dir)
-    _prepare_output(output_directory, args.overwrite)
-    shutil.copy2(Path(args.config).resolve(), output_directory / Path(args.config).name)
-    shutil.copy2(
-        prepared.directory / "fold_assignments.tsv",
-        output_directory / "fold_assignments.tsv",
-    )
-
-    gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
     device = f"cuda:{gpu_ids[0]}" if gpu_ids else "cpu"
-    if train_deterministic_enabled(config):
-        print("[INFO] CUDA deterministic algorithms enabled")
-    if len(gpu_ids) > 1 and normalize_hpo_config(config.get("hpo", {}))[
-        "method"
-    ] in {"grid", "bayesian"}:
-        prepared = PreparedData(
-            features=share_memory_tensors(prepared.features),
-            targets=prepared.targets.share_memory_(),
-            target_mask=prepared.target_mask.share_memory_(),
-            metadata=prepared.metadata,
-            directory=prepared.directory,
-        )
-
     train_config = config.get("train", {})
     normalized_hpo = normalize_hpo_config(config.get("hpo", {}))
     context = DeploymentHPOContext(
         prepared_data=prepared,
-        config=copy.deepcopy(config),
+        config=copy.deepcopy(dict(config)),
         folds=tuple(folds),
         regression_tasks=tuple(regression_tasks),
         classification_tasks=tuple(classification_tasks),
@@ -1014,7 +1589,6 @@ def main() -> None:
             cv_seed=cv_seed,
         )
     )
-
     torch.save(checkpoint, output_directory / "best_model.pt")
     processor.save_json(output_directory / "preprocessing.json")
     with (output_directory / "config.yaml").open("w", encoding="utf-8") as handle:
@@ -1055,8 +1629,10 @@ def main() -> None:
         output_directory / "summary.json",
         {
             "status": "completed",
+            "mode": "cv-refit",
             "model_type": "production",
             "evaluation_set": "none",
+            "refit_full_dataset": True,
             "sample_count": prepared.sample_count,
             "folds": len(folds),
             "cv_seed": cv_seed,
@@ -1076,6 +1652,124 @@ def main() -> None:
     print(
         f"Completed production CV ({len(folds)} folds) and full-data refit; "
         f"checkpoint: {output_directory / 'best_model.pt'}"
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    started = time.time()
+    prepared = load_prepared_data(args.data_dir)
+    config = configure_hpo_mode(
+        load_config(args.config),
+        mode=args.mode,
+        n_trials=args.n_trials,
+    )
+    config.setdefault("train", {})
+    config["train"]["precision"] = args.precision
+    resolve_train_deterministic(
+        config,
+        True if args.use_deterministic else None,
+    )
+    if args.live_metrics_log:
+        config["train"]["live_metrics_log"] = True
+    config["train"].pop("mixed_precision", None)
+    _validate_preprocessing_cache(prepared, config)
+
+    regression_tasks, classification_tasks = _task_lists(prepared)
+    if not regression_tasks:
+        raise ValueError(
+            "Prepared data contains no regression tasks; production HPO "
+            "currently requires at least one regression trait"
+        )
+    if prepared.metadata.get("data_mode") != "deployment":
+        raise ValueError(
+            "aquila-train-cv-production requires data prepared by "
+            "aquila-data-cv-production"
+        )
+    all_folds = load_deployment_folds(prepared)
+    if args.mode == "cv-refit" and args.folds is not None:
+        raise ValueError("--fold is only supported in per-fold mode")
+    selected_folds = (
+        select_deployment_folds(all_folds, args.folds)
+        if args.mode == "per-fold"
+        else all_folds
+    )
+
+    output_directory = Path(args.output_dir)
+    if args.resume and args.mode != "per-fold":
+        raise ValueError("--resume is only supported in per-fold mode")
+    _prepare_output(
+        output_directory,
+        args.overwrite,
+        resume=args.resume,
+    )
+    shutil.copy2(Path(args.config).resolve(), output_directory / Path(args.config).name)
+    shutil.copy2(
+        prepared.directory / "fold_assignments.tsv",
+        output_directory / "fold_assignments.tsv",
+    )
+    gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
+    if train_deterministic_enabled(config):
+        print("[INFO] CUDA deterministic algorithms enabled")
+    if len(gpu_ids) > 1:
+        prepared = PreparedData(
+            features=share_memory_tensors(prepared.features),
+            targets=prepared.targets.share_memory_(),
+            target_mask=prepared.target_mask.share_memory_(),
+            metadata=prepared.metadata,
+            directory=prepared.directory,
+        )
+
+    if args.mode == "cv-refit":
+        _run_cv_refit_mode(
+            args=args,
+            prepared=prepared,
+            config=config,
+            folds=all_folds,
+            regression_tasks=regression_tasks,
+            classification_tasks=classification_tasks,
+            output_directory=output_directory,
+            gpu_ids=gpu_ids,
+            started=started,
+        )
+        return
+
+    train_config = config.get("train", {})
+    normalized_hpo = normalize_hpo_config(config.get("hpo", {}))
+    context = DeploymentHPOContext(
+        prepared_data=prepared,
+        config=copy.deepcopy(config),
+        folds=tuple(selected_folds),
+        regression_tasks=tuple(regression_tasks),
+        classification_tasks=tuple(classification_tasks),
+        metric=str(normalized_hpo["metric"]),
+        direction=str(normalized_hpo["direction"]),
+        patience=int(train_config.get("early_stopping_patience", 20)),
+        loader_options=_loader_kwargs(train_config),
+        output_directory=str(output_directory),
+        live_metrics_log=bool(train_config.get("live_metrics_log", False)),
+        resume=bool(args.resume),
+    )
+    fold_summaries = _run_per_fold_mode(context, gpu_ids)
+    aggregate = {
+        "status": "completed",
+        "mode": "per-fold",
+        "evaluation_set": "validation",
+        "refit_full_dataset": False,
+        "prepared_folds": len(all_folds),
+        "selected_folds": [int(split.fold) for split in selected_folds],
+        "hpo_trials_per_fold": int(normalized_hpo["n_trials"]),
+        "elapsed_seconds": time.time() - started,
+        "folds": fold_summaries,
+        "warning": (
+            "Validation metrics were used adaptively for HPO and are not "
+            "unbiased test estimates."
+        ),
+    }
+    _write_json(output_directory / "summary.json", aggregate)
+    print(
+        f"Completed independent HPO for folds "
+        f"{aggregate['selected_folds']}; results: {output_directory}"
     )
 
 

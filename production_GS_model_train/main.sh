@@ -26,13 +26,32 @@ aquila_data_cv_production.py \
 aquila_train_cv_production.py \
   --data-dir 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.production.10folds.data \
   --config 64hpo_budgets.bayesian.yaml \
-  -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.10folds \
+  --fold 0 \
+  --n-trials 500 \
+  -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.fold0-hpo \
   --precision bf16 --live-metrics-log \
   --use-deterministic --overwrite
 
 ./aquila_export_locked_config.py \
-  --summary results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.10folds/summary.json \
+  --summary results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.fold0-hpo/fold_0/summary.json \
   -o 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.locked.yaml
+
+# Omit --fold to run one independent 500-trial Bayesian study for every
+# prepared fold. Available GPUs are assigned different folds.
+# aquila_train_cv_production.py \
+#   --data-dir 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.production.10folds.data \
+#   --config 64hpo_budgets.bayesian.yaml \
+#   --n-trials 500 \
+#   -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.all-fold-hpo \
+#   --precision bf16 --use-deterministic --overwrite
+
+# Legacy behavior: aggregate every fold for HPO, then refit on the full data.
+# aquila_train_cv_production.py \
+#   --mode cv-refit \
+#   --data-dir 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.production.10folds.data \
+#   --config 64hpo_budgets.bayesian.yaml \
+#   -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.cv-refit \
+#   --precision bf16 --use-deterministic --overwrite
 
 for seed in $(seq 43 51); do
   aquila_train.py \
@@ -45,11 +64,14 @@ for seed in $(seq 43 51); do
     --use-deterministic
 done
 
-# rrBLUP: fixed REML parameters, so fit the full reference set directly.
+# rrBLUP uses fixed REML parameters. Fit one model on each of the 10
+# train splits. 120_lines_test-set/main.sh averages those fold predictions.
 python rrBLUP/rrblup_production.py \
   --data-dir 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.production.10folds.data \
   --config rrBLUP/configs/production.yaml \
-  -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.rrblup
+  --traits GYP_BLUP \
+  -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.GYP_BLUP.rrblup \
+  --overwrite
 
 
 # For Aquila-Vars
@@ -62,6 +84,7 @@ aquila_data_cv_production.py \
   -o 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-vars.production.data \
   --overwrite
 aquila_train_cv_production.py \
+  --mode cv-refit \
   --data-dir 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-vars.production.data \
   --config ../benchmark/aquila-vars/32hpo_budgets.aquila-vars.yaml \
   -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean \

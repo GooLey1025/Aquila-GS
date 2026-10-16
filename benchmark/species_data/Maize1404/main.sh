@@ -12,7 +12,7 @@ VCF_FILT="${P}.${FILTER_TAG}.vcf.gz"
 VCF_IMPUTE="results/${P}.${FILTER_TAG}.impute.biallelic.vcf.gz"
 PHENO_IN="${P}_GSTP004.pheno"
 PHENO_OUT="${P}.pheno"
-BENCHMARK_PHENO="benchmark.blup.pheno"
+BENCHMARK_PHENO="benchmark.pheno"
 SINGLE_PHENO_DIR="single_phenotypes"
 
 if python3 -c "import pandas" >/dev/null 2>&1; then
@@ -93,13 +93,11 @@ echo "[INFO] ${FINAL_VCF}: $(bcftools index -n "${FINAL_VCF}") variants"
 mv -f "${FINAL_VCF}.renamed.vcf.gz" "${FINAL_VCF}"
 mv -f "${FINAL_VCF}.renamed.vcf.gz.csi" "${FINAL_VCF}.csi"
 
-# Representative, nearly complete agronomic traits:
-# flowering time (DTS), plant/ear height (PH/EH), and yield components
-# kernel number and kernel weight per ear (KNPE/KWPE).
+# Yield components only. These are observed means, not BLUPs.
 "$PY" "${COMMON_SCRIPT_DIR}/export_benchmark_phenotypes.py" \
     --input "${PHENO_OUT}" \
     --output "${BENCHMARK_PHENO}" \
     --single-dir "${SINGLE_PHENO_DIR}" \
-    --traits DTS PH EH KNPE KWPE \
+    --traits KNPE KWPE \
     --min-observed 100 \
     --min-observed-fraction 0.5

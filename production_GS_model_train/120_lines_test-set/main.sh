@@ -13,13 +13,13 @@ MAP=300lines_map.txt
 VCF_IN=Rice655_ref.snp.indel.sv.impute.biallelic.vcf.gz
 PHENO=3605rice_Phenotype.tsv
 RRBLUP_DIR=../results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.GYP_BLUP.rrblup
-AQUILA_DIR=../results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.GYP_BLUP.10folds
+AQUILA_DIR=../results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.per-fold-hpo/fold_0
 VCF_120=120rice.snp.indel.sv.vcf.gz
 TRAITS=(GYP_BLUP)
 RRBLUP_PREDICTIONS=predictions/rrblup.GYP_BLUP.10fold-mean.120rice.tsv
 RRBLUP_FIGURES=figures/rrblup.GYP_BLUP.10fold-mean
-AQUILA_PREDICTIONS=predictions/aquila-snp.GYP_BLUP.single-trait.120rice.tsv
-AQUILA_FIGURES=figures/aquila-snp.GYP_BLUP.single-trait
+AQUILA_PREDICTIONS=predictions/aquila-snp.fold0.120rice.tsv
+AQUILA_FIGURES=figures/aquila-snp.fold0
 
 mkdir -p predictions figures
 
@@ -62,13 +62,13 @@ python compute_phenotype_blup.py \
   --samples samples_120.txt \
   --extract 120rice_Phenotype_BLUP.tsv
 
-python predict_rrblup_vcf.py \
-  --vcf "$VCF_120" \
-  --model-dir "$RRBLUP_DIR" \
-  --traits "${TRAITS[@]}" \
-  --average-folds \
-  --rscript "$RSCRIPT" \
-  -o "$RRBLUP_PREDICTIONS"
+# python predict_rrblup_vcf.py \
+#   --vcf "$VCF_120" \
+#   --model-dir "$RRBLUP_DIR" \
+#   --traits "${TRAITS[@]}" \
+#   --average-folds \
+#   --rscript "$RSCRIPT" \
+#   -o "$RRBLUP_PREDICTIONS"
 
 aquila_predict.py \
   --checkpoint "$AQUILA_CHECKPOINT" \
@@ -76,16 +76,16 @@ aquila_predict.py \
   --vcf "$VCF_120" \
   -o "$AQUILA_PREDICTIONS"
 
-python correlation_analysis.py \
-  --preds "$RRBLUP_PREDICTIONS" \
-  --blup 120rice_Phenotype_BLUP.tsv \
-  --meta "$MAP" \
-  --model-name "rrBLUP (10-fold mean)" \
-  --output-dir "$RRBLUP_FIGURES"
+# python correlation_analysis.py \
+#   --preds "$RRBLUP_PREDICTIONS" \
+#   --blup 120rice_Phenotype_BLUP.tsv \
+#   --meta "$MAP" \
+#   --model-name "rrBLUP (10-fold mean)" \
+#   --output-dir "$RRBLUP_FIGURES"
 
 python correlation_analysis.py \
   --preds "$AQUILA_PREDICTIONS" \
   --blup 120rice_Phenotype_BLUP.tsv \
   --meta "$MAP" \
-  --model-name "Aquila-SNP (GYP_BLUP single-trait)" \
+  --model-name "Aquila-SNP (fold 0 best model)" \
   --output-dir "$AQUILA_FIGURES"

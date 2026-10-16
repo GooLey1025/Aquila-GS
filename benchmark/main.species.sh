@@ -1,5 +1,5 @@
-COHORT=Maize1404_blup_pheno_10folds
-PHENO_FILE=species_data/Maize1404/benchmark.blup.pheno
+COHORT=Maize1404_pheno_10folds
+PHENO_FILE=species_data/Maize1404/benchmark.pheno
 VCF_FILE=species_data/Maize1404/Maize1404.coding.ld.vcf.gz
 
 COHORT=Soybean975_blup_pheno_10folds
@@ -10,15 +10,24 @@ COHORT=wheat994_blup_pheno_10folds
 PHENO_FILE=species_data/wheat994/benchmark.blup.pheno
 VCF_FILE=species_data/wheat994/wheat994.coding.ld.vcf.gz
 
+COHORT=Rice1171_pheno_10folds
+PHENO_FILE=species_data/Rice1171/1171rice.pheno
+VCF_FILE=species_data/Rice1171/1171rice.final.imputed.WG_LD.vcf.gz
+
 export PATH="$CONDA_PREFIX/bin:$PATH"
 
 conda activate aquila
 aquila_cv.py --phenotype $PHENO_FILE -o $COHORT.nested_cv.json --outer-folds 10 --inner-folds 4 --seed 42 --min-observed 20
 
-# For Aquila-SNP data
-aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.nested_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
-# For Aquila-Vars data
-aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.nested_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
+if [[ "$COHORT" == *Rice1171* ]]; then
+  aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --id-prefix "SNP-" --fold-mapping $COHORT.nested_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
+  aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.nested_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
+else
+  # For Aquila-SNP data
+  aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.nested_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
+  # For Aquila-Vars data
+  aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.nested_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
+fi
 
 cd croparnet
 /usr/bin/time -v -o $COHORT.time.txt python src_benchmark/adapter.py \
@@ -130,12 +139,18 @@ for TRAIT in "${PHENO_COLUMNS[@]:1}"; do
   SINGLE_TASK_OUTPUT="results/$COHORT.single_task/$TRAIT"
 
   echo "Preparing Aquila-SNP single-task data: $COHORT / $TRAIT"
+  if [[ "$COHORT" == *Rice1171* ]]; then
+    ID_PREFIX=(--id-prefix "SNP-")
+  else
+    ID_PREFIX=()
+  fi
   aquila_data_cv.py \
     --vcf "../$VCF_FILE" \
     --phenotype "../$PHENO_FILE" \
     --traits "$TRAIT" \
     --encoding-type diploid_onehot \
     --variant-type snp \
+    "${ID_PREFIX[@]}" \
     --fold-mapping "../$COHORT.nested_cv.json" \
     -o "$SINGLE_TASK_DATA" \
     --overwrite

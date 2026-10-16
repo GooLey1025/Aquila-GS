@@ -428,7 +428,7 @@ def main() -> None:
     for trait in traits:
         trait_index = trait_names.index(trait)
         print(
-            f"[INFO] rrBLUP trait={trait} mode=full-data",
+            f"[INFO] rrBLUP trait={trait} mode=10-fold-train-splits",
             flush=True,
         )
         results.append(
@@ -453,6 +453,7 @@ def main() -> None:
             "model": "rrBLUP",
             "model_type": "production",
             "evaluation_set": "none",
+            "prediction_mode": "average_fold_models",
             "data_dir": str(data_dir),
             "config": str(Path(args.config).resolve()),
             "sample_count": len(sample_ids),
@@ -462,7 +463,7 @@ def main() -> None:
         },
     )
     print(
-        f"Completed rrBLUP full-data fit for {len(results)} trait(s); "
+        f"Completed rrBLUP 10-fold fits for {len(results)} trait(s); "
         f"summary: {output_dir / 'summary.json'}"
     )
 
