@@ -1,0 +1,33 @@
+model: ElasticNet
+seed: 42
+parameters:
+  standardize: true
+  intercept: true
+hpo:
+  enabled: true
+  method: bayesian
+  n_trials: 200
+  metric: pearson
+  direction: maximize
+  seed: 42
+  parameters:
+    alpha:
+      type: float
+      low: 0.05
+      high: 0.95
+      step: 0.05
+    lambda:
+      type: log_uniform
+      low: 1.0e-4
+      high: 1.0
+grid:
+  alpha:
+    - 0.25
+    - 0.5
+    - 0.75
+  lambda:
+    - 0.0001
+    - 0.001
+    - 0.01
+    - 0.1
+    - 1.0

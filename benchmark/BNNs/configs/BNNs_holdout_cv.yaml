@@ -1,0 +1,65 @@
+# BNN single-trait nested-CV benchmark configuration.
+
+data:
+  lasso_alpha: 0.001
+  max_features: 3000
+
+model:
+  hidden_dims: [32]
+  activation: relu
+
+prior:
+  sigma1: 1.0
+  sigma2: 0.00001
+  pi: 0.5
+
+train:
+  learning_rate: 0.001
+  weight_decay: 0.0
+  max_epochs: 3000
+  patience: 40
+  min_delta: 0.0001
+  mc_samples: 1
+  noise_std: 0.1
+  kl_weight: 1.0
+  gradient_clip: 5.0
+
+inference:
+  validation_samples: 20
+  test_samples: 100
+
+hpo:
+  enabled: true
+  method: bayesian
+  n_trials: 50
+  metric: avg_pearson
+  direction: maximize
+  seed: 42
+  parameters:
+    data.lasso_alpha:
+      type: log_uniform
+      low: 1.0e-4
+      high: 1.0e-2
+    model.hidden_dims:
+      type: categorical
+      choices:
+        - [32]
+        - [64]
+        - [32, 16]
+    prior.pi:
+      type: float
+      low: 0.1
+      high: 0.7
+      step: 0.1
+    prior.sigma2:
+      type: log_uniform
+      low: 1.0e-6
+      high: 1.0e-3
+    train.learning_rate:
+      type: log_uniform
+      low: 1.0e-4
+      high: 3.0e-3
+    train.kl_weight:
+      type: log_uniform
+      low: 0.01
+      high: 1.0
