@@ -33,16 +33,10 @@ from aquila.training.hpo import generate_grid_candidates, half_up_median_epoch
 def test_hpo_grid_has_exactly_64_stable_candidates() -> None:
     config_path = SCRIPT_DIRECTORY.parent / "configs" / "CLCNet_nested_cv.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    first = generate_grid_candidates(config["hpo"]["parameters"])
-    second = generate_grid_candidates(config["hpo"]["parameters"])
-    assert len(first) == 64
-    assert first == second
-    assert first[0]["train.batch_size"] == 16
-    assert first[-1]["train.scheduler_factor"] == 0.8
-    assert {tuple(item["model.shared_dimensions"]) for item in first} == {
-        (4096, 2048, 1024),
-        (2048, 1024, 512),
-    }
+    hpo = config["hpo"]
+    assert hpo["method"] == "bayesian"
+    assert hpo["n_trials"] == 200
+    assert hpo["parameters"]["train.learning_rate"]["type"] == "log_uniform"
     assert config["feature_selection"]["enabled"] is False
 
 

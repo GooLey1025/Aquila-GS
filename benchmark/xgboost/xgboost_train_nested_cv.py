@@ -194,21 +194,11 @@ def _split_paths(
     inner_fold: int | None,
     role: str,
 ) -> tuple[Path, Path, Path]:
-    outer_path = data_directory / "cv" / f"outer_fold_{outer_fold}"
-    raw_path = data_directory / "raw_genotype" / f"outer_fold_{outer_fold}"
-    if inner_fold is None:
-        if role not in {"train", "test"}:
-            raise ValueError(f"Invalid final split role: {role}")
-        split_path = outer_path / "final"
-        index_path = outer_path / f"{role}_idx.npy"
-        vcf_path = raw_path / f"{role}.vcf.gz"
-    else:
-        if role not in {"train", "valid"}:
-            raise ValueError(f"Invalid inner split role: {role}")
-        split_path = outer_path / f"inner_fold_{inner_fold}"
-        index_path = split_path / f"{role}_idx.npy"
-        vcf_path = raw_path / f"inner_fold_{inner_fold}" / f"{role}.vcf.gz"
-    return split_path, index_path, vcf_path
+    from aquila.data import resolve_prepared_split_paths
+
+    return resolve_prepared_split_paths(
+        data_directory, outer_fold, inner_fold, role
+    )
 
 
 def load_split_data(
@@ -348,7 +338,10 @@ def _candidate_payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
             result["best_iteration"] for result in candidate["inner_results"]
         ],
         "final_rounds": candidate["final_rounds"],
-        "inner_results": candidate["inner_results"],
+        "inner_results": [
+            {key: value for key, value in result.items() if key != "booster"}
+            for result in candidate["inner_results"]
+        ],
     }
 
 
@@ -385,6 +378,7 @@ def train_inner_candidate(
     metrics = _metric_payload(predictions, valid.targets, trait_name)
     return {
         "best_iteration": best_round,
+        "booster": booster,
         "metrics": metrics,
         "objective": float(metrics["avg_pearson"]),
         "imputation": {
@@ -424,6 +418,152 @@ def _write_json(path: Path, payload: Any) -> None:
         handle.write("\n")
 
 
+def _run_xgboost_holdout(
+    xgboost: Any,
+    data_directory: Path,
+    output_directory: Path,
+    prepared: Any,
+    trait_name: str,
+    trait_index: int,
+    outer_fold: int,
+    base_config: Mapping[str, Any],
+    seed: int,
+    n_jobs: int,
+) -> dict[str, Any]:
+    """Select one early-stopped booster on the validation split and score test."""
+    from aquila.benchmark.holdout import run_holdout_search
+
+    started = time.time()
+    fold_path = output_directory / trait_name / f"fold_{outer_fold}"
+    fold_path.mkdir(parents=True, exist_ok=True)
+    train = load_split_data(
+        data_directory, prepared.metadata, prepared.target_mask,
+        trait_index, outer_fold, 0, "train",
+    )
+    valid = load_split_data(
+        data_directory, prepared.metadata, prepared.target_mask,
+        trait_index, outer_fold, 0, "valid",
+    )
+    test = load_split_data(
+        data_directory, prepared.metadata, prepared.target_mask,
+        trait_index, outer_fold, None, "test",
+    )
+    winner: dict[str, Any] = {}
+
+    def evaluate(parameters: Mapping[str, Any], trial_id: int) -> tuple[float, Any]:
+        config = {
+            **base_config,
+            "model": {**base_config["model"], **dict(parameters)},
+        }
+        result = train_inner_candidate(
+            xgboost,
+            train,
+            valid,
+            config,
+            derive_seed(seed, outer_fold, trial_id, 0),
+            n_jobs,
+            trait_name,
+        )
+        return float(result["objective"]), result
+
+    search = run_holdout_search(
+        base_config.get("hpo", {}),
+        evaluate,
+        default_trials=200,
+    )
+    best = search["best"]
+    winner = best["payload"]
+    best_config = {
+        **base_config,
+        "model": {**base_config["model"], **dict(best["parameters"])},
+    }
+    booster = winner["booster"]
+    best_round = int(winner["best_iteration"])
+    imputed = impute_from_training(train.genotypes, test.genotypes)
+    test_matrix = xgboost.DMatrix(imputed.held_out)
+    normalized_predictions = _predict(booster, test_matrix, best_round)
+    normalized_metrics = _metric_payload(
+        normalized_predictions, test.targets, trait_name
+    )
+    preprocessor = PerTraitPreprocessor.load_json(
+        _split_paths(data_directory, outer_fold, None, "test")[0]
+        / "preprocessing.json"
+    )
+    original_predictions = _inverse_trait(
+        normalized_predictions, preprocessor, trait_index
+    )
+    original_targets = _inverse_trait(test.targets, preprocessor, trait_index)
+    original_metrics = _metric_payload(
+        original_predictions, original_targets, trait_name
+    )
+    booster.save_model(str(fold_path / "booster.json"))
+    np.save(fold_path / "imputation_means.npy", imputed.marker_means)
+    _write_json(
+        fold_path / "hpo_results.json",
+        {
+            "method": "bayesian",
+            "direction": "maximize",
+            "metric": "avg_pearson",
+            "best_candidate_id": best["candidate_id"],
+            "best_parameters": best["parameters"],
+            "best_valid_pearson_mean": best["objective"],
+            "final_rounds": best_round,
+            "refit_full_dataset": False,
+            "candidates": search["trials"],
+        },
+    )
+    _write_json(
+        fold_path / "metrics.json",
+        {"standardized": normalized_metrics, "original": original_metrics},
+    )
+    _write_json(
+        fold_path / "audit.json",
+        {
+            "protocol": "single_holdout",
+            "train_observed": len(train.sample_ids),
+            "validation_observed": len(valid.sample_ids),
+            "test_observed": len(test.sample_ids),
+            "validation_used_for": "bayesian_hpo_and_early_stopping",
+            "test_evaluation_count": 1,
+        },
+    )
+    with (fold_path / "config.yaml").open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(best_config, handle, sort_keys=False)
+    preprocessor.save_json(fold_path / "preprocessing.json")
+    with (fold_path / "predictions.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "sample_id",
+                "prediction_standardized",
+                "observed_standardized",
+                "prediction_original",
+                "observed_original",
+            ]
+        )
+        for values in zip(
+            test.sample_ids,
+            normalized_predictions,
+            test.targets,
+            original_predictions,
+            original_targets,
+        ):
+            writer.writerow([values[0], *(float(value) for value in values[1:])])
+    del winner
+    return {
+        "outer_fold": outer_fold,
+        "best_candidate_id": best["candidate_id"],
+        "best_parameters": best["parameters"],
+        "best_valid_pearson_mean": best["objective"],
+        "final_rounds": best_round,
+        "test_metrics_standardized": normalized_metrics,
+        "test_metrics_original": original_metrics,
+        "elapsed_seconds": time.time() - started,
+    }
+
+
 def run_outer_fold(
     xgboost: Any,
     data_directory: Path,
@@ -438,6 +578,21 @@ def run_outer_fold(
     seed: int,
     n_jobs: int,
 ) -> dict[str, Any]:
+    from aquila.benchmark.holdout import is_holdout_protocol
+
+    if is_holdout_protocol(prepared.metadata):
+        return _run_xgboost_holdout(
+            xgboost,
+            data_directory,
+            output_directory,
+            prepared,
+            trait_name,
+            trait_index,
+            outer_fold,
+            base_config,
+            seed,
+            n_jobs,
+        )
     started = time.time()
     fold_path = output_directory / trait_name / f"fold_{outer_fold}"
     fold_path.mkdir(parents=True, exist_ok=True)
@@ -556,10 +711,7 @@ def run_outer_fold(
         normalized_predictions, outer_test.targets, trait_name
     )
     preprocessor = PerTraitPreprocessor.load_json(
-        data_directory
-        / "cv"
-        / f"outer_fold_{outer_fold}"
-        / "final"
+        _split_paths(data_directory, outer_fold, None, "test")[0]
         / "preprocessing.json"
     )
     original_predictions = _inverse_trait(
@@ -681,11 +833,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     ]
     if non_regression:
         raise ValueError(f"XGBoost adapter supports regression traits only: {non_regression}")
-    inner_count = int(prepared.metadata["inner_folds"])
+    from aquila.benchmark.holdout import is_holdout_protocol
+
+    holdout = is_holdout_protocol(prepared.metadata)
+    inner_count = 1 if holdout else int(prepared.metadata["inner_folds"])
     outer_folds = resolve_outer_folds(args.outer_folds, prepared.metadata)
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)
-    candidates = generate_grid_candidates(config["hpo"]["parameters"])
+    candidates = (
+        []
+        if holdout
+        else generate_grid_candidates(config["hpo"]["parameters"])
+    )
     if args.max_candidates is not None:
         candidates = candidates[: args.max_candidates]
     if not candidates:

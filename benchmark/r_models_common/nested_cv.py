@@ -32,7 +32,8 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from aquila.data import resolve_outer_folds
+from aquila.benchmark.holdout import is_holdout_protocol, run_holdout_search
+from aquila.data import resolve_outer_folds, resolve_prepared_split_paths
 
 
 @dataclass(frozen=True)
@@ -129,17 +130,7 @@ def split_paths(
     inner_fold: int | None,
     role: str,
 ) -> tuple[Path, Path, Path]:
-    outer_path = data_dir / "cv" / f"outer_fold_{outer_fold}"
-    raw_path = data_dir / "raw_genotype" / f"outer_fold_{outer_fold}"
-    if inner_fold is None:
-        split_path = outer_path / "final"
-        index_path = outer_path / f"{role}_idx.npy"
-        vcf_path = raw_path / f"{role}.vcf.gz"
-    else:
-        split_path = outer_path / f"inner_fold_{inner_fold}"
-        index_path = split_path / f"{role}_idx.npy"
-        vcf_path = raw_path / f"inner_fold_{inner_fold}" / f"{role}.vcf.gz"
-    return split_path, index_path, vcf_path
+    return resolve_prepared_split_paths(data_dir, outer_fold, inner_fold, role)
 
 
 def load_split(
@@ -479,15 +470,70 @@ def run_outer_fold(
     inner_count: int,
     candidates: Sequence[Mapping[str, Any]],
     base_seed: int,
+    hpo_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     fold_dir = output_dir / trait / f"fold_{outer_fold}"
     fold_dir.mkdir(parents=True, exist_ok=True)
     candidate_results = []
     inner_audit = []
-    if len(candidates) == 1:
-        # A fixed model configuration requires no data-driven model selection.
-        # Fit it once on the complete outer-training partition below.
+    if hpo_config is not None:
+        train = load_split(
+            data_dir, metadata, target_mask, trait_index, outer_fold, 0, "train"
+        )
+        valid = load_split(
+            data_dir, metadata, target_mask, trait_index, outer_fold, 0, "valid"
+        )
+        train_x, valid_x, means = impute_from_training(train, valid)
+        base_parameters = dict(candidates[0]) if candidates else {}
+
+        def evaluate_trial(parameters: Mapping[str, Any], trial_id: int):
+            prediction, worker_metadata = worker.run(
+                fold_dir / "trials" / f"trial_{trial_id}",
+                train_x,
+                train.targets,
+                valid_x,
+                {**base_parameters, **dict(parameters)},
+                derive_seed(base_seed, trait, outer_fold, trial_id, 0),
+            )
+            metrics = regression_metrics(valid.targets, prediction)
+            return float(metrics["pearson"]), {
+                "metrics": metrics,
+                "worker_metadata": worker_metadata,
+            }
+
+        search = run_holdout_search(hpo_config, evaluate_trial, default_trials=200)
+        winner = search["best"]
+        best = {
+            "candidate_id": int(winner["candidate_id"]),
+            "parameters": {**base_parameters, **dict(winner["parameters"])},
+            "mean_valid_pearson": float(winner["objective"]),
+            "inner_results": [winner["payload"]],
+        }
+        candidate_results = [
+            {
+                "candidate_id": int(trial["candidate_id"]),
+                "parameters": dict(trial["parameters"]),
+                "mean_valid_pearson": float(trial["objective"]),
+                "inner_results": [],
+            }
+            for trial in search["trials"]
+        ]
+        inner_audit = [
+            {
+                "inner_fold": 0,
+                "train_observed": len(train.sample_ids),
+                "train_discarded": list(train.discarded_sample_ids),
+                "valid_observed": len(valid.sample_ids),
+                "valid_discarded": list(valid.discarded_sample_ids),
+                "imputation_means": means.tolist(),
+            }
+        ]
+        selection_metric = "validation Pearson"
+        selection_mode = "holdout_bayesian"
+    elif len(candidates) == 1:
+        # A fixed configuration is fit once on the train split. The validation
+        # split is not used.
         best = {
             "candidate_id": 0,
             "parameters": dict(candidates[0]),
@@ -594,10 +640,7 @@ def run_outer_fold(
     )
     normalized_metrics = regression_metrics(test.targets, prediction)
     preprocessing_path = (
-        data_dir
-        / "cv"
-        / f"outer_fold_{outer_fold}"
-        / "final"
+        resolve_prepared_split_paths(data_dir, outer_fold, None, "test")[0]
         / "preprocessing.json"
     )
     observed_original = inverse_trait(test.targets, preprocessing_path, trait_index)
@@ -739,11 +782,20 @@ def cli(spec: ModelSpec, default_config: Path) -> None:
         raise ValueError(
             f"{spec.name} only supports regression traits: {non_regression}"
         )
-    inner_count = int(metadata["inner_folds"])
+    holdout = is_holdout_protocol(metadata)
+    inner_count = 1 if holdout else int(metadata["inner_folds"])
     outer_folds = resolve_outer_folds(args.outer_folds, metadata)
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)
-    candidates = expand_grid(spec, config)
+    hpo_section = config.get("hpo") if isinstance(config.get("hpo"), dict) else {}
+    use_bayesian = holdout and str(hpo_section.get("method", "")).lower() in {
+        "bayesian",
+        "tpe",
+    }
+    if use_bayesian:
+        candidates = [dict(config.get("parameters", {}))]
+    else:
+        candidates = expand_grid(spec, config)
     if args.max_candidates is not None:
         candidates = candidates[: args.max_candidates]
     seed = int(args.seed if args.seed is not None else config.get("seed", 42))
@@ -753,8 +805,14 @@ def cli(spec: ModelSpec, default_config: Path) -> None:
     for trait in traits:
         trait_index = list(metadata["trait_names"]).index(trait)
         for outer_fold in outer_folds:
-            selection = "skipped (fixed configuration)"
-            if len(candidates) > 1:
+            hpo_config = hpo_section
+            selection = "skipped (fixed configuration; train split only)"
+            if use_bayesian:
+                selection = (
+                    f"{int(hpo_config.get('n_trials', 200))} Bayesian trials "
+                    "on one validation split"
+                )
+            elif len(candidates) > 1:
                 selection = f"{inner_count} inner folds"
             print(
                 f"[INFO] {spec.name} trait={trait} outer_fold={outer_fold} "
@@ -775,6 +833,7 @@ def cli(spec: ModelSpec, default_config: Path) -> None:
                     inner_count,
                     candidates,
                     seed,
+                    hpo_config=hpo_config if use_bayesian else None,
                 )
             )
     write_json(

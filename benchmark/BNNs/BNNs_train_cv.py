@@ -55,6 +55,7 @@ from bnn_data_benchmark import (
     PreparedPair,
     load_trait_split,
     prepare_pair,
+    transform_markers,
 )
 from bnn_model_benchmark import build_model, predict_bnn, train_bnn
 
@@ -435,6 +436,187 @@ def _load_splits(
     return train, valid
 
 
+def _run_bnn_holdout(
+    data_directory: Path,
+    output_directory: Path,
+    prepared: Any,
+    raw_targets: torch.Tensor,
+    trait_name: str,
+    trait_index: int,
+    outer_fold: int,
+    base_config: Mapping[str, Any],
+    device: torch.device,
+    seed: int,
+) -> dict[str, Any]:
+    """Bayesian search on one train/valid split. Lasso is fit on train only."""
+    from aquila.benchmark.holdout import run_holdout_search
+    from aquila.data import resolve_prepared_split_paths
+
+    fold_start = time.time()
+    fold_path = output_directory / trait_name / f"fold_{outer_fold}"
+    fold_path.mkdir(parents=True, exist_ok=True)
+    train, valid = _load_splits(
+        data_directory, prepared, raw_targets, trait_index, outer_fold, 0
+    )
+    test = load_trait_split(
+        data_directory,
+        prepared.metadata,
+        prepared.target_mask,
+        raw_targets,
+        trait_index,
+        outer_fold,
+        None,
+        "test",
+    )
+
+    def evaluate_trial(parameters: Mapping[str, Any], trial_id: int):
+        config = merge_config(base_config, parameters)
+        pipeline_seed = derive_seed(seed, outer_fold, trial_id, 0)
+        pair = prepare_pair(
+            train,
+            valid,
+            float(config["data"]["lasso_alpha"]),
+            int(config["data"]["max_features"]),
+            pipeline_seed,
+        )
+        fit = train_bnn(
+            pair.train_features,
+            pair.train.targets,
+            pair.held_out_features,
+            pair.held_out.targets,
+            config,
+            device,
+            derive_seed(seed, outer_fold, trial_id, 1),
+            evaluate_regression,
+            trait_name,
+        )
+        return float(fit.best_metric), {
+            "state_dict": fit.state_dict,
+            "best_epoch": int(fit.best_epoch),
+            "history": list(fit.history),
+            "pipeline": pair.pipeline,
+        }
+
+    search = run_holdout_search(
+        base_config.get("hpo", {}),
+        evaluate_trial,
+        default_trials=50,
+    )
+    best = search["best"]
+    best_config = merge_config(base_config, best["parameters"])
+    payload = best["payload"]
+    pipeline = payload["pipeline"]
+    test_features = transform_markers(test.genotypes, pipeline)
+    final_epoch = int(payload["best_epoch"])
+    model = build_model(test_features.shape[1], best_config, device)
+    model.load_state_dict(payload["state_dict"])
+    predictions, uncertainty = predict_bnn(
+        model,
+        test_features,
+        device,
+        int(best_config["inference"]["test_samples"]),
+        derive_seed(seed + 1, outer_fold, int(best["candidate_id"]), 999),
+    )
+    normalized = evaluate_regression(
+        predictions[:, None],
+        test.targets[:, None],
+        np.ones((len(predictions), 1), dtype=bool),
+        [trait_name],
+    ).metrics
+    preprocessor_path = (
+        resolve_prepared_split_paths(data_directory, outer_fold, None, "test")[0]
+        / "preprocessing.json"
+    )
+    preprocessor = PerTraitPreprocessor.load_json(preprocessor_path)
+    original_predictions = _inverse_trait(predictions, preprocessor, trait_index)
+    original = evaluate_regression(
+        original_predictions[:, None],
+        test.raw_targets[:, None],
+        np.ones((len(predictions), 1), dtype=bool),
+        [trait_name],
+    ).metrics
+    metrics_payload = {"normalized": normalized, "original": original}
+    torch.save(
+        {
+            "model_state_dict": payload["state_dict"],
+            "config": best_config,
+            "trait": trait_name,
+            "outer_fold": outer_fold,
+            "final_epoch": final_epoch,
+            "variant_schema": train.variants,
+            "marker_pipeline": _pipeline_payload(pipeline),
+            "refit_full_dataset": False,
+        },
+        fold_path / "best_model.pt",
+    )
+    _write_json(
+        fold_path / "hpo_results.json",
+        {
+            "method": "bayesian",
+            "direction": "maximize",
+            "best_candidate_id": best["candidate_id"],
+            "best_parameters": dict(best["parameters"]),
+            "best_valid_pearson_mean": best["objective"],
+            "final_epoch": final_epoch,
+            "n_trials": search["n_trials"],
+            "trials": search["trials"],
+            "refit_full_dataset": False,
+        },
+    )
+    _write_json(fold_path / "metrics.json", metrics_payload)
+    _write_json(
+        fold_path / "training_history.json",
+        {"best": payload["history"]},
+    )
+    with (fold_path / "config.yaml").open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(best_config, handle, sort_keys=False)
+    shutil.copy2(preprocessor_path, fold_path / "preprocessing.json")
+    _write_json(
+        fold_path / "sample_audit.json",
+        {
+            "protocol": "single_holdout",
+            "train_observed": len(train.sample_ids),
+            "valid_observed": len(valid.sample_ids),
+            "outer_test_observed": len(test.sample_ids),
+            "outer_test_sample_ids": list(test.sample_ids),
+        },
+    )
+    _write_json(
+        fold_path / "selected_variants.json",
+        {"variants": [variant for variant in pipeline.selected_variants]},
+    )
+    with (fold_path / "predictions_normalized_scale.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["SampleID", "Prediction", "Observed", "PosteriorStd"])
+        for sample_id, prediction, observed, std in zip(
+            test.sample_ids, predictions, test.targets, uncertainty
+        ):
+            writer.writerow(
+                [sample_id, float(prediction), float(observed), float(std)]
+            )
+    with (fold_path / "predictions_original_scale.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["SampleID", "Prediction", "Observed"])
+        for sample_id, prediction, observed in zip(
+            test.sample_ids, original_predictions, test.raw_targets
+        ):
+            writer.writerow([sample_id, float(prediction), float(observed)])
+    return {
+        "trait": trait_name,
+        "outer_fold": outer_fold,
+        "best_candidate_id": best["candidate_id"],
+        "best_parameters": dict(best["parameters"]),
+        "best_valid_pearson_mean": best["objective"],
+        "final_epoch": final_epoch,
+        "metrics": metrics_payload,
+        "elapsed_seconds": time.time() - fold_start,
+    }
+
+
 def run_outer_fold(
     data_directory: Path,
     output_directory: Path,
@@ -449,6 +631,21 @@ def run_outer_fold(
     device: torch.device,
     seed: int,
 ) -> dict[str, Any]:
+    from aquila.benchmark.holdout import is_holdout_protocol
+
+    if is_holdout_protocol(prepared.metadata):
+        return _run_bnn_holdout(
+            data_directory,
+            output_directory,
+            prepared,
+            raw_targets,
+            trait_name,
+            trait_index,
+            outer_fold,
+            base_config,
+            device,
+            seed,
+        )
     fold_start = time.time()
     fold_path = output_directory / trait_name / f"fold_{outer_fold}"
     fold_path.mkdir(parents=True, exist_ok=True)
@@ -582,11 +779,10 @@ def run_outer_fold(
         np.ones((len(predictions), 1), dtype=bool),
         [trait_name],
     ).metrics
+    from aquila.data import resolve_prepared_split_paths
+
     preprocessor_path = (
-        data_directory
-        / "cv"
-        / f"outer_fold_{outer_fold}"
-        / "final"
+        resolve_prepared_split_paths(data_directory, outer_fold, None, "test")[0]
         / "preprocessing.json"
     )
     preprocessor = PerTraitPreprocessor.load_json(preprocessor_path)
@@ -760,12 +956,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     invalid = [trait for trait in traits if trait not in regression_traits]
     if invalid:
         raise ValueError(f"Unknown traits: {invalid}")
-    inner_count = int(prepared.metadata["inner_folds"])
+    from aquila.benchmark.holdout import is_holdout_protocol
+
+    holdout = is_holdout_protocol(prepared.metadata)
+    inner_count = 1 if holdout else int(prepared.metadata["inner_folds"])
     outer_folds = resolve_outer_folds(args.outer_folds, prepared.metadata)
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)
-    candidates = generate_grid_candidates(config["hpo"]["parameters"])
-    if len(candidates) != 16:
+    candidates = (
+        []
+        if holdout
+        else generate_grid_candidates(config["hpo"]["parameters"])
+    )
+    if not holdout and len(candidates) != 16:
         raise ValueError(f"BNN grid must contain 16 candidates, got {len(candidates)}")
     if args.max_candidates is not None:
         candidates = candidates[: args.max_candidates]

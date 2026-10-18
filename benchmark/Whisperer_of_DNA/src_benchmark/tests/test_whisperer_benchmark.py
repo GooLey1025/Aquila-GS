@@ -350,10 +350,12 @@ def test_grid_uses_training_batch_size_32() -> None:
     config_path = SOURCE_DIRECTORY.parent / "configs" / "Whisperer_nested_cv.yaml"
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
-    candidates = generate_grid_candidates(config["hpo"]["parameters"])
-    assert len(candidates) == 16
-    assert config["training"]["batch_size"] == 32
-    assert all("data.batch_size" not in candidate for candidate in candidates)
+    hpo = config["hpo"]
+    assert hpo["method"] == "bayesian"
+    assert hpo["n_trials"] == 50
+    assert hpo["parameters"]["optimizer.learning_rate"]["type"] == "log_uniform"
+    assert "data.batch_size" not in hpo["parameters"]
+    assert config["training"]["batch_size"] == 16
 
 
 def test_model_config_disables_gradient_checkpointing() -> None:

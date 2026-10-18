@@ -26,21 +26,36 @@ train:
 
 hpo:
   enabled: true
-  method: grid_search
+  method: bayesian
+  n_trials: 200
   metric: avg_pearson
   direction: maximize
+  seed: 42
   parameters:
     train.learning_rate:
-      values: [0.0001, 0.001]
+      type: log_uniform
+      low: 1.0e-5
+      high: 3.0e-3
     train.batch_size:
-      values: [16, 32]
+      type: categorical
+      choices: [16, 32]
     train.momentum:
-      values: [0.9, 0.95]
+      type: float
+      low: 0.85
+      high: 0.95
+      step: 0.05
     train.contrastive_weight:
-      values: [0.5, 1.0]
+      type: float
+      low: 0.25
+      high: 1.0
+      step: 0.25
     train.scheduler_factor:
-      values: [0.5, 0.8]
+      type: float
+      low: 0.5
+      high: 0.9
+      step: 0.1
     model.shared_dimensions:
-      values:
+      type: categorical
+      choices:
         - [4096, 2048, 1024]
         - [2048, 1024, 512]

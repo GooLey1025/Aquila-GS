@@ -150,8 +150,10 @@ def test_grid_contains_exactly_16_candidates() -> None:
     path = BENCHMARK_SOURCE.parent / "configs" / "BNNs_nested_cv.yaml"
     with path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
-    candidates = generate_grid_candidates(config["hpo"]["parameters"])
-    assert len(candidates) == 16
+    hpo = config["hpo"]
+    assert hpo["method"] == "bayesian"
+    assert hpo["n_trials"] == 50
+    assert hpo["parameters"]["data.lasso_alpha"]["type"] == "log_uniform"
 
 
 def test_json_writer_sanitizes_non_finite_values(tmp_path: Path) -> None:

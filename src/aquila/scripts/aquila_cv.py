@@ -3,7 +3,7 @@
 # Author: Lei Gu
 # Contact: goley04@foxmail.com
 
-"""Create reusable nested-CV sample mappings from a phenotype table."""
+"""Create reusable train/valid/test sample mappings from a phenotype table."""
 
 import argparse
 import json
@@ -14,12 +14,22 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 
-from aquila.data.cv import generate_nested_folds, validate_outer_fold_observations
+from aquila.data.cv import (
+    generate_benchmark_folds,
+    generate_nested_folds,
+    validate_benchmark_folds,
+    validate_outer_fold_observations,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create phenotype-aware nested CV sample mappings."
+        description=(
+            "Create phenotype-aware CV sample mappings. The default mapping "
+            "has 10 outer tests and a 4:1 train:validation split inside each "
+            "outer training set. Change the validation share with "
+            "--valid-fraction."
+        )
     )
     parser.add_argument(
         "--phenotype",
@@ -30,8 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-o",
         "--output",
-        default="nested_cv_mapping.json",
-        help="Output nested-CV mapping in JSON format.",
+        default="holdout_cv_mapping.json",
+        help="Output CV mapping in JSON format.",
     )
     parser.add_argument(
         "--sample-id-column",
@@ -44,12 +54,29 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Traits to validate; defaults to all non-ID columns.",
     )
-    parser.add_argument("--outer-folds", type=int, default=5)
+    parser.add_argument("--outer-folds", type=int, default=10)
+    parser.add_argument(
+        "--valid-fraction",
+        type=float,
+        default=0.2,
+        help=(
+            "Validation fraction of each outer training set. "
+            "Default 0.2 is a 4:1 train:validation split."
+        ),
+    )
+    parser.add_argument(
+        "--nested",
+        action="store_true",
+        help=(
+            "Write the legacy nested-CV mapping instead. Requires --inner-folds. "
+            "Use this only with aquila_data_cv.py."
+        ),
+    )
     parser.add_argument(
         "--inner-folds",
         type=int,
-        default=4,
-        help="Number of inner folds within every outer training partition.",
+        default=None,
+        help="Inner folds within every outer training set. Only used with --nested.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--missing-sentinel", type=float, default=-999.0)
@@ -122,13 +149,53 @@ def load_phenotype_mask(
     }
 
 
-def save_mapping(
+def _sample_ids_for(sample_ids: List[str], indices: object) -> List[str]:
+    return [
+        sample_ids[index]
+        for index in np.asarray(indices, dtype=np.int64)
+    ]
+
+
+def save_holdout_mapping(
+    path: str | Path,
+    sample_ids: List[str],
+    folds: List[Dict[str, object]],
+    seed: int,
+    valid_fraction: float,
+) -> None:
+    """Save one train/validation/test partition per outer fold."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": "aquila_holdout_cv",
+        "version": 1,
+        "seed": seed,
+        "outer_folds": len(folds),
+        "valid_fraction": float(valid_fraction),
+        "sample_ids": sample_ids,
+        "folds": [
+            {
+                "fold": int(outer["fold"]),
+                "outer_train": _sample_ids_for(sample_ids, outer["outer_train"]),
+                "train": _sample_ids_for(sample_ids, outer["train"]),
+                "valid": _sample_ids_for(sample_ids, outer["valid"]),
+                "test": _sample_ids_for(sample_ids, outer["test"]),
+            }
+            for outer in folds
+        ],
+    }
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+
+def save_nested_mapping(
     path: str | Path,
     sample_ids: List[str],
     folds: List[Dict[str, object]],
     seed: int,
 ) -> None:
-    """Save complete nested folds using sample IDs instead of row positions."""
+    """Save the legacy nested-CV mapping used by aquila_data_cv.py."""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -138,36 +205,23 @@ def save_mapping(
         "outer_folds": len(folds),
         "inner_folds": len(folds[0]["inner"]) if folds else 0,
         "sample_ids": sample_ids,
-        "folds": [],
-    }
-    for outer in folds:
-        payload["folds"].append(
+        "folds": [
             {
                 "fold": int(outer["fold"]),
-                "train": [
-                    sample_ids[index]
-                    for index in np.asarray(outer["train"], dtype=np.int64)
-                ],
-                "test": [
-                    sample_ids[index]
-                    for index in np.asarray(outer["test"], dtype=np.int64)
-                ],
+                "train": _sample_ids_for(sample_ids, outer["train"]),
+                "test": _sample_ids_for(sample_ids, outer["test"]),
                 "inner": [
                     {
                         "fold": int(inner["fold"]),
-                        "train": [
-                            sample_ids[index]
-                            for index in np.asarray(inner["train"], dtype=np.int64)
-                        ],
-                        "valid": [
-                            sample_ids[index]
-                            for index in np.asarray(inner["valid"], dtype=np.int64)
-                        ],
+                        "train": _sample_ids_for(sample_ids, inner["train"]),
+                        "valid": _sample_ids_for(sample_ids, inner["valid"]),
                     }
                     for inner in outer["inner"]
                 ],
             }
-        )
+            for outer in folds
+        ],
+    }
     with output_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
@@ -177,33 +231,65 @@ def main() -> None:
     args = parse_args()
     if args.min_observed < 10:
         raise ValueError("--min-observed must be at least 10")
+    if args.nested and args.inner_folds is None:
+        raise ValueError("--nested requires --inner-folds")
+    if not args.nested and args.inner_folds is not None:
+        raise ValueError(
+            "--inner-folds is only used with --nested. The default mapping "
+            "writes one train/validation/test split per outer fold."
+        )
+    if not args.nested and not 0.0 < float(args.valid_fraction) < 1.0:
+        raise ValueError("--valid-fraction must be between 0 and 1")
     phenotype = load_phenotype_mask(
         args.phenotype,
         sample_id_column=args.sample_id_column,
         traits=args.traits,
         missing_sentinel=args.missing_sentinel,
     )
-    folds = generate_nested_folds(
-        n_samples=len(phenotype["sample_ids"]),
-        outer_folds=args.outer_folds,
-        inner_folds=args.inner_folds,
-        seed=args.seed,
-    )
+    if args.nested:
+        folds = generate_nested_folds(
+            n_samples=len(phenotype["sample_ids"]),
+            outer_folds=args.outer_folds,
+            inner_folds=args.inner_folds,
+            seed=args.seed,
+        )
+    else:
+        folds = generate_benchmark_folds(
+            n_samples=len(phenotype["sample_ids"]),
+            outer_folds=args.outer_folds,
+            valid_fraction=args.valid_fraction,
+            seed=args.seed,
+        )
+        validate_benchmark_folds(folds, len(phenotype["sample_ids"]))
     validate_outer_fold_observations(
         phenotype["mask"],
         folds,
         phenotype["trait_names"],
         min_observed=args.min_observed,
     )
-    save_mapping(
-        args.output,
-        phenotype["sample_ids"],
-        folds,
-        args.seed,
-    )
+    if args.nested:
+        save_nested_mapping(
+            args.output,
+            phenotype["sample_ids"],
+            folds,
+            args.seed,
+        )
+        split_message = f"{args.inner_folds} inner folds"
+    else:
+        save_holdout_mapping(
+            args.output,
+            phenotype["sample_ids"],
+            folds,
+            args.seed,
+            args.valid_fraction,
+        )
+        split_message = (
+            "one train:validation split "
+            f"({1.0 - float(args.valid_fraction):.4g}:"
+            f"{float(args.valid_fraction):.4g})"
+        )
     print(
-        f"Saved {args.outer_folds} outer folds and "
-        f"{args.inner_folds} inner folds for "
+        f"Saved {args.outer_folds} outer folds and {split_message} for "
         f"{len(phenotype['sample_ids'])} samples to {args.output}"
     )
     print(

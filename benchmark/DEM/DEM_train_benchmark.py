@@ -17,6 +17,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -397,87 +398,166 @@ def run_outer_fold(
     trait_path = Path(context.output_directory) / _safe_name(job.trait_name)
     fold_path = trait_path / f"fold_{job.outer_fold}"
     fold_path.mkdir(parents=True, exist_ok=True)
-    inner_results: dict[int, list[InnerFoldResult]] = {
-        index: [] for index in range(len(context.candidates))
-    }
-    inner_audit = []
-    for inner_fold in range(context.inner_count):
-        selected = _load_pair(
-            context, job.trait_index, job.outer_fold, inner_fold, context.base_config
+    from aquila.benchmark.holdout import is_holdout_protocol
+
+    holdout = is_holdout_protocol(context.metadata)
+    hpo_method = "bayesian" if holdout else "grid"
+    if holdout:
+        from aquila.benchmark.holdout import run_holdout_search
+
+        selected_holdout = _load_pair(
+            context, job.trait_index, job.outer_fold, 0, context.base_config
         )
         inner_selection = _selection_metadata(
-            selected,
+            selected_holdout,
             bool(context.base_config["data"].get("rf_enabled", True)),
             trait=job.trait_name,
             outer_fold=job.outer_fold,
-            inner_fold=inner_fold,
-            selection_scope="inner_train",
+            inner_fold=0,
+            selection_scope="hpo_train",
             data_config=context.base_config["data"],
         )
-        _write_json(
-            fold_path / "rf_selection" / f"inner_fold_{inner_fold}.json",
-            inner_selection,
-        )
-        inner_audit.append(
-            {
-                "inner_fold": inner_fold,
-                "train": _split_audit(selected.train),
-                "valid": _split_audit(selected.held_out),
-                "selection": inner_selection,
-            }
-        )
-        for candidate_id, parameters in enumerate(context.candidates):
+        _write_json(fold_path / "rf_selection" / "train.json", inner_selection)
+
+        def evaluate_trial(parameters: Mapping[str, Any], trial_id: int):
             candidate_config = merge_config(context.base_config, parameters)
             fit = train_dem(
-                selected.train.modalities,
-                selected.train.targets,
-                selected.held_out.modalities,
-                selected.held_out.targets,
+                selected_holdout.train.modalities,
+                selected_holdout.train.targets,
+                selected_holdout.held_out.modalities,
+                selected_holdout.held_out.targets,
                 candidate_config,
                 device,
                 derive_seed(
-                    context.seed,
-                    job.trait_index,
-                    job.outer_fold,
-                    candidate_id,
-                    inner_fold,
+                    context.seed, job.trait_index, job.outer_fold, trial_id, 0
                 ),
                 evaluate_regression,
                 job.trait_name,
             )
-            inner_results[candidate_id].append(
-                InnerFoldResult(
-                    inner_fold, fit.best_metric, fit.best_epoch, fit.metrics
-                )
-            )
-    candidates = []
-    for candidate_id, parameters in enumerate(context.candidates):
-        results = tuple(inner_results[candidate_id])
-        values = np.asarray([result.metric for result in results], dtype=float)
-        objective = float(values.mean()) if np.isfinite(values).all() else float("nan")
-        candidates.append(
-            CandidateResult(candidate_id, dict(parameters), objective, results)
+            return float(fit.best_metric), fit
+
+        search = run_holdout_search(
+            context.base_config.get("hpo", {}),
+            evaluate_trial,
+            default_trials=200,
         )
-    best = select_candidate(candidates)
-    best_config = merge_config(context.base_config, best.parameters)
-    final_epoch = half_up_median_epoch(best.best_epochs)
-    selected = _load_pair(
-        context, job.trait_index, job.outer_fold, None, best_config
-    )
-    final_fit = train_dem(
-        selected.train.modalities,
-        selected.train.targets,
-        None,
-        None,
-        best_config,
-        device,
-        derive_seed(
-            context.seed, job.trait_index, job.outer_fold, best.candidate_id, 999
-        ),
-        evaluate_regression,
-        job.trait_name,
-        fixed_epochs=final_epoch,
-    )
+        final_fit = search["best"]["payload"]
+        best = SimpleNamespace(
+            candidate_id=int(search["best"]["candidate_id"]),
+            parameters=dict(search["best"]["parameters"]),
+            objective=float(search["best"]["objective"]),
+        )
+        best_config = merge_config(context.base_config, best.parameters)
+        final_epoch = int(final_fit.best_epoch)
+        selected = _load_pair(
+            context, job.trait_index, job.outer_fold, None, best_config
+        )
+        train_dims = [
+            int(values.shape[1]) for values in selected_holdout.train.modalities
+        ]
+        test_dims = [int(values.shape[1]) for values in selected.train.modalities]
+        if train_dims != test_dims:
+            raise RuntimeError(
+                "Holdout marker selection changed between the training split and "
+                f"the outer-test transform: {train_dims} vs {test_dims}"
+            )
+        candidates = []
+        inner_audit = [
+            {
+                "inner_fold": 0,
+                "train": _split_audit(selected_holdout.train),
+                "valid": _split_audit(selected_holdout.held_out),
+                "selection": inner_selection,
+            }
+        ]
+    else:
+        inner_results: dict[int, list[InnerFoldResult]] = {
+            index: [] for index in range(len(context.candidates))
+        }
+        inner_audit = []
+        for inner_fold in range(context.inner_count):
+            selected = _load_pair(
+                context,
+                job.trait_index,
+                job.outer_fold,
+                inner_fold,
+                context.base_config,
+            )
+            inner_selection = _selection_metadata(
+                selected,
+                bool(context.base_config["data"].get("rf_enabled", True)),
+                trait=job.trait_name,
+                outer_fold=job.outer_fold,
+                inner_fold=inner_fold,
+                selection_scope="inner_train",
+                data_config=context.base_config["data"],
+            )
+            _write_json(
+                fold_path / "rf_selection" / f"inner_fold_{inner_fold}.json",
+                inner_selection,
+            )
+            inner_audit.append(
+                {
+                    "inner_fold": inner_fold,
+                    "train": _split_audit(selected.train),
+                    "valid": _split_audit(selected.held_out),
+                    "selection": inner_selection,
+                }
+            )
+            for candidate_id, parameters in enumerate(context.candidates):
+                candidate_config = merge_config(context.base_config, parameters)
+                fit = train_dem(
+                    selected.train.modalities,
+                    selected.train.targets,
+                    selected.held_out.modalities,
+                    selected.held_out.targets,
+                    candidate_config,
+                    device,
+                    derive_seed(
+                        context.seed,
+                        job.trait_index,
+                        job.outer_fold,
+                        candidate_id,
+                        inner_fold,
+                    ),
+                    evaluate_regression,
+                    job.trait_name,
+                )
+                inner_results[candidate_id].append(
+                    InnerFoldResult(
+                        inner_fold, fit.best_metric, fit.best_epoch, fit.metrics
+                    )
+                )
+        candidates = []
+        for candidate_id, parameters in enumerate(context.candidates):
+            results = tuple(inner_results[candidate_id])
+            values = np.asarray([result.metric for result in results], dtype=float)
+            objective = (
+                float(values.mean()) if np.isfinite(values).all() else float("nan")
+            )
+            candidates.append(
+                CandidateResult(candidate_id, dict(parameters), objective, results)
+            )
+        best = select_candidate(candidates)
+        best_config = merge_config(context.base_config, best.parameters)
+        final_epoch = half_up_median_epoch(best.best_epochs)
+        selected = _load_pair(
+            context, job.trait_index, job.outer_fold, None, best_config
+        )
+        final_fit = train_dem(
+            selected.train.modalities,
+            selected.train.targets,
+            None,
+            None,
+            best_config,
+            device,
+            derive_seed(
+                context.seed, job.trait_index, job.outer_fold, best.candidate_id, 999
+            ),
+            evaluate_regression,
+            job.trait_name,
+            fixed_epochs=final_epoch,
+        )
     input_dims = [values.shape[1] for values in selected.train.modalities]
     model = _load_model(final_fit.state_dict, best_config, input_dims, device)
     predictions, test_loss = predict_dem(
@@ -491,11 +571,12 @@ def run_outer_fold(
     normalized = evaluate_regression(
         predictions, selected.held_out.targets, mask, [job.trait_name]
     )
+    from aquila.data import resolve_prepared_split_paths
+
     preprocessor_path = (
-        Path(context.data_directory)
-        / "cv"
-        / f"outer_fold_{job.outer_fold}"
-        / "final"
+        resolve_prepared_split_paths(
+            context.data_directory, job.outer_fold, None, "test"
+        )[0]
         / "preprocessing.json"
     )
     processor = PerTraitPreprocessor.load_json(preprocessor_path)
@@ -516,7 +597,7 @@ def run_outer_fold(
         bool(best_config["data"].get("rf_enabled", True)),
         trait=job.trait_name,
         outer_fold=job.outer_fold,
-        selection_scope="outer_train",
+        selection_scope="hpo_train" if holdout else "outer_train",
         data_config=best_config["data"],
     )
     _write_json(fold_path / "rf_selection" / "final.json", selection)
@@ -538,7 +619,7 @@ def run_outer_fold(
     _write_json(
         fold_path / "hpo_results.json",
         {
-            "method": "grid",
+            "method": hpo_method,
             "direction": "maximize",
             "metric": "normalized Pearson correlation",
             "best_candidate_id": best.candidate_id,
@@ -625,14 +706,21 @@ def main() -> None:
     metadata = load_metadata(data_directory)
     raw_targets, target_mask = load_target_tensors(data_directory)
     traits = resolve_traits(metadata, args.traits)
-    inner_count = int(metadata["inner_folds"])
+    from aquila.benchmark.holdout import is_holdout_protocol
+
+    holdout = is_holdout_protocol(metadata)
+    inner_count = 1 if holdout else int(metadata["inner_folds"])
     outer_folds = resolve_outer_folds(args.outer_folds, metadata)
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)
-    candidates = generate_grid_candidates(config["hpo"]["parameters"])
+    candidates = (
+        []
+        if holdout
+        else generate_grid_candidates(config["hpo"]["parameters"])
+    )
     if args.max_candidates is not None:
         candidates = candidates[: args.max_candidates]
-    if not candidates:
+    if not holdout and not candidates:
         raise ValueError("DEM configuration generated no HPO candidates")
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
     worker_gpu_ids = expand_gpu_workers(gpu_ids, args.jobs_per_gpu)

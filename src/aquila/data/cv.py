@@ -130,6 +130,162 @@ def generate_nested_folds_from_assignments(
     return folds
 
 
+def split_train_valid(
+    indices: Sequence[int] | np.ndarray,
+    valid_fraction: float = 0.2,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split one index vector once into deterministic train and validation sets.
+
+    ``valid_fraction`` 0.2 is the 4:1 train:validation holdout. The validation
+    count is the rounded fraction, with at least one sample kept in each side.
+    """
+    values = np.asarray(indices, dtype=np.int64)
+    if values.ndim != 1 or values.size < 2:
+        raise ValueError("A train/validation split requires at least two samples")
+    fraction = float(valid_fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(
+            f"valid_fraction must be between 0 and 1, got {valid_fraction}"
+        )
+    n_valid = int(round(values.size * fraction))
+    n_valid = min(max(n_valid, 1), int(values.size) - 1)
+    order = np.random.default_rng(int(seed)).permutation(values.size)
+    valid = np.sort(values[order[:n_valid]])
+    train = np.sort(values[order[n_valid:]])
+    return train, valid
+
+
+def _benchmark_fold(
+    fold_id: int,
+    outer_train: np.ndarray,
+    outer_test: np.ndarray,
+    valid_fraction: float,
+    seed: int,
+) -> NestedFold:
+    train, valid = split_train_valid(
+        outer_train,
+        valid_fraction=valid_fraction,
+        seed=int(seed) + int(fold_id) + 1,
+    )
+    return {
+        "fold": int(fold_id),
+        "outer_train": np.asarray(outer_train, dtype=np.int64).copy(),
+        "train": train,
+        "valid": valid,
+        "test": np.asarray(outer_test, dtype=np.int64).copy(),
+    }
+
+
+def generate_benchmark_folds(
+    n_samples: int,
+    outer_folds: int = 10,
+    valid_fraction: float = 0.2,
+    seed: int = 42,
+) -> List[NestedFold]:
+    """Generate outer K-fold tests and one 4:1 split inside each outer train set."""
+    if n_samples < 2:
+        raise ValueError("At least two aligned samples are required")
+    if not 2 <= int(outer_folds) <= int(n_samples):
+        raise ValueError(
+            f"outer_folds must be between 2 and {n_samples}, got {outer_folds}"
+        )
+    absolute_indices = np.arange(n_samples, dtype=np.int64)
+    outer_splitter = KFold(
+        n_splits=int(outer_folds),
+        shuffle=True,
+        random_state=int(seed),
+    )
+    folds: List[NestedFold] = []
+    for outer_index, (train_positions, test_positions) in enumerate(
+        outer_splitter.split(absolute_indices)
+    ):
+        folds.append(
+            _benchmark_fold(
+                outer_index,
+                absolute_indices[train_positions],
+                absolute_indices[test_positions],
+                valid_fraction,
+                seed,
+            )
+        )
+    return folds
+
+
+def generate_benchmark_folds_from_assignments(
+    outer_test_folds: Sequence[int] | np.ndarray,
+    outer_folds: int = 10,
+    valid_fraction: float = 0.2,
+    seed: int = 42,
+) -> List[NestedFold]:
+    """Keep predefined outer tests and draw one train/validation split in each."""
+    assignments = np.asarray(outer_test_folds, dtype=np.int64)
+    if assignments.ndim != 1 or assignments.size < 2:
+        raise ValueError("outer_test_folds must be a one-dimensional sample mapping")
+    invalid = assignments[(assignments < 0) | (assignments >= int(outer_folds))]
+    if invalid.size:
+        raise ValueError(
+            f"Outer fold assignments must be in 0..{int(outer_folds) - 1}"
+        )
+    absolute_indices = np.arange(assignments.size, dtype=np.int64)
+    folds: List[NestedFold] = []
+    for outer_index in range(int(outer_folds)):
+        outer_test = absolute_indices[assignments == outer_index]
+        outer_train = absolute_indices[assignments != outer_index]
+        if outer_test.size == 0:
+            raise ValueError(f"Outer fold {outer_index} has no test samples")
+        if outer_train.size < 2:
+            raise ValueError(
+                f"Outer fold {outer_index} needs at least two training samples"
+            )
+        folds.append(
+            _benchmark_fold(
+                outer_index,
+                outer_train,
+                outer_test,
+                valid_fraction,
+                seed,
+            )
+        )
+    return folds
+
+
+def validate_benchmark_folds(
+    folds: Sequence[NestedFold],
+    sample_count: int,
+) -> None:
+    """Require 10-style outer tests and one disjoint train/validation holdout."""
+    if len(folds) < 2:
+        raise ValueError("At least two benchmark outer folds are required")
+    all_indices = set(range(int(sample_count)))
+    observed_test: set[int] = set()
+    expected_ids = set(range(len(folds)))
+    if {int(fold["fold"]) for fold in folds} != expected_ids:
+        raise ValueError("Benchmark outer fold identifiers must be zero-based")
+    for outer in folds:
+        fold_id = int(outer["fold"])
+        outer_train = set(np.asarray(outer["outer_train"], dtype=np.int64).tolist())
+        train = set(np.asarray(outer["train"], dtype=np.int64).tolist())
+        valid = set(np.asarray(outer["valid"], dtype=np.int64).tolist())
+        test = set(np.asarray(outer["test"], dtype=np.int64).tolist())
+        if not train or not valid or not test:
+            raise ValueError(f"Outer fold {fold_id} has an empty split")
+        if outer_train & test or outer_train | test != all_indices:
+            raise ValueError(
+                f"Outer fold {fold_id} is not a complete disjoint partition"
+            )
+        if train & valid or train | valid != outer_train:
+            raise ValueError(
+                f"Outer fold {fold_id} train/validation split does not "
+                "partition its outer training samples"
+            )
+        if observed_test & test:
+            raise ValueError("Outer test folds overlap")
+        observed_test.update(test)
+    if observed_test != all_indices:
+        raise ValueError("Outer test folds do not cover every sample")
+
+
 def validate_outer_fold_observations(
     target_mask: np.ndarray,
     folds: Sequence[NestedFold],
@@ -186,31 +342,82 @@ def save_nested_folds(folds: Iterable[NestedFold], cv_directory: str | Path) -> 
             np.save(inner_path / "valid_idx.npy", inner["valid"])
 
 
+def is_single_holdout_fold(prepared_directory: str | Path, outer_fold: int) -> bool:
+    """Return whether one outer fold stores a single 4:1 train/validation holdout."""
+    outer_path = Path(prepared_directory) / "cv" / f"outer_fold_{int(outer_fold)}"
+    return (outer_path / "valid_idx.npy").is_file() and (
+        outer_path / "outer_train_idx.npy"
+    ).is_file()
+
+
+def resolve_prepared_split_paths(
+    prepared_directory: str | Path,
+    outer_fold: int,
+    inner_fold: int | None,
+    role: str,
+) -> tuple[Path, Path, Path]:
+    """Return processed-target directory, index file, and raw VCF for one role.
+
+    Benchmark holdout data keeps the HPO train split, validation split, and
+    outer test at the outer-fold root. The train VCF is the 4:1 training
+    subset. Nested-CV data keeps its historical inner-fold and ``final`` layout.
+    """
+    root = Path(prepared_directory)
+    outer_path = root / "cv" / f"outer_fold_{int(outer_fold)}"
+    raw_path = root / "raw_genotype" / f"outer_fold_{int(outer_fold)}"
+    if is_single_holdout_fold(root, outer_fold):
+        if inner_fold not in (None, 0):
+            raise ValueError(
+                "Benchmark holdout data has one validation split; "
+                f"inner fold {inner_fold} is not available"
+            )
+        if inner_fold is None and role not in {"train", "test"}:
+            raise ValueError(f"Invalid outer-test role: {role}")
+        if inner_fold is not None and role not in {"train", "valid"}:
+            raise ValueError(f"Invalid holdout role: {role}")
+        vcf_path = (
+            raw_path / "test.vcf.gz"
+            if role == "test"
+            else raw_path / "inner_fold_0" / f"{role}.vcf.gz"
+        )
+        return outer_path, outer_path / f"{role}_idx.npy", vcf_path
+    if inner_fold is None:
+        if role not in {"train", "test"}:
+            raise ValueError(f"Invalid final split role: {role}")
+        return (
+            outer_path / "final",
+            outer_path / f"{role}_idx.npy",
+            raw_path / f"{role}.vcf.gz",
+        )
+    if role not in {"train", "valid"}:
+        raise ValueError(f"Invalid inner split role: {role}")
+    split_path = outer_path / f"inner_fold_{int(inner_fold)}"
+    return (
+        split_path,
+        split_path / f"{role}_idx.npy",
+        raw_path / f"inner_fold_{int(inner_fold)}" / f"{role}.vcf.gz",
+    )
+
+
 def load_fold_indices(
     prepared_directory: str | Path,
     outer_fold: int,
     inner_fold: int | None = None,
 ) -> Dict[str, np.ndarray]:
     """Load one outer or inner split from a prepared-data directory."""
-    outer_path = Path(prepared_directory) / "cv" / f"outer_fold_{outer_fold}"
-    if inner_fold is None:
-        names = ("train_idx", "test_idx")
-        split_path = outer_path
-    else:
-        names = ("train_idx", "valid_idx")
-        split_path = outer_path / f"inner_fold_{inner_fold}"
-
-    missing = [name for name in names if not (split_path / f"{name}.npy").is_file()]
-    if missing:
-        raise FileNotFoundError(
-            f"Missing split files in {split_path}: {', '.join(missing)}"
+    roles = ("train", "test") if inner_fold is None else ("train", "valid")
+    loaded: Dict[str, np.ndarray] = {}
+    for role in roles:
+        _processed, index_path, _vcf = resolve_prepared_split_paths(
+            prepared_directory,
+            outer_fold,
+            inner_fold,
+            role,
         )
-    return {
-        name.removesuffix("_idx"): np.load(
-            split_path / f"{name}.npy", allow_pickle=False
-        )
-        for name in names
-    }
+        if not index_path.is_file():
+            raise FileNotFoundError(f"Missing split file: {index_path}")
+        loaded[role] = np.load(index_path, allow_pickle=False)
+    return loaded
 
 
 def parse_fold_selector(

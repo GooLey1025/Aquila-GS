@@ -73,6 +73,15 @@ class InnerHPOJob:
 
 
 @dataclass(frozen=True)
+class HoldoutFoldJob:
+    """One outer fold of sequential Bayesian holdout search."""
+
+    job_id: int
+    outer_fold: int
+    started: float
+
+
+@dataclass(frozen=True)
 class OuterRefitJob:
     """Outer-train refit after all inner HPO jobs for a fold complete."""
 
@@ -833,6 +842,316 @@ def _run_outer_refit_job(
         limiter.restore_original_limits()
 
 
+def _run_whisperer_holdout_fold(
+    job: HoldoutFoldJob,
+    device_name: str,
+    context: WorkerContext,
+) -> dict[str, Any]:
+    """Fifty Bayesian trials on one validation split, then one outer-test score."""
+    from aquila.benchmark.holdout import run_holdout_search
+
+    limiter = _limit_worker_threads()
+    try:
+        device = torch.device(device_name)
+        if device.type == "cuda":
+            configure_cuda_runtime(device_name, deterministic=False)
+        names = tuple(context.trait_names)
+        output_directory = Path(context.output_directory)
+        fold_path = output_directory / f"fold_{job.outer_fold}"
+        fold_path.mkdir(parents=True, exist_ok=True)
+        benchmark = WhispererPreparedBenchmark(Path(context.data_directory))
+        block_length = int(context.config["model"]["embedding"]["Block_length"])
+        train, valid, schema = benchmark.load_multi_trait_fold(
+            names, job.outer_fold, 0, block_length=block_length
+        )
+        expected_variants = tuple(tuple(value) for value in schema["variants"])
+        _same_train, outer_test, variant_schema = benchmark.load_multi_trait_fold(
+            names,
+            job.outer_fold,
+            None,
+            block_length=block_length,
+            expected_variants=expected_variants,
+        )
+
+        def evaluate_trial(parameters: Mapping[str, Any], trial_id: int):
+            flat = _candidate_parameters(parameters)
+            flat["batch_size"] = int(context.config["training"]["batch_size"])
+            training_seed = derive_seed(
+                int(context.config["seed"]), job.outer_fold, trial_id, 0
+            )
+            result = train_model(
+                train.genotypes,
+                train.processed_targets,
+                valid.genotypes,
+                valid.processed_targets,
+                apply_candidate_overrides(context.config["model"], flat, names),
+                flat,
+                device,
+                training_seed,
+                max_epochs=context.max_epochs,
+                patience=int(context.config["training"]["patience"]),
+                train_mask=train.observed_mask,
+                valid_mask=valid.observed_mask,
+                trait_names=names,
+            )
+            return float(result.best_metric), {
+                "state_dict": result.state_dict,
+                "best_epoch": int(result.best_epoch),
+                "history": list(result.history),
+                "parameters": flat,
+                "training_seed": training_seed,
+            }
+
+        search = run_holdout_search(
+            context.config.get("hpo", {}),
+            evaluate_trial,
+            default_trials=50,
+        )
+        best = search["best"]
+        payload = best["payload"]
+        final_parameters = dict(payload["parameters"])
+        final_config = apply_candidate_overrides(
+            context.config["model"], final_parameters, names
+        )
+        final_config["random_seed"] = int(payload["training_seed"])
+        predictions, observed, test_loss = predict_model(
+            payload["state_dict"],
+            outer_test.genotypes,
+            outer_test.processed_targets,
+            final_config,
+            final_parameters,
+            device,
+            outer_test.observed_mask,
+        )
+        predictions_original = benchmark.inverse_selected_traits(
+            predictions, observed, names, job.outer_fold
+        )
+        processed_metrics = evaluate_regression(
+            predictions, outer_test.processed_targets, observed, names
+        ).metrics
+        original_metrics = evaluate_regression(
+            predictions_original, outer_test.raw_targets, observed, names
+        ).metrics
+        torch.save(
+            {
+                "state_dict": payload["state_dict"],
+                "config": final_config,
+                "parameters": final_parameters,
+                "traits": list(names),
+                "outer_fold": job.outer_fold,
+                "final_epoch": payload["best_epoch"],
+                "training_seed": payload["training_seed"],
+                "retained_variants": train.variants,
+                "refit_full_dataset": False,
+            },
+            fold_path / "best_model.ckpt",
+        )
+        with (fold_path / "config.yaml").open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(
+                {
+                    "model": final_config,
+                    "optimizer": final_parameters,
+                    "training": context.config["training"],
+                    "traits": list(names),
+                },
+                handle,
+                sort_keys=False,
+            )
+        shutil.copy2(
+            benchmark.resolve_fold_paths(job.outer_fold).preprocessing,
+            fold_path / "preprocessing.json",
+        )
+        write_json(
+            fold_path / "hpo_results.json",
+            {
+                "method": "bayesian",
+                "direction": "maximize",
+                "best_candidate_id": best["candidate_id"],
+                "best_parameters": final_parameters,
+                "best_valid_pearson_mean": best["objective"],
+                "final_epoch": payload["best_epoch"],
+                "n_trials": search["n_trials"],
+                "trials": search["trials"],
+                "refit_full_dataset": False,
+            },
+        )
+        metrics = {
+            "normalized": processed_metrics,
+            "original": original_metrics,
+            "test_loss": test_loss,
+        }
+        write_json(fold_path / "metrics.json", metrics)
+        write_json(
+            fold_path / "training_history.json",
+            {"best": payload["history"]},
+        )
+        write_json(
+            fold_path / "sample_audit.json",
+            {
+                "protocol": "single_holdout",
+                "train": build_sample_audit(train, valid, held_out_name="valid"),
+                "outer": build_sample_audit(train, outer_test, held_out_name="test"),
+            },
+        )
+        write_json(fold_path / "variant_schema.json", variant_schema)
+        for trait_name in names:
+            _write_trait_predictions(
+                fold_path / f"predictions_{trait_name}_original_scale.csv",
+                outer_test,
+                predictions,
+                predictions_original,
+                trait_name,
+                job.outer_fold,
+            )
+            trait_fold = output_directory / trait_name / f"fold_{job.outer_fold}"
+            trait_fold.mkdir(parents=True, exist_ok=True)
+            write_json(trait_fold / "metrics.json", _slice_metrics(metrics, trait_name))
+            _write_trait_predictions(
+                trait_fold / "predictions_original_scale.csv",
+                outer_test,
+                predictions,
+                predictions_original,
+                trait_name,
+                job.outer_fold,
+            )
+        runtime = {
+            "elapsed_seconds": time.time() - job.started,
+            "device": str(device),
+            "training_seed": payload["training_seed"],
+            "outer_test_evaluations": 1,
+            "traits": list(names),
+            "n_trials": search["n_trials"],
+        }
+        write_json(fold_path / "runtime.json", runtime)
+        return {
+            "outer_fold": job.outer_fold,
+            "traits": list(names),
+            "best_candidate_id": best["candidate_id"],
+            "best_parameters": final_parameters,
+            "best_valid_pearson_mean": best["objective"],
+            "final_epoch": payload["best_epoch"],
+            "metrics": sanitize_json(metrics),
+            "runtime": runtime,
+        }
+    finally:
+        limiter.restore_original_limits()
+
+
+def _finish_whisperer_holdout(
+    args: argparse.Namespace,
+    data_directory: Path,
+    config_path: Path,
+    output_directory: Path,
+    config: Mapping[str, Any],
+    benchmark: WhispererPreparedBenchmark,
+    traits: Sequence[str],
+    outer_folds: Sequence[int],
+) -> None:
+    from aquila.training.distributed import detect_gpu_ids, execute_gpu_jobs
+
+    max_epochs = int(config["training"]["max_epochs"])
+    if args.max_epochs is not None:
+        max_epochs = min(max_epochs, args.max_epochs)
+    n_trials = int(config.get("hpo", {}).get("n_trials", 50))
+    budget = {
+        "protocol": "single_holdout",
+        "planned_outer_folds": benchmark.outer_fold_count,
+        "planned_trials": n_trials,
+        "actual_outer_folds": list(outer_folds),
+        "actual_max_epochs": max_epochs,
+        "actual_traits": list(traits),
+    }
+    completed_results = []
+    pending = []
+    for outer_fold in outer_folds:
+        completed = (
+            _load_completed_outer_fold(output_directory, outer_fold, traits)
+            if not args.overwrite
+            else None
+        )
+        if completed is None:
+            pending.append(int(outer_fold))
+        else:
+            completed_results.append(completed)
+    worker_context = WorkerContext(
+        data_directory=str(data_directory),
+        output_directory=str(output_directory),
+        config=dict(config),
+        candidates=(),
+        inner_folds=(0,),
+        trait_names=tuple(traits),
+        max_epochs=max_epochs,
+        budget=budget,
+        live_metrics_log=args.live_metrics_log,
+        resume=not args.overwrite,
+    )
+    started = time.time()
+    jobs = [
+        HoldoutFoldJob(job_id=index, outer_fold=outer_fold, started=started)
+        for index, outer_fold in enumerate(pending)
+    ]
+    gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
+    worker_gpu_ids = expand_gpu_workers(gpu_ids, args.jobs_per_gpu)
+    work_results = execute_gpu_jobs(
+        jobs,
+        _run_whisperer_holdout_fold,
+        worker_gpu_ids,
+        worker_args=(worker_context,),
+        raise_on_error=True,
+    )
+    results = completed_results + [item.value for item in work_results]
+    results.sort(key=lambda result: result["outer_fold"])
+    run_index = []
+    for trait_name in traits:
+        fold_results = [
+            {
+                "trait": trait_name,
+                "outer_fold": result["outer_fold"],
+                "best_candidate_id": result["best_candidate_id"],
+                "best_parameters": result["best_parameters"],
+                "best_valid_pearson_mean": result["best_valid_pearson_mean"],
+                "final_epoch": result["final_epoch"],
+                "metrics": _slice_metrics(result["metrics"], trait_name),
+                "runtime": result["runtime"],
+            }
+            for result in results
+        ]
+        write_json(
+            output_directory / trait_name / "summary.json",
+            {
+                "trait": trait_name,
+                "folds": fold_results,
+                "metrics": aggregate_outer_folds(
+                    [result["metrics"] for result in fold_results]
+                ),
+                "actual_budget": budget,
+            },
+        )
+        run_index.append(
+            {
+                "trait": trait_name,
+                "status": "completed",
+                "error": None,
+                "completed_outer_folds": [
+                    result["outer_fold"] for result in fold_results
+                ],
+            }
+        )
+    write_json(
+        output_directory / "summary.json",
+        {
+            "data_dir": str(data_directory),
+            "config": str(config_path),
+            "protocol": "single_holdout",
+            "traits": list(traits),
+            "actual_budget": budget,
+            "folds": results,
+            "metrics": aggregate_outer_folds([result["metrics"] for result in results]),
+            "runs": run_index,
+        },
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     data_directory = Path(args.data_dir).resolve()
@@ -851,6 +1170,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark = WhispererPreparedBenchmark(data_directory)
     traits = _select_traits(benchmark, args.traits)
     outer_folds = resolve_outer_folds(args.outer_folds, benchmark.metadata)
+    from aquila.benchmark.holdout import is_holdout_protocol
+
+    if is_holdout_protocol(benchmark.metadata):
+        _finish_whisperer_holdout(
+            args,
+            data_directory,
+            config_path,
+            output_directory,
+            config,
+            benchmark,
+            traits,
+            outer_folds,
+        )
+        return
     inner_count = benchmark.inner_fold_count
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)

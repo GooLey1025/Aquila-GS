@@ -378,6 +378,137 @@ def _split(payload: Any) -> GenotypeSplit:
     )
 
 
+def _apply_parameter_paths(
+    config: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    selected = copy.deepcopy(dict(config))
+    for path, value in parameters.items():
+        section, key = str(path).split(".", 1)
+        selected.setdefault(section, {})[key] = value
+    return selected
+
+
+def _run_holdout_trait_fold(
+    job: TraitFoldJob,
+    device: torch.device,
+    device_name: str,
+    worker_context: TraitFoldContext,
+    context: Any,
+    load_split: Callable[..., Any],
+    evaluate: Callable[..., Any],
+) -> dict[str, Any]:
+    """Bayesian early stopping on one validation split, then one outer-test score."""
+    from aquila.benchmark.holdout import run_holdout_search
+
+    trait = job.trait
+    outer_fold = job.outer_fold
+    started = time.time()
+    train = _split(load_split(context, trait, outer_fold, 0, "train"))
+    valid = _split(load_split(context, trait, outer_fold, 0, "valid"))
+    test = _split(load_split(context, trait, outer_fold, None, "test"))
+    train_x, valid_x, _scaler = fit_train_only_scaler(
+        train.genotypes, valid.genotypes, train.missing_mask, valid.missing_mask
+    )
+    _train_for_test, test_x, scaler = fit_train_only_scaler(
+        train.genotypes, test.genotypes, train.missing_mask, test.missing_mask
+    )
+    best_fit: FitResult | None = None
+
+    def evaluate_trial(parameters: Mapping[str, Any], trial_id: int):
+        nonlocal best_fit
+        config = _apply_parameter_paths(worker_context.base_config, parameters)
+        fit = train_model(
+            train_x,
+            train.targets,
+            valid_x,
+            valid.targets,
+            config,
+            device,
+            _seed(worker_context.seed, job.trait_index, outer_fold, trial_id, 0),
+        )
+        if best_fit is None or fit.best_pearson >= best_fit.best_pearson:
+            best_fit = fit
+        return float(fit.best_pearson), {
+            "best_epoch": int(fit.best_epoch),
+            "state_dict": fit.state_dict,
+        }
+
+    search = run_holdout_search(
+        worker_context.base_config.get("hpo", {}),
+        evaluate_trial,
+        default_trials=200,
+    )
+    if best_fit is None:
+        raise RuntimeError("CropARNet holdout search did not retain a checkpoint")
+    selected = _apply_parameter_paths(
+        worker_context.base_config, search["best"]["parameters"]
+    )
+    model = _model(train_x.shape[1], selected).to(device)
+    model.load_state_dict(search["best"]["payload"]["state_dict"])
+    model.eval()
+    with torch.no_grad():
+        predictions = model(
+            torch.as_tensor(test_x, dtype=torch.float32, device=device)
+        )[0].cpu().numpy()
+    metrics = evaluate(context, trait, outer_fold, test.targets, predictions)
+    fold_path = Path(worker_context.output_dir) / trait / f"fold_{outer_fold}"
+    fold_path.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": search["best"]["payload"]["state_dict"],
+            "config": selected,
+            "trait": trait,
+            "outer_fold": outer_fold,
+            "epoch": search["best"]["payload"]["best_epoch"],
+            "refit_full_dataset": False,
+            "scaler": {"min": scaler.min_.tolist(), "scale": scaler.scale_.tolist()},
+        },
+        fold_path / "checkpoint.pt",
+    )
+    _json(
+        fold_path / "hpo.json",
+        {
+            "method": "bayesian",
+            "n_trials": search["n_trials"],
+            "best": {
+                key: value
+                for key, value in search["best"].items()
+                if key != "payload"
+            },
+            "trials": search["trials"],
+        },
+    )
+    _json(fold_path / "history.json", list(best_fit.history))
+    _json(fold_path / "metrics.json", metrics)
+    _json(
+        fold_path / "audit.json",
+        {
+            "protocol": "single_holdout",
+            "train_samples": list(train.sample_ids),
+            "validation_samples": list(valid.sample_ids),
+            "test_samples": list(test.sample_ids),
+            "device": device_name,
+            "test_evaluations": 1,
+            "runtime_seconds": time.time() - started,
+        },
+    )
+    with (fold_path / "predictions.tsv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(("sample_id", "observed_processed", "predicted_processed"))
+        writer.writerows(zip(test.sample_ids, test.targets, predictions, strict=True))
+    return {
+        "trait": trait,
+        "outer_fold": outer_fold,
+        "candidate_id": search["best"]["candidate_id"],
+        "epoch": search["best"]["payload"]["best_epoch"],
+        "device": device_name,
+        "metrics": metrics,
+    }
+
+
 def _run_trait_fold(
     job: TraitFoldJob,
     device_name: str,
@@ -399,6 +530,10 @@ def _run_trait_fold(
     device = torch.device(device_name)
     load_context, load_split, evaluate = _resolve_api()
     context = load_context(worker_context.data_dir)
+    if str(context.metadata.get("data_mode", "")).lower() == "benchmark":
+        return _run_holdout_trait_fold(
+            job, device, device_name, worker_context, context, load_split, evaluate
+        )
     trait = job.trait
     outer_fold = job.outer_fold
     started = time.time()
@@ -579,10 +714,11 @@ def run_nested_cv(args: argparse.Namespace) -> dict[str, Any]:
     context = load_context(args.data_dir)
     traits = args.traits or list(context.regression_traits)
     outer_folds = resolve_outer_folds(args.outer_folds, context.metadata)
-    inner_count = int(context.inner_folds)
+    holdout = str(context.metadata.get("data_mode", "")).lower() == "benchmark"
+    inner_count = 1 if holdout else int(context.inner_folds)
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)
-    candidates = generate_candidates(base["hpo"]["grid"])
+    candidates = [] if holdout else generate_candidates(base["hpo"]["grid"])
     if args.max_candidates is not None:
         candidates = candidates[: args.max_candidates]
     output = Path(args.output_dir or base["output"]["directory"])

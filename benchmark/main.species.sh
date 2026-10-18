@@ -1,32 +1,37 @@
-COHORT=Maize1404_pheno_10folds
+COHORT=Maize1404_pheno_10folds_cv
 PHENO_FILE=species_data/Maize1404/benchmark.pheno
 VCF_FILE=species_data/Maize1404/Maize1404.coding.ld.vcf.gz
 
-COHORT=Soybean975_blup_pheno_10folds
+COHORT=Soybean975_blup_pheno_10folds_cv
 PHENO_FILE=species_data/Soybean975/benchmark.blup.pheno
 VCF_FILE=species_data/Soybean975/Soybean975.coding.ld.vcf.gz
 
-COHORT=wheat994_blup_pheno_10folds
+COHORT=wheat994_blup_pheno_10folds_cv
 PHENO_FILE=species_data/wheat994/benchmark.blup.pheno
 VCF_FILE=species_data/wheat994/wheat994.coding.ld.vcf.gz
 
-COHORT=Rice1171_pheno_10folds
+COHORT=Rice1171_pheno_10folds_cv
 PHENO_FILE=species_data/Rice1171/1171rice.pheno
 VCF_FILE=species_data/Rice1171/1171rice.final.imputed.WG_LD.vcf.gz
 
 export PATH="$CONDA_PREFIX/bin:$PATH"
 
 conda activate aquila
-aquila_cv.py --phenotype $PHENO_FILE -o $COHORT.nested_cv.json --outer-folds 10 --inner-folds 4 --seed 42 --min-observed 20
+# 10-fold holdout, not nested CV:
+#   1. Split all samples into 10 folds. Each fold's held-out part is test;
+#      the other 9 folds together are outer-train.
+#   2. Split that outer-train once into train and valid.
+#      --valid-fraction 0.2 means valid is 20% of outer-train (4:1).
+aquila_cv.py --phenotype $PHENO_FILE -o $COHORT.holdout_cv.json --outer-folds 10 --valid-fraction 0.2 --seed 42 --min-observed 20
 
 if [[ "$COHORT" == *Rice1171* ]]; then
-  aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --id-prefix "SNP-" --fold-mapping $COHORT.nested_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
-  aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.nested_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
+  aquila_data_cv_benchmark.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --id-prefix "SNP-" --fold-mapping $COHORT.holdout_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
+  aquila_data_cv_benchmark.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.holdout_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
 else
   # For Aquila-SNP data
-  aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.nested_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
+  aquila_data_cv_benchmark.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.holdout_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
   # For Aquila-Vars data
-  aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.nested_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
+  aquila_data_cv_benchmark.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.holdout_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
 fi
 
 cd croparnet
@@ -122,16 +127,16 @@ cd ../BNNs
   --jobs-per-gpu 2 --overwrite
 
 cd ../aquila-snp
-aquila_train_cv.py --data-dir ../$COHORT.cv.data --config 32hpo_budgets.yaml \
+aquila_train_cv_benchmark.py --data-dir ../$COHORT.cv.data --config 200hpo_bayesian.aquila-snp.yaml \
   -o results/$COHORT --live-metrics-log --overwrite
 
 cd ../aquila-vars
-aquila_train_cv.py --data-dir ../$COHORT.vars.cv.data --config 32hpo_budgets.aquila-vars.yaml \
+aquila_train_cv_benchmark.py --data-dir ../$COHORT.vars.cv.data --config 200hpo_bayesian.aquila-vars.yaml \
   -o results/$COHORT --live-metrics-log --use-deterministic --overwrite
 
 # Aquila-SNP single-task benchmark:
 # prepare and train one independent model for every phenotype trait while
-# reusing the same nested-CV split as the multi-task benchmark above.
+# reusing the same 10-fold outer-test and outer-train holdout as the multi-task benchmark above.
 cd ../aquila-snp
 IFS=$'\t' read -r -a PHENO_COLUMNS < "../$PHENO_FILE"
 for TRAIT in "${PHENO_COLUMNS[@]:1}"; do
@@ -144,21 +149,21 @@ for TRAIT in "${PHENO_COLUMNS[@]:1}"; do
   else
     ID_PREFIX=()
   fi
-  aquila_data_cv.py \
+  aquila_data_cv_benchmark.py \
     --vcf "../$VCF_FILE" \
     --phenotype "../$PHENO_FILE" \
     --traits "$TRAIT" \
     --encoding-type diploid_onehot \
     --variant-type snp \
     "${ID_PREFIX[@]}" \
-    --fold-mapping "../$COHORT.nested_cv.json" \
+    --fold-mapping "../$COHORT.holdout_cv.json" \
     -o "$SINGLE_TASK_DATA" \
     --overwrite
 
   echo "Training Aquila-SNP single-task model: $COHORT / $TRAIT"
-  aquila_train_cv.py \
+  aquila_train_cv_benchmark.py \
     --data-dir "$SINGLE_TASK_DATA" \
-    --config 32hpo_budgets.yaml \
+    --config 200hpo_bayesian.aquila-snp.yaml \
     -o "$SINGLE_TASK_OUTPUT" \
     --live-metrics-log \
     --overwrite

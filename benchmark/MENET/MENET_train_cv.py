@@ -15,6 +15,7 @@ import gzip
 import json
 import math
 import random
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -486,23 +487,15 @@ def load_split_data(
     missing_genotype: float,
 ) -> SplitData:
     """Align one VCF split to cached processed targets and discard missing labels."""
-    outer_path = data_directory / "cv" / f"outer_fold_{outer_fold}"
-    raw_path = data_directory / "raw_genotype" / f"outer_fold_{outer_fold}"
+    from aquila.data import resolve_prepared_split_paths
+
     valid_roles = {"train", "test"} if inner_fold is None else {"train", "valid"}
     if role not in valid_roles:
         raise ValueError(f"Invalid split role {role!r}")
-    if inner_fold is None:
-        split_path = outer_path / "final"
-        index_path = outer_path / f"{role}_idx.npy"
-        target_name = f"Y_{role}_processed.pt"
-        vcf_path = raw_path / f"{role}.vcf.gz"
-    else:
-        split_path = outer_path / f"inner_fold_{inner_fold}"
-        index_path = split_path / f"{role}_idx.npy"
-        target_name = f"Y_{role}_processed.pt"
-        vcf_path = (
-            raw_path / f"inner_fold_{inner_fold}" / f"{role}.vcf.gz"
-        )
+    split_path, index_path, vcf_path = resolve_prepared_split_paths(
+        data_directory, outer_fold, inner_fold, role
+    )
+    target_name = f"Y_{role}_processed.pt"
     absolute_indices = np.load(index_path, allow_pickle=False)
     processed = _load_tensor(split_path / target_name)
     if len(absolute_indices) != len(processed):
@@ -1180,6 +1173,194 @@ def load_completed_fold_summary(
         return None
 
 
+def _run_menet_holdout(
+    data_directory: Path,
+    output_directory: Path,
+    prepared: Any,
+    trait_name: str,
+    trait_index: int,
+    outer_fold: int,
+    base_config: Mapping[str, Any],
+    device: torch.device,
+    seed: int,
+) -> dict[str, Any]:
+    """Bayesian early stopping for the encoder and MeNet, then one outer-test score."""
+    from aquila.benchmark.holdout import run_holdout_search
+    from aquila.data import resolve_prepared_split_paths
+
+    fold_start = time.time()
+    fold_path = output_directory / trait_name / f"fold_{outer_fold}"
+    fold_path.mkdir(parents=True, exist_ok=True)
+    missing_value = float(base_config["data"]["missing_genotype_value"])
+    train = load_split_data(
+        data_directory,
+        prepared.metadata,
+        prepared.target_mask,
+        trait_index,
+        outer_fold,
+        0,
+        "train",
+        missing_value,
+    )
+    valid = load_split_data(
+        data_directory,
+        prepared.metadata,
+        prepared.target_mask,
+        trait_index,
+        outer_fold,
+        0,
+        "valid",
+        missing_value,
+    )
+    outer_test = load_split_data(
+        data_directory,
+        prepared.metadata,
+        prepared.target_mask,
+        trait_index,
+        outer_fold,
+        None,
+        "test",
+        missing_value,
+    )
+    validate_variant_schema(train, valid)
+    validate_variant_schema(train, outer_test)
+
+    def evaluate_trial(parameters: Mapping[str, Any], trial_id: int):
+        config = merge_config(base_config, parameters)
+        encoder = train_encoder(
+            train,
+            valid,
+            config,
+            device,
+            derive_seed(seed, outer_fold, trial_id, 0),
+        )
+        train_rep, valid_rep, _scale = build_relatedness(
+            train,
+            valid,
+            config["encoder"],
+            encoder.state_dict,
+            device,
+        )
+        menet = train_menet(
+            train,
+            valid,
+            train_rep,
+            valid_rep,
+            config,
+            device,
+            derive_seed(seed + 1, outer_fold, trial_id, 0),
+        )
+        metric = float(menet.metrics.get("avg_pearson", float("nan")))
+        return metric, {
+            "encoder_state": encoder.state_dict,
+            "encoder_epoch": int(encoder.best_epoch),
+            "menet_state": menet.state_dict,
+            "menet_epoch": int(menet.best_epoch),
+            "history": list(menet.history),
+        }
+
+    search = run_holdout_search(
+        base_config.get("hpo", {}),
+        evaluate_trial,
+        default_trials=200,
+    )
+    best = search["best"]
+    best_config = merge_config(base_config, best["parameters"])
+    payload = best["payload"]
+    train_rep, test_rep, _scale = build_relatedness(
+        train,
+        outer_test,
+        best_config["encoder"],
+        payload["encoder_state"],
+        device,
+    )
+    normalized_metrics, normalized_predictions = evaluate_model(
+        train,
+        outer_test,
+        train_rep,
+        test_rep,
+        best_config,
+        payload["menet_state"],
+        device,
+        trait_name,
+    )
+    preprocessor_path = (
+        resolve_prepared_split_paths(data_directory, outer_fold, None, "test")[0]
+        / "preprocessing.json"
+    )
+    preprocessor = PerTraitPreprocessor.load_json(preprocessor_path)
+    original_predictions = _inverse_trait(
+        normalized_predictions, preprocessor, trait_index
+    )
+    original_targets = _inverse_trait(
+        outer_test.targets.numpy()[:, None], preprocessor, trait_index
+    )
+    torch.save(
+        {
+            "encoder_state_dict": payload["encoder_state"],
+            "menet_state_dict": payload["menet_state"],
+            "config": best_config,
+            "trait": trait_name,
+            "outer_fold": outer_fold,
+            "encoder_epoch": payload["encoder_epoch"],
+            "menet_epoch": payload["menet_epoch"],
+            "refit_full_dataset": False,
+        },
+        fold_path / "best_model.pt",
+    )
+    shutil.copy2(preprocessor_path, fold_path / "preprocessing.json")
+    with (fold_path / "config.yaml").open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(best_config, handle, sort_keys=False)
+    with (fold_path / "hpo_results.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "method": "bayesian",
+                "n_trials": search["n_trials"],
+                "best_candidate_id": best["candidate_id"],
+                "best_parameters": best["parameters"],
+                "best_valid_pearson_mean": best["objective"],
+                "trials": search["trials"],
+                "refit_full_dataset": False,
+            },
+            handle,
+            indent=2,
+        )
+    with (fold_path / "metrics.json").open("w", encoding="utf-8") as handle:
+        json.dump({"normalized": normalized_metrics}, handle, indent=2)
+    with (fold_path / "training_history.json").open("w", encoding="utf-8") as handle:
+        json.dump({"best": payload["history"]}, handle, indent=2)
+    with (fold_path / "sample_audit.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "protocol": "single_holdout",
+                "train_observed": len(train.sample_ids),
+                "valid_observed": len(valid.sample_ids),
+                "outer_test_observed": len(outer_test.sample_ids),
+            },
+            handle,
+            indent=2,
+        )
+    with (fold_path / "predictions_original_scale.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["SampleID", "Prediction", "Observed"])
+        for sample_id, prediction, observed in zip(
+            outer_test.sample_ids,
+            original_predictions[:, 0],
+            original_targets[:, 0],
+        ):
+            writer.writerow([sample_id, float(prediction), float(observed)])
+    return {
+        "outer_fold": outer_fold,
+        "best_candidate_id": best["candidate_id"],
+        "best_parameters": dict(best["parameters"]),
+        "best_valid_pearson_mean": best["objective"],
+        "test_pearson": normalized_metrics["avg_pearson"],
+        "elapsed_seconds": time.time() - fold_start,
+    }
+
+
 def run_outer_fold(
     data_directory: Path,
     output_directory: Path,
@@ -1198,6 +1379,20 @@ def run_outer_fold(
     fold_start = time.time()
     fold_path = output_directory / trait_name / f"fold_{outer_fold}"
     fold_path.mkdir(parents=True, exist_ok=True)
+    from aquila.benchmark.holdout import is_holdout_protocol
+
+    if is_holdout_protocol(prepared.metadata):
+        return _run_menet_holdout(
+            data_directory,
+            output_directory,
+            prepared,
+            trait_name,
+            trait_index,
+            outer_fold,
+            base_config,
+            device,
+            seed,
+        )
     inner_results_by_candidate: dict[int, list[InnerFoldResult]] = {
         index: [] for index in range(len(candidates))
     }
@@ -1465,11 +1660,12 @@ def run_outer_fold(
         device,
         trait_name,
     )
+    from aquila.data import resolve_prepared_split_paths
+
     preprocessor = PerTraitPreprocessor.load_json(
-        data_directory
-        / "cv"
-        / f"outer_fold_{outer_fold}"
-        / "final"
+        resolve_prepared_split_paths(
+            data_directory, outer_fold, None, "test"
+        )[0]
         / "preprocessing.json"
     )
     original_predictions = _inverse_trait(
@@ -1660,11 +1856,18 @@ def main() -> None:
     invalid_traits = [trait for trait in traits if trait not in regression_traits]
     if invalid_traits:
         raise ValueError(f"Unknown traits: {invalid_traits}")
-    inner_count = int(prepared.metadata["inner_folds"])
+    from aquila.benchmark.holdout import is_holdout_protocol
+
+    holdout = is_holdout_protocol(prepared.metadata)
+    inner_count = 1 if holdout else int(prepared.metadata["inner_folds"])
     outer_folds = resolve_outer_folds(args.outer_folds, prepared.metadata)
     if args.max_inner_folds is not None:
         inner_count = min(inner_count, args.max_inner_folds)
-    candidates = generate_grid_candidates(config["hpo"]["parameters"])
+    candidates = (
+        []
+        if holdout
+        else generate_grid_candidates(config["hpo"]["parameters"])
+    )
     if args.max_candidates is not None:
         candidates = candidates[: args.max_candidates]
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)

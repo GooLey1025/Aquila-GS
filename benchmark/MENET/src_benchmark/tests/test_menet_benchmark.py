@@ -228,8 +228,10 @@ def test_grid_budget() -> None:
     )
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
-    candidates = generate_grid_candidates(config["hpo"]["parameters"])
-    assert len(candidates) == 64
+    hpo = config["hpo"]
+    assert hpo["method"] == "bayesian"
+    assert hpo["n_trials"] == 200
+    assert hpo["parameters"]["train.learning_rate"]["type"] == "log_uniform"
 
 
 def test_menet_training_loader_discards_incomplete_final_batch() -> None:

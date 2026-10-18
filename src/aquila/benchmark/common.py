@@ -17,7 +17,12 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import torch
 
-from aquila.data import PerTraitPreprocessor, load_fold_indices, load_prepared_data
+from aquila.data import (
+    PerTraitPreprocessor,
+    load_fold_indices,
+    load_prepared_data,
+    resolve_prepared_split_paths,
+)
 from aquila.training.evaluator import RegressionEvaluator
 
 
@@ -262,6 +267,8 @@ class PreparedBenchmark:
 
     @property
     def inner_fold_count(self) -> int:
+        if str(self.metadata.get("data_mode", "")).lower() == "benchmark":
+            return 1
         return int(self.metadata["inner_folds"])
 
     @property
@@ -297,38 +304,27 @@ class PreparedBenchmark:
         require_complete: bool = True,
     ) -> FoldPaths:
         self._validate_fold_number(outer_fold, self.outer_fold_count, "outer")
-        outer_cv = self.directory / "cv" / f"outer_fold_{outer_fold}"
-        outer_vcf = self.directory / "raw_genotype" / f"outer_fold_{outer_fold}"
-        if inner_fold is None:
-            processed = outer_cv / "final"
-            paths = FoldPaths(
-                self.directory,
-                outer_fold,
-                None,
-                outer_cv / "train_idx.npy",
-                outer_cv / "test_idx.npy",
-                _resolve_vcf_path(outer_vcf, "train"),
-                _resolve_vcf_path(outer_vcf, "test"),
-                processed / "Y_train_processed.pt",
-                processed / "Y_test_processed.pt",
-                processed / "preprocessing.json",
-            )
-        else:
+        if inner_fold is not None:
             self._validate_fold_number(inner_fold, self.inner_fold_count, "inner")
-            inner_cv = outer_cv / f"inner_fold_{inner_fold}"
-            inner_vcf = outer_vcf / f"inner_fold_{inner_fold}"
-            paths = FoldPaths(
-                self.directory,
-                outer_fold,
-                inner_fold,
-                inner_cv / "train_idx.npy",
-                inner_cv / "valid_idx.npy",
-                _resolve_vcf_path(inner_vcf, "train"),
-                _resolve_vcf_path(inner_vcf, "valid"),
-                inner_cv / "Y_train_processed.pt",
-                inner_cv / "Y_valid_processed.pt",
-                inner_cv / "preprocessing.json",
-            )
+        held_out_role = "valid" if inner_fold is not None else "test"
+        train_processed, train_index, train_vcf = resolve_prepared_split_paths(
+            self.directory, outer_fold, inner_fold, "train"
+        )
+        held_processed, held_index, held_vcf = resolve_prepared_split_paths(
+            self.directory, outer_fold, inner_fold, held_out_role
+        )
+        paths = FoldPaths(
+            self.directory,
+            outer_fold,
+            inner_fold,
+            train_index,
+            held_index,
+            train_vcf,
+            held_vcf,
+            train_processed / "Y_train_processed.pt",
+            held_processed / f"Y_{held_out_role}_processed.pt",
+            train_processed / "preprocessing.json",
+        )
         return paths.require_complete() if require_complete else paths
 
     def validate_complete(self) -> None:

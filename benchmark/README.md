@@ -25,7 +25,12 @@ $CONDA_PREFIX/bin/Rscript -e 'install.packages("hibayes", repos="https://cloud.r
 
 ## Data Prepare
 
-To ensure a fair comparison, we first generated a fixed nested cross-validation scheme and applied exactly the same outer-fold sample partitions to all methods. The outer folds are used for final model evaluation. Inner folds are used only by methods that compare multiple candidate configurations and therefore require hyperparameter optimization or model selection. Methods with one fixed configuration, currently rrBLUP and BayesCpi, skip inner-fold fitting and train directly on the complete outer-training partition. All models are evaluated on the same held-out outer-test samples.
+To ensure a fair comparison, every method uses the same 10-fold holdout. This is not nested CV: there is no inner cross-validation loop.
+
+1. Split all samples into 10 folds. For fold k, the held-out fold is test, and the other nine folds together are outer-train.
+2. Split that outer-train once into train and valid. The default `--valid-fraction 0.2` puts 20% of outer-train in valid and 80% in train (4:1). Pass another value between 0 and 1 to change the ratio.
+
+The mapping file is named `holdout_cv.json`. Hyperparameter models run Bayesian search on the validation set, keep the early-stopping checkpoint, and score the outer test once. They do not refit on the full outer-train. The default budget is 200 trials. Whisperer of DNA and BNNs use 50 trials. rrBLUP and BayesCpi have no searched hyperparameters: they train only on the train split and do not use the validation samples. All models are evaluated on the same held-out outer-test samples.
 
 For Aquila, missing phenotypic observations are handled natively through a masked multi-task learning strategy. Specifically, missing trait values are excluded from the loss calculation while the remaining observed traits continue to contribute to model optimization, allowing the model to exploit correlations among multiple traits without requiring phenotype imputation. For other methods that do not support missing phenotypes, missing observations were handled according to their model assumptions. Single-trait models were trained using only individuals with available phenotypic records for the target trait. Importantly, these models still followed the same predefined cross-validation partitions as Aquila, ensuring that differences in performance reflect model behavior rather than differences in data splitting. This evaluation framework assesses genomic prediction performance under realistic incomplete phenotype conditions encountered in practical breeding programs.
 
@@ -36,24 +41,23 @@ For Aquila, missing phenotypic observations are handled natively through a maske
 wget https://iagr.genomics.cn/static/gstool/data/GSTP008/population/GSTP008.pheno
 # However, the 705rice have a total of 50 low-depth duplicated samples, filtering required.
 
-aquila_cv.py --phenotype Rice655.pheno -o 655rice_nested_cv_10folds.json --outer-folds 10 --inner-folds 4 --seed 42
+aquila_cv.py --phenotype Rice655.pheno -o 655rice_holdout_cv_10folds.json --outer-folds 10 --valid-fraction 0.2 --seed 42
 ```
 
-The JSON mapping fixes both outer and inner folds and was used throughout the pipeline, including [GWAS lead-variant selection](https://github.com/GooLey1025/Multi_Source_Marker_Panel_generation), to avoid information leakage. Specifically, GWAS discovery and lead-variant selection were performed using only the training samples within each outer fold, while test samples were completely excluded from this process.
+Each record in this JSON is one outer fold: `test` is the held-out fold, `outer_train` is the other nine folds, and `train` / `valid` are the single split of that outer-train. It was used throughout the pipeline, including [GWAS lead-variant selection](https://github.com/GooLey1025/Multi_Source_Marker_Panel_generation), to avoid information leakage. GWAS discovery uses `outer_train` and excludes `test`. `aquila_data_cv_benchmark.py` uses the written train, validation, and test IDs. An older nested-CV JSON can still be read: its outer tests are kept, and the inner folds are replaced by one train/validation split.
 
-When `--save-raw-genotype` is enabled, sample-subset VCF files are written under each prepared directory's `raw_genotype/`. Every outer fold contains `train.vcf.gz` and `test.vcf.gz`; every nested inner fold contains `train.vcf.gz` and `valid.vcf.gz`. These files preserve the source variants and genotype fields, but include only the samples assigned to that split. These raw fold-specific VCFs allow benchmark models to apply their own genotype encodings while using exactly the same samples as Aquila.
+When `--save-raw-genotype` is enabled, sample-subset VCF files are written under each prepared directory's `raw_genotype/`. Every outer fold contains `test.vcf.gz` and a full outer-train `train.vcf.gz`. The protocol training genotypes are `raw_genotype/outer_fold_k/inner_fold_0/train.vcf.gz` (80%) and `valid.vcf.gz` (20%). Do not train on the full outer-train VCF. These files preserve the source variants and genotype fields, but include only the samples assigned to that split.
 
 Phenotypes are preprocessed once during data preparation and the resulting fold-specific standardized targets are reused by all downstream benchmarks. This provides a consistent phenotype input and prevents each method from introducing differences through independent preprocessing.
 
-To avoid information leakage, preprocessing parameters are always estimated from the corresponding training samples only:
+To avoid information leakage, preprocessing parameters are estimated once from the 80% HPO train split:
 
-- For each inner fold, trait skewness is calculated using the observed phenotypes in `inner_train`. A `log1p` transformation is applied when the absolute skewness exceeds the configured threshold, after which the trait is standardized using the training-set mean and standard deviation. The same fitted transformation is then applied to `inner_valid`.
-- For final evaluation in each outer fold, preprocessing is fitted again using the complete `outer_train` partition. The fitted transformation is applied unchanged to both `outer_train` and `outer_test`.
+- Trait skewness is calculated using the observed phenotypes in that train split. A `log1p` transformation is applied when the absolute skewness exceeds the configured threshold, after which the trait is standardized using the training-set mean and standard deviation. The same fitted transformation is applied to the validation split and the outer test. There is no second fit on the full outer-train.
 - Missing phenotype values are excluded when fitting preprocessing parameters and remain masked in the prepared targets.
 
-Each inner-fold directory stores `Y_train_processed.pt`, `Y_valid_processed.pt`, and `preprocessing.json`. The `final` directory of each outer fold stores `Y_train_processed.pt`, `Y_test_processed.pt`, and its own `preprocessing.json`. Together with the predefined nested-CV mapping and fold-specific VCF files, these artifacts form the common data inputs used for all benchmark models.
+Each outer fold stores `Y_train_processed.pt`, `Y_valid_processed.pt`, `Y_test_processed.pt`, and `preprocessing.json` at `cv/outer_fold_k/`. Together with the outer-fold mapping and fold-specific VCF files, these artifacts form the common data inputs used for all benchmark models.
 
-Single-trait benchmark models that do not natively support missing phenotypes, such as MENET, discard samples with an unobserved target separately within each training, validation, and test partition. The `-999` missing-value sentinel is never passed to their loss functions or evaluation metrics. The remaining samples retain the same predefined nested-CV assignments and fold-local phenotype transformations used by Aquila.
+Single-trait benchmark models that do not natively support missing phenotypes, such as MENET, discard samples with an unobserved target separately within each training, validation, and test partition. The `-999` missing-value sentinel is never passed to their loss functions or evaluation metrics. The remaining samples retain the same outer-fold assignments and the train-split phenotype transformation used by Aquila.
 
 For regression benchmarks, both Aquila-GS and the integrated comparison models report Pearson r, R², MSE, RMSE, and MAE on the available test observations. Fold outputs include metrics on both the standardized phenotype scale and the inverse-transformed original scale. The comparison summary uses within-trait Pearson: for each phenotype, Pearson correlation is calculated across its held-out samples and then averaged across outer folds. This is distinct from Aquila's optional within-accession Pearson, which correlates traits within a sample and is undefined for independent single-trait models such as DEM-SNP and DEM-Vars.
 
@@ -83,13 +87,13 @@ GWAS lead variants are selected independently from the training samples of each 
 
 ```sh
 for FOLD in {0..9}; do
-  aquila_data_cv.py \
+  aquila_data_cv_benchmark.py \
     --vcf "./species_data/Rice655-current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
     --phenotype Rice655.pheno \
     --encoding-type diploid_onehot \
     --variant-type snp \
     --id-prefix "SNP-" \
-    --fold-mapping 655rice_nested_cv_10folds.json \
+    --fold-mapping 655rice_holdout_cv_10folds.json \
     --fold-specific-gwas-fold "$FOLD" \
     -o "Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --save-raw-genotype \
@@ -103,11 +107,11 @@ Aquila-Vars uses separate SNP, INDEL, and SV branches, so its prepared data are 
 
 ```sh
 for FOLD in {0..9}; do
-  aquila_data_cv.py \
+  aquila_data_cv_benchmark.py \
     --vcf "./species_data/Rice655-current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
     --phenotype Rice655.pheno \
     --encoding-type diploid_onehot \
-    --fold-mapping 655rice_nested_cv_10folds.json \
+    --fold-mapping 655rice_holdout_cv_10folds.json \
     --fold-specific-gwas-fold "$FOLD" \
     -o "Rice655.current_fold_GWAS.vars.cv.data/fold_${FOLD}" \
     --save-raw-genotype \
@@ -123,9 +127,9 @@ Each output directory records its bound outer fold in `metadata.json`. Training 
 cd aquila-snp
 
 for FOLD in {0..9}; do
-  aquila_train_cv.py \
+  aquila_train_cv_benchmark.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config  32hpo_budgets.yaml \
+    --config  200hpo_bayesian.aquila-snp.yaml \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --live-metrics-log \
     --use-deterministic \
@@ -141,9 +145,9 @@ cd ..
 cd aquila-vars
 
 for FOLD in {0..9}; do
-  aquila_train_cv.py \
+  aquila_train_cv_benchmark.py \
     --data-dir "../Rice655.current_fold_GWAS.vars.cv.data/fold_${FOLD}" \
-    --config 32hpo_budgets.aquila-vars.yaml \
+    --config 200hpo_bayesian.aquila-vars.yaml \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --live-metrics-log \
     --use-deterministic \
@@ -209,10 +213,10 @@ done
 
 ### BayesCpi
 
-BayesCpi uses the single fixed configuration in `bayescpi/configs/nested_cv.yaml`, so the shared R benchmark runner automatically skips inner CV and fits once on the complete outer-training partition. `niter`, `nburn`, and `thin` control MCMC sampling accuracy, convergence, and runtime; they are fixed before evaluation rather than selected using outer-test performance. Convergence should be checked through MCMC diagnostics when changing these values. The historical script name is retained for command-line compatibility.
+BayesCpi uses the single fixed configuration in `bayescpi/configs/nested_cv.yaml`. It trains only on the 80% HPO train split and does not use the validation samples. `niter`, `nburn`, and `thin` control MCMC sampling accuracy, convergence, and runtime; they are fixed before evaluation rather than selected using outer-test performance. Convergence should be checked through MCMC diagnostics when changing these values. The historical script name is retained for command-line compatibility.
 
 ```sh
-pcd bayescpi
+cd bayescpi
 for FOLD in {0..9}; do
   python bayescpi_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
@@ -225,7 +229,7 @@ done
 
 ### rrBLUP
 
-rrBLUP uses the single fixed `REML` configuration in `rrBLUP/configs/nested_cv.yaml`, so the shared R benchmark runner automatically skips inner CV and fits once on the complete outer-training partition. Variance components and marker effects are estimated from that training partition by `mixed.solve`; they are fitted model parameters rather than CV-selected hyperparameters. The historical script name is retained for command-line compatibility.
+rrBLUP uses the single fixed `REML` configuration in `rrBLUP/configs/nested_cv.yaml`. It trains only on the 80% HPO train split and does not use the validation samples. Variance components and marker effects are estimated from that training partition by `mixed.solve`; they are fitted model parameters rather than searched hyperparameters. The historical script name is retained for command-line compatibility.
 
 ```sh
 cd rrBLUP
@@ -301,7 +305,7 @@ for FOLD in {0..9}; do
 done
 ```
 
-The benchmark adaptation preserves MENET's two-stage architecture while making model selection and evaluation compatible with the shared leakage-safe nested CV protocol. See the [detailed MENET benchmark adaptation](docs/MENET_benchmark_adaptation.md).
+The benchmark adaptation preserves MENET's two-stage architecture. On holdout data, both stages use Bayesian search (200 trials), early stopping, and the winning checkpoints for the single outer-test score. See the [detailed MENET benchmark adaptation](docs/MENET_benchmark_adaptation.md).
 
 ### [DNAwhisper](https://github.com/Marxin1992/Whisperer_of_DNA)
 
@@ -325,7 +329,7 @@ done
 
 Some scripts from BNNs were copied or adapted into our project repository. The upstream source code version referenced for this benchmark is commit `6a8a82fd68625443a1c6dbcef19b428d031fa18f`.
 
-BNNs retains its internal Lasso-based feature-selection module because it is treated as part of the model's architecture rather than external preprocessing. Its effective SNP subset can therefore differ from the shared benchmark panel. Despite retaining this feature-selection mechanism, BNNs did not achieve competitive nested-CV performance in this benchmark.
+BNNs retains its internal Lasso-based feature-selection module because it is treated as part of the model's architecture rather than external preprocessing. Lasso is fit on the 80% train split only. BNNs uses 50 Bayesian trials, keeps the early-stopping checkpoint, and scores the outer test once. Its effective SNP subset can therefore differ from the shared benchmark panel.
 
 ```sh
 cd BNNs
@@ -350,7 +354,7 @@ Some scripts from DEM were copied or adapted into our project repository. The up
 
 DEM's random-forest (RF) marker selection is retained because removing it produces approximately `number_of_SNPs × 10` genotype-class features per sample and exceeded the available memory on the RTX 4090 benchmark server. DEM is not included in the main horizontal comparison. Instead, `GYP_BLUP`, `HD_BLUP`, and `PH_BLUP` are evaluated as independent single-trait tasks. DEM-SNP and Aquila-SNP share the 1,000 SNP markers selected by the DEM-SNP RF, while DEM-Vars and Aquila-Vars share up to 1,000 markers independently selected for each SNP, INDEL, and SV branch by the DEM-Vars RF.
 
-Marker selection remains nested-CV local: each inner-fold RF is fitted only on that inner-training split, and the final RF is refitted using the complete outer-training split before outer-test evaluation. Aquila uses the same selected marker identities but retains its own genotype encodings. The complete two-stage workflow is provided in `DEM/run_dem_rf_matched_comparison.sh`.
+Marker selection is fit on the 80% HPO train split only. The winning early-stopping checkpoint is applied to the outer test; the random forest is not refit on validation samples or on the full outer-train. Aquila uses the same selected marker identities but retains its own genotype encodings. The complete two-stage workflow is provided in `DEM/run_dem_rf_matched_comparison.sh`.
 
 ```sh
 cd DEM

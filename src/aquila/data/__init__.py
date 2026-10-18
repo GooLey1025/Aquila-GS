@@ -7,9 +7,11 @@
 from .cv import (
     generate_nested_folds,
     generate_nested_folds_from_assignments,
+    is_single_holdout_fold,
     load_fold_indices,
     parse_fold_selector,
     resolve_outer_folds,
+    resolve_prepared_split_paths,
     save_nested_folds,
     validate_outer_fold_observations,
 )
@@ -29,10 +31,12 @@ __all__ = [
     "create_masked_loader",
     "generate_nested_folds",
     "generate_nested_folds_from_assignments",
+    "is_single_holdout_fold",
     "load_fold_indices",
     "load_prepared_data",
     "parse_fold_selector",
     "resolve_outer_folds",
+    "resolve_prepared_split_paths",
     "save_nested_folds",
     "validate_outer_fold_observations",
 ]

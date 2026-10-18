@@ -131,22 +131,10 @@ def _split_paths(
     inner_fold: int | None,
     role: str,
 ) -> tuple[Path, Path, Path]:
-    outer_path = data_directory / "cv" / f"outer_fold_{outer_fold}"
-    raw_path = data_directory / "raw_genotype" / f"outer_fold_{outer_fold}"
-    valid_roles = {"train", "test"} if inner_fold is None else {"train", "valid"}
-    if role not in valid_roles:
-        raise ValueError(f"Invalid split role {role!r}")
-    if inner_fold is None:
-        return (
-            outer_path / "final",
-            outer_path / f"{role}_idx.npy",
-            raw_path / f"{role}.vcf.gz",
-        )
-    split_path = outer_path / f"inner_fold_{inner_fold}"
-    return (
-        split_path,
-        split_path / f"{role}_idx.npy",
-        raw_path / f"inner_fold_{inner_fold}" / f"{role}.vcf.gz",
+    from aquila.data import resolve_prepared_split_paths
+
+    return resolve_prepared_split_paths(
+        data_directory, outer_fold, inner_fold, role
     )
 
 

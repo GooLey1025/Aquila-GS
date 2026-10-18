@@ -18,19 +18,41 @@ train:
   early_stopping_rounds: 40
 
 hpo:
-  method: grid
+  enabled: true
+  method: bayesian
+  n_trials: 200
   metric: avg_pearson
   direction: maximize
+  seed: 42
   parameters:
     max_depth:
-      values: [3, 6]
+      type: int
+      low: 3
+      high: 8
     eta:
-      values: [0.03, 0.1]
+      type: log_uniform
+      low: 0.01
+      high: 0.3
     subsample:
-      values: [0.8, 1.0]
+      type: float
+      low: 0.6
+      high: 1.0
+      step: 0.1
+    colsample_bytree:
+      type: float
+      low: 0.6
+      high: 1.0
+      step: 0.1
     min_child_weight:
-      values: [1, 5]
+      type: int
+      low: 1
+      high: 8
     gamma:
-      values: [0.0, 0.1]
+      type: float
+      low: 0.0
+      high: 0.5
+      step: 0.1
     reg_lambda:
-      values: [1.0, 5.0]
+      type: log_uniform
+      low: 0.1
+      high: 10.0

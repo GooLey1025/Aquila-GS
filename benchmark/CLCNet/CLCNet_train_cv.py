@@ -796,6 +796,186 @@ def _selected_matrices(
     )
 
 
+def _run_clcnet_holdout(
+    benchmark: PreparedBenchmark,
+    output_directory: Path,
+    trait_name: str,
+    outer_fold: int,
+    base_config: Mapping[str, Any],
+    device: torch.device,
+    seed: int,
+) -> dict[str, Any]:
+    """Bayesian early stopping on one validation split, then one outer-test score."""
+    from aquila.benchmark.holdout import run_holdout_search
+
+    fold_start = time.perf_counter()
+    fold_path = output_directory / trait_name / f"fold_{outer_fold}"
+    fold_path.mkdir(parents=True, exist_ok=True)
+    missing_value = float(base_config["data"]["missing_genotype_value"])
+    train, valid = benchmark.load_single_trait_fold(trait_name, outer_fold, 0)
+    _same_train, outer_test = benchmark.load_single_trait_fold(
+        trait_name, outer_fold, None
+    )
+    selector_start = time.perf_counter()
+    selection = fit_feature_selector(
+        train.genotypes,
+        train.processed_targets,
+        train.variants,
+        base_config["feature_selection"],
+        derive_seed(seed, outer_fold, 0, 0),
+    )
+    feature_selection_seconds = time.perf_counter() - selector_start
+    train_genotypes, valid_genotypes = _selected_matrices(
+        train, valid, selection, missing_value
+    )
+    _train_for_test, outer_test_genotypes = _selected_matrices(
+        train, outer_test, selection, missing_value
+    )
+
+    def evaluate_trial(parameters: Mapping[str, Any], trial_id: int):
+        candidate_config = merge_config(base_config, parameters)
+        result = train_clcnet(
+            train_genotypes,
+            train.processed_targets,
+            valid_genotypes,
+            valid.processed_targets,
+            candidate_config,
+            device,
+            derive_seed(seed, outer_fold, trial_id, 0),
+        )
+        metric = float(result.best_metrics.get("avg_pearson", float("nan")))
+        return metric, {
+            "state_dict": result.state_dict,
+            "best_epoch": int(result.best_epoch),
+            "history": list(result.history),
+            "metrics": dict(result.best_metrics),
+        }
+
+    search_start = time.perf_counter()
+    search = run_holdout_search(
+        base_config.get("hpo", {}),
+        evaluate_trial,
+        default_trials=200,
+    )
+    hpo_training_seconds = time.perf_counter() - search_start
+    best = search["best"]
+    best_config = merge_config(base_config, best["parameters"])
+    payload = best["payload"]
+    evaluation_start = time.perf_counter()
+    processed_predictions = predict_clcnet(
+        outer_test_genotypes,
+        outer_test.processed_targets,
+        best_config,
+        payload["state_dict"],
+        device,
+    )
+    original_predictions = benchmark.inverse_trait(
+        processed_predictions, trait_name, outer_fold
+    )
+    evaluation = evaluate_two_scales(
+        processed_predictions,
+        outer_test.processed_targets,
+        original_predictions,
+        outer_test.raw_targets,
+        trait_name=trait_name,
+    )
+    evaluation_seconds = time.perf_counter() - evaluation_start
+    size_estimate = estimate_model_size(
+        train_genotypes.shape[1], _shared_dimensions(best_config)
+    )
+    torch.save(
+        {
+            "model_state_dict": payload["state_dict"],
+            "trait": trait_name,
+            "outer_fold": outer_fold,
+            "input_dim": int(train_genotypes.shape[1]),
+            "shared_dimensions": list(_shared_dimensions(best_config)),
+            "variant_schema": [
+                train.variants[int(index)] for index in selection.selected_indices
+            ],
+            "selected_feature_indices": selection.selected_indices,
+            "missing_genotype_value": missing_value,
+            "config": best_config,
+            "best_candidate_id": best["candidate_id"],
+            "final_epoch": payload["best_epoch"],
+            "refit_full_dataset": False,
+        },
+        fold_path / "best_model.pt",
+    )
+    with (fold_path / "config.yaml").open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(best_config, handle, sort_keys=False)
+    write_json(
+        fold_path / "hpo_results.json",
+        {
+            "method": "bayesian",
+            "direction": "maximize",
+            "best_candidate_id": best["candidate_id"],
+            "best_parameters": best["parameters"],
+            "best_inner_pearson": best["objective"],
+            "final_epoch": payload["best_epoch"],
+            "n_trials": search["n_trials"],
+            "trials": search["trials"],
+            "refit_full_dataset": False,
+        },
+    )
+    metrics = {
+        "processed": evaluation.processed,
+        "original": evaluation.original,
+    }
+    write_json(fold_path / "metrics.json", metrics)
+    benchmark.load_preprocessor(outer_fold).save_json(fold_path / "preprocessing.json")
+    write_json(
+        fold_path / "feature_selection.json",
+        feature_selection_payload(selection, train.variants, train.sample_ids),
+    )
+    write_selected_variants(
+        fold_path / "selected_variants.tsv",
+        selection.selected_indices,
+        train.variants,
+    )
+    write_json(
+        fold_path / "sample_audit.json",
+        {
+            "protocol": "single_holdout",
+            "train": build_sample_audit(train, valid, held_out_name="valid"),
+            "outer": build_sample_audit(train, outer_test, held_out_name="test"),
+        },
+    )
+    write_json(
+        fold_path / "training_history.json",
+        {"best": payload["history"]},
+    )
+    runtime = {
+        "feature_selection_seconds": feature_selection_seconds,
+        "hpo_training_seconds": hpo_training_seconds,
+        "final_training_seconds": 0.0,
+        "evaluation_seconds": evaluation_seconds,
+        "total_seconds": time.perf_counter() - fold_start,
+        "model_size_estimate": size_estimate,
+    }
+    write_json(fold_path / "runtime.json", runtime)
+    write_predictions_csv(
+        fold_path / "predictions.csv",
+        outer_test.sample_ids,
+        evaluation.targets_processed,
+        evaluation.predictions_processed,
+        evaluation.targets_original,
+        evaluation.predictions_original,
+        trait_name=trait_name,
+        outer_fold=outer_fold,
+    )
+    return {
+        "trait": trait_name,
+        "outer_fold": outer_fold,
+        "best_candidate_id": best["candidate_id"],
+        "best_parameters": dict(best["parameters"]),
+        "best_inner_pearson": best["objective"],
+        "final_epoch": payload["best_epoch"],
+        "metrics": metrics,
+        "runtime_seconds": runtime["total_seconds"],
+    }
+
+
 def run_outer_fold(
     benchmark: PreparedBenchmark,
     output_directory: Path,
@@ -808,6 +988,18 @@ def run_outer_fold(
     seed: int,
     resume: bool = False,
 ) -> dict[str, Any]:
+    from aquila.benchmark.holdout import is_holdout_protocol
+
+    if is_holdout_protocol(benchmark.metadata):
+        return _run_clcnet_holdout(
+            benchmark,
+            output_directory,
+            trait_name,
+            outer_fold,
+            base_config,
+            device,
+            seed,
+        )
     fold_start = time.perf_counter()
     fold_path = output_directory / trait_name / f"fold_{outer_fold}"
     fold_path.mkdir(parents=True, exist_ok=True)
@@ -1153,18 +1345,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     ]
     if invalid_traits:
         raise ValueError(f"Unknown traits: {invalid_traits}")
+    from aquila.benchmark.holdout import is_holdout_protocol
+
+    holdout = is_holdout_protocol(benchmark.metadata)
     outer_folds = resolve_outer_folds(args.outer_folds, benchmark.metadata)
-    inner_folds = list(range(benchmark.inner_fold_count))
+    inner_folds = [0] if holdout else list(range(benchmark.inner_fold_count))
     if args.max_inner_folds is not None:
         inner_folds = inner_folds[: args.max_inner_folds]
-    candidates = generate_grid_candidates(config["hpo"]["parameters"])
-    if len(candidates) != 64:
+    candidates = (
+        []
+        if holdout
+        else generate_grid_candidates(config["hpo"]["parameters"])
+    )
+    if not holdout and len(candidates) != 64:
         raise ValueError(
             f"CLCNet HPO grid must contain exactly 64 candidates, got {len(candidates)}"
         )
     if args.max_candidates is not None:
         candidates = candidates[: args.max_candidates]
-    if not candidates or not inner_folds:
+    if not holdout and (not candidates or not inner_folds):
         raise ValueError("At least one HPO candidate and inner fold are required")
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
     worker_gpu_ids = expand_gpu_workers(gpu_ids, args.jobs_per_gpu)

@@ -4,38 +4,30 @@ hpo:
   metric: best/val_r
   direction: maximize
   seed: 42
-  # 32 candidates = 2 x 2 x 2 x 2 x 2.
+  # 8 candidates = 2 x 2 x 2.
   #
-  # The architecture is fixed to the best Aquila-Vars design from the
-  # Rice655 fold-0 architecture/width/fusion screens:
-  #   SNP 256 (Aquila-SNP Conv/DownConv/Transformer/Pool, pool axis 2)
-  #   INDEL 32/64 (MHA, pool axis 1)
-  #   SV 16/32 (MHA, pool axis 1)
+  # Widths stay fixed:
+  #   SNP 256 (Conv/DownConv/Transformer/Pool, pool axis 2)
+  #   INDEL 64 (MHA, pool axis 1)
+  #   SV 16 (MHA, pool axis 1)
   #   SNP-primary residual fusion, no shared trunk
   #
-  # SNP dropout is fixed at 0.4. indel/sv_dropout are grouped aliases that
-  # apply the selected value to the embedder, down-conv, transformer
-  # residual, and pooling dropout of that branch. Branch-local d_model is
-  # propagated to embedder, DownConv, Transformer d_model/d_ff, and Pool.
+  # Dropout inside each branch is a fixed front-to-back schedule.
+  # The grid only moves the three sites outside that schedule: the SNP
+  # embedder, the fusion block, and the regression head.
   parameters:
-    train.branches.indel.d_model:
-      type: categorical
-      choices: [32, 64]
-    train.branches.sv.d_model:
-      type: categorical
-      choices: [16, 32]
-    indel_dropout:
+    train.branches.snp.embedder.0.dropout:
       type: categorical
       choices: [0.4, 0.5]
-    sv_dropout:
-      type: categorical
-      choices: [0.1, 0.2]
     train.fusion.0.dropout:
       type: categorical
-      choices: [0.1, 0.3]
+      choices: [0.05, 0.3]
+    train.heads.regression.0.dropout:
+      type: categorical
+      choices: [0.1, 0.4]
 
 train:
-  batch_size: 16
+  batch_size: 32
   optimizer_type: adamw
   weight_decay: 8e-5
   loss_type: mse
@@ -79,56 +71,56 @@ train:
         residual: true
         seq_len_threshold: 1500
         kernel_size: 5
-        dropout: 0.4
+        dropout: 0.3
       - name: transformer
         d_model: 256
         num_heads: 8
         activation: gelu
         use_rope: false
         d_ff: 256
-        dropout: 0.4
-        ffn_dropout: 0.4
+        dropout: 0.2
+        ffn_dropout: 0.2
       - name: multi_head_pool
         d_model: 256
         num_heads: 4
         pool_axis: 2
-        dropout: 0.4
+        dropout: 0.1
       d_model: 256
-      dropout: 0.4
+      dropout: 0.2
 
     indel:
       embedder:
       - name: conv_block
         in_channels: 4
-        out_channels: 32
+        out_channels: 64
         kernel_size: 15
         activation: gelu
         norm_type: layer
         residual: false
-        dropout: 0.5
+        dropout: 0.3
       trunk:
       - name: down_conv_tower
-        in_channels: 32
-        out_channels: 32
+        in_channels: 64
+        out_channels: 64
         residual: true
         seq_len_threshold: 1500
         kernel_size: 5
-        dropout: 0.5
+        dropout: 0.2
       - name: transformer
-        d_model: 32
+        d_model: 64
         num_heads: 4
-        d_ff: 32
+        d_ff: 64
         activation: gelu
         use_rope: false
-        dropout: 0.5
-        ffn_dropout: 0.4
+        dropout: 0.15
+        ffn_dropout: 0.15
       - name: multi_head_pool
-        d_model: 32
+        d_model: 64
         num_heads: 4
         pool_axis: 1
-        dropout: 0.5
-      d_model: 32
-      dropout: 0.5
+        dropout: 0.05
+      d_model: 64
+      dropout: 0.15
 
     sv:
       embedder:
@@ -147,22 +139,22 @@ train:
         residual: true
         seq_len_threshold: 1500
         kernel_size: 5
-        dropout: 0.1
+        dropout: 0.05
       - name: transformer
         d_model: 16
         num_heads: 4
         d_ff: 16
         activation: gelu
         use_rope: false
-        dropout: 0.1
-        ffn_dropout: 0.4
+        dropout: 0.05
+        ffn_dropout: 0.05
       - name: multi_head_pool
         d_model: 16
         num_heads: 4
         pool_axis: 1
-        dropout: 0.1
+        dropout: 0.0
       d_model: 16
-      dropout: 0.1
+      dropout: 0.05
 
   fusion:
   - name: snp_primary_residual_fusion
@@ -172,7 +164,7 @@ train:
     - indel
     - sv
     gate_init: -3.0
-    dropout: 0.3
+    dropout: 0.05
 
   heads:
     regression:
@@ -181,7 +173,7 @@ train:
       num_targets: null
       hidden_features: 256
       activation: gelu
-      dropout: 0.1
+      dropout: 0.4
 
   live_metrics_log: true
 
