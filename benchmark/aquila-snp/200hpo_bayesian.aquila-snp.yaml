@@ -1,0 +1,121 @@
+hpo:
+  enabled: true
+  method: bayesian
+  n_trials: 200
+  metric: best/val_r
+  direction: maximize
+  seed: 42
+  parameters:
+    train.learning_rate:
+      type: log_uniform
+      low: 1.0e-5
+      high: 3.0e-3
+    train.weight_decay:
+      type: log_uniform
+      low: 1.0e-6
+      high: 1.0e-2
+    train.scheduler_params.warmup_epochs:
+      type: int
+      low: 5
+      high: 30
+      step: 5
+    train.scheduler_params.min_lr:
+      type: log_uniform
+      low: 1.0e-7
+      high: 1.0e-5
+    model.trunk.0.kernel_size:
+      type: categorical
+      choices: [5, 7, 9]
+    model.trunk.0.dropout:
+      type: float
+      low: 0.1
+      high: 0.4
+      step: 0.05
+    model.heads.regression.0.dropout:
+      type: float
+      low: 0.1
+      high: 0.4
+      step: 0.05
+    model.dropout:
+      type: float
+      low: 0.4
+      high: 0.5
+      step: 0.05
+    model.d_model:
+      type: categorical
+      choices: [128, 256, 512]
+    model.heads.regression.0.hidden_features:
+      type: categorical
+      choices: [128, 256, 512]
+
+train:
+  batch_size: 32
+  optimizer_type: adamw
+  weight_decay: 1e-3
+  loss_type: mse
+  normalize_regression: true
+  uncertainty_weighting: true
+  early_stopping_patience: 40
+  # Ignore tiny valid_r gains; still consume early-stopping patience.
+  early_stopping_min_delta: 0.0001
+  # clip_grad_norm_ syncs each step (~1–2pp util); null favors sustained ~99%.
+  gradient_clip_norm: null
+  scheduler_type: cosine_warmup
+  learning_rate: 1e-3
+  num_epochs: 200
+  scheduler_params:
+    warmup_epochs: 20
+    warmup_start_factor: 0.01
+    min_lr: 1e-5
+  val_split: 0.1
+  test_split: 0.0
+  # Keep fold subsets on GPU. If your batch is large, keep this false.
+  gpu_resident: true
+  # AMP dtype: bf16 enables autocast; fp32 disables it.
+  precision: bf16
+  # CUDA deterministic algorithms. CLI --use-deterministic overrides this.
+  deterministic: false
+  # Shared init + dropout + shuffle seed for every fit.
+  seed: 42
+
+model:
+  architecture_type: single
+  activation: gelu
+  dropout: 0.4
+  d_model: 256
+  l2_scale: 1.0e-05
+  verbose: false
+  embedder:
+  - name: conv_block
+    in_channels: 8
+    out_channels: d_model
+    kernel_size: 15
+    activation: gelu
+    norm_type: layer
+    residual: false
+  trunk:
+  - name: down_conv_tower
+    in_channels: d_model
+    out_channels: d_model
+    activation: gelu
+    norm_type: layer
+    order: nac
+    residual: true
+    seq_len_threshold: 1500
+  - name: transformer
+    d_model: d_model
+    num_heads: 8
+    d_ff: d_model
+    activation: gelu
+    use_rope: false
+  - name: multi_head_pool
+    d_model: d_model
+    num_heads: 4
+    pool_axis: 2
+
+  heads:
+    regression:
+    - name: regression_head
+      in_features: null
+      hidden_features: 256
+      activation: gelu
