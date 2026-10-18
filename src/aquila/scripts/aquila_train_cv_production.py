@@ -171,6 +171,15 @@ def parse_args() -> argparse.Namespace:
         help="GPU IDs to use. Pass with no IDs to force CPU execution.",
     )
     parser.add_argument(
+        "--folds-per-gpu",
+        type=int,
+        default=1,
+        help=(
+            "Independent outer-fold studies to run at the same time on each "
+            "GPU in per-fold mode (default: 1)."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Replace an existing nonempty production output directory.",
@@ -241,6 +250,22 @@ def select_deployment_folds(
             f"folds must be between 0 and {len(folds) - 1}, got {invalid}"
         )
     return [folds[fold_id] for fold_id in selected_ids]
+
+
+def expand_gpu_slots(gpu_ids: Sequence[int], folds_per_gpu: int) -> list[int]:
+    """Repeat each GPU so several outer folds can share one device.
+
+    The first pass visits every GPU before a second study is placed on the
+    same device, so a short job list still spreads across GPUs.
+    """
+    if int(folds_per_gpu) < 1:
+        raise ValueError("--folds-per-gpu must be at least 1")
+    ids = [int(gpu_id) for gpu_id in gpu_ids]
+    return [
+        gpu_id
+        for _ in range(int(folds_per_gpu))
+        for gpu_id in ids
+    ]
 
 
 def configure_hpo_mode(
@@ -895,10 +920,16 @@ def _run_per_fold_study(
         duplicate_note = (
             f" skipped_duplicates={duplicate_count}" if duplicate_count else ""
         )
+        if best_candidate is None:
+            raise RuntimeError(
+                f"Fold {split.fold} has no best model after trial {trial.number}"
+            )
         print(
             f"[Fold {split.fold} Bayesian HPO] unique={len(candidates)}/"
             f"{normalized['n_trials']} optuna_trial={trial.number + 1} "
-            f"objective={objective:.6f} best_epoch={training.best_epoch}"
+            f"objective={objective:.6f} "
+            f"best_valid_r={best_candidate.objective:.6f} "
+            f"best_epoch={training.best_epoch}"
             f"{duplicate_note}",
             flush=True,
         )
@@ -1053,11 +1084,17 @@ def _run_per_fold_mode(
     context: DeploymentHPOContext,
     gpu_ids: Sequence[int],
 ) -> list[Dict[str, Any]]:
-    """Schedule independent fold studies across available GPUs."""
+    """Schedule independent fold studies across available GPU slots."""
     jobs = [
         PerFoldHPOJob(job_id=int(split.fold), fold_id=int(split.fold))
         for split in context.folds
     ]
+    if gpu_ids:
+        print(
+            f"[INFO] Per-fold GPU slots {list(gpu_ids)}; "
+            f"{min(len(gpu_ids), len(jobs))} concurrent outer-fold studies",
+            flush=True,
+        )
     results = execute_gpu_jobs(
         jobs,
         _per_fold_hpo_worker,
@@ -1709,9 +1746,15 @@ def main() -> None:
         output_directory / "fold_assignments.tsv",
     )
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
+    if int(args.folds_per_gpu) < 1:
+        raise ValueError("--folds-per-gpu must be at least 1")
+    if args.mode != "per-fold" and int(args.folds_per_gpu) != 1:
+        raise ValueError("--folds-per-gpu is only supported in per-fold mode")
     if train_deterministic_enabled(config):
         print("[INFO] CUDA deterministic algorithms enabled")
-    if len(gpu_ids) > 1:
+    per_fold_gpu_ids = expand_gpu_slots(gpu_ids, int(args.folds_per_gpu))
+    shared_gpu_ids = per_fold_gpu_ids if args.mode == "per-fold" else gpu_ids
+    if len(shared_gpu_ids) > 1:
         prepared = PreparedData(
             features=share_memory_tensors(prepared.features),
             targets=prepared.targets.share_memory_(),
@@ -1750,7 +1793,7 @@ def main() -> None:
         live_metrics_log=bool(train_config.get("live_metrics_log", False)),
         resume=bool(args.resume),
     )
-    fold_summaries = _run_per_fold_mode(context, gpu_ids)
+    fold_summaries = _run_per_fold_mode(context, per_fold_gpu_ids)
     aggregate = {
         "status": "completed",
         "mode": "per-fold",
