@@ -929,7 +929,7 @@ def _run_per_fold_study(
             f"{normalized['n_trials']} optuna_trial={trial.number + 1} "
             f"objective={objective:.6f} "
             f"best_valid_r={best_candidate.objective:.6f} "
-            f"best_epoch={training.best_epoch}"
+            f"best_trial={best_candidate.candidate_id + 1}"
             f"{duplicate_note}",
             flush=True,
         )
