@@ -32,6 +32,7 @@ from aquila.data.cv import (
     validate_benchmark_folds,
     validate_outer_fold_observations,
 )
+from aquila.encoding import parse_genotype_file
 from aquila.scripts.aquila_data_cv import (
     NestedCVDataPreparer,
     PreparationConfig,
@@ -51,6 +52,14 @@ class BenchmarkDataPreparer(NestedCVDataPreparer):
     def __init__(self, config: BenchmarkPreparationConfig) -> None:
         self.benchmark_config = config
         super().__init__(config)
+
+    def _parse_genotypes(self) -> Any:
+        return parse_genotype_file(
+            str(self.config.genotype_file),
+            encoding_type=self.config.encoding_type,
+            variant_type=self.config.variant_type,
+            id_prefix=self.config.id_prefix,
+        )
 
     def prepare(self) -> Dict[str, Any]:
         self._validate_inputs()
