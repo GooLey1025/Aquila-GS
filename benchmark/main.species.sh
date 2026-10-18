@@ -30,8 +30,6 @@ if [[ "$COHORT" == *Rice1171* ]]; then
 else
   # For Aquila-SNP data
   aquila_data_cv_benchmark.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.holdout_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
-  # For Aquila-Vars data
-  aquila_data_cv_benchmark.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.holdout_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
 fi
 
 cd croparnet
