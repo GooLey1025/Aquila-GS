@@ -224,7 +224,7 @@ def test_training_only_relatedness() -> None:
 
 def test_grid_budget() -> None:
     config_path = (
-        Path(__file__).parent.parent.parent / "configs" / "MeNet_nested_cv.yaml"
+        Path(__file__).parent.parent.parent / "configs" / "MeNet_holdout_cv.yaml"
     )
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)

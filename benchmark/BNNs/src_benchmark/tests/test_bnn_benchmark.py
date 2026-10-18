@@ -147,7 +147,7 @@ def test_pipeline_round_trip_and_schema_validation() -> None:
 
 
 def test_grid_contains_exactly_16_candidates() -> None:
-    path = BENCHMARK_SOURCE.parent / "configs" / "BNNs_nested_cv.yaml"
+    path = BENCHMARK_SOURCE.parent / "configs" / "BNNs_holdout_cv.yaml"
     with path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     hpo = config["hpo"]

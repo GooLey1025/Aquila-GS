@@ -31,7 +31,7 @@ from aquila.training.hpo import generate_grid_candidates, half_up_median_epoch
 
 
 def test_hpo_grid_has_exactly_64_stable_candidates() -> None:
-    config_path = SCRIPT_DIRECTORY.parent / "configs" / "CLCNet_nested_cv.yaml"
+    config_path = SCRIPT_DIRECTORY.parent / "configs" / "CLCNet_holdout_cv.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     hpo = config["hpo"]
     assert hpo["method"] == "bayesian"

@@ -347,7 +347,7 @@ def test_prepared_partition_filters_missing_trait_samples() -> None:
 
 
 def test_grid_uses_training_batch_size_32() -> None:
-    config_path = SOURCE_DIRECTORY.parent / "configs" / "Whisperer_nested_cv.yaml"
+    config_path = SOURCE_DIRECTORY.parent / "configs" / "Whisperer_holdout_cv.yaml"
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     hpo = config["hpo"]

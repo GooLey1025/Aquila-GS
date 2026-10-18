@@ -1,6 +1,0 @@
-model: rrBLUP
-seed: 42
-parameters: {}
-grid:
-  method:
-    - REML

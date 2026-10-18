@@ -25,5 +25,5 @@ if __name__ == "__main__":
         BENCHMARK_SOURCE / "lasso_worker.R",
         ("jsonlite", "glmnet"),
         ("lambda",),
-        MODEL_ROOT / "configs" / "nested_cv.yaml",
+        MODEL_ROOT / "configs" / "holdout_cv.yaml",
     )

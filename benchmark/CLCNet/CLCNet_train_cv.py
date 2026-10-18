@@ -169,7 +169,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-dir", required=True)
     parser.add_argument(
         "--config",
-        default=str(SCRIPT_DIRECTORY / "configs" / "CLCNet_nested_cv.yaml"),
+        default=str(SCRIPT_DIRECTORY / "configs" / "CLCNet_holdout_cv.yaml"),
     )
     parser.add_argument(
         "--traits",

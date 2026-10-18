@@ -167,7 +167,7 @@ cd croparnet
 for FOLD in {0..9}; do
   python src_benchmark/adapter.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/nested_cv.yaml \
+    --config configs/holdout_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --jobs-per-gpu 2 \
@@ -188,7 +188,7 @@ cd cropformer
 for FOLD in {0..9}; do
   python src_benchmark/adapter.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/nested_cv.yaml \
+    --config configs/holdout_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --jobs-per-gpu 2 \
@@ -203,7 +203,7 @@ cd xgboost
 for FOLD in {0..9}; do
   python xgboost_train_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/xgboost_nested_cv.yaml \
+    --config configs/xgboost_holdout_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --n-jobs 32 \
@@ -213,14 +213,14 @@ done
 
 ### BayesCpi
 
-BayesCpi uses the single fixed configuration in `bayescpi/configs/nested_cv.yaml`. It trains only on the 80% HPO train split and does not use the validation samples. `niter`, `nburn`, and `thin` control MCMC sampling accuracy, convergence, and runtime; they are fixed before evaluation rather than selected using outer-test performance. Convergence should be checked through MCMC diagnostics when changing these values. The historical script name is retained for command-line compatibility.
+BayesCpi uses the single fixed configuration in `bayescpi/configs/holdout_cv.yaml`. It trains only on the 80% HPO train split and does not use the validation samples. `niter`, `nburn`, and `thin` control MCMC sampling accuracy, convergence, and runtime; they are fixed before evaluation rather than selected using outer-test performance. Convergence should be checked through MCMC diagnostics when changing these values. The historical script name is retained for command-line compatibility.
 
 ```sh
 cd bayescpi
 for FOLD in {0..9}; do
   python bayescpi_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/nested_cv.yaml \
+    --config configs/holdout_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --overwrite
@@ -229,14 +229,14 @@ done
 
 ### rrBLUP
 
-rrBLUP uses the single fixed `REML` configuration in `rrBLUP/configs/nested_cv.yaml`. It trains only on the 80% HPO train split and does not use the validation samples. Variance components and marker effects are estimated from that training partition by `mixed.solve`; they are fitted model parameters rather than searched hyperparameters. The historical script name is retained for command-line compatibility.
+rrBLUP uses the single fixed `REML` configuration in `rrBLUP/configs/holdout_cv.yaml`. It trains only on the 80% HPO train split and does not use the validation samples. Variance components and marker effects are estimated from that training partition by `mixed.solve`; they are fitted model parameters rather than searched hyperparameters. The historical script name is retained for command-line compatibility.
 
 ```sh
 cd rrBLUP
 for FOLD in {0..9}; do
   python rrblup_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/nested_cv.yaml \
+    --config configs/holdout_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --overwrite
@@ -250,7 +250,7 @@ cd Lasso
 for FOLD in {0..9}; do
   python lasso_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/nested_cv.yaml \
+    --config configs/holdout_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --overwrite
@@ -264,7 +264,7 @@ cd ElasticNet
 for FOLD in {0..9}; do
   python elasticnet_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/nested_cv.yaml \
+    --config configs/holdout_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --overwrite
@@ -280,7 +280,7 @@ cd CLCNet
 for FOLD in {0..9}; do
   python CLCNet_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/CLCNet_nested_cv.yaml \
+    --config configs/CLCNet_holdout_cv.yaml \
     --outer-folds "$FOLD" \
     --jobs-per-gpu 2 \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -297,7 +297,7 @@ cd MENET
 for FOLD in {0..9}; do
   python MENET_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/MeNet_nested_cv.yaml \
+    --config configs/MeNet_holdout_cv.yaml \
     --outer-folds "$FOLD" \
     --jobs-per-gpu 2 \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -317,7 +317,7 @@ conda activate aquila_dnawhisperer
 for FOLD in {0..9}; do
   python Whisperer_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/Whisperer_nested_cv.yaml \
+    --config configs/Whisperer_holdout_cv.yaml \
     --outer-folds "$FOLD" \
     --output-dir "results/Rice655_10folds/fold_${FOLD}" \
     --jobs-per-gpu 2 \
@@ -336,7 +336,7 @@ cd BNNs
 for FOLD in {0..9}; do
   python BNNs_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/BNNs_nested_cv.yaml \
+    --config configs/BNNs_holdout_cv.yaml \
     --outer-folds "$FOLD" \
     --output-dir "results/Rice655_10folds/fold_${FOLD}" \
     --jobs-per-gpu 2 \
@@ -360,12 +360,12 @@ Marker selection is fit on the 80% HPO train split only. The winning early-stopp
 cd DEM
 python DEM_train_benchmark.py \
   --data-dir ../Maize1404.snp.cv.data \
-  --config configs/DEM-SNP_nested_cv.yaml \
+  --config configs/DEM-SNP_holdout_cv.yaml \
   --output-dir results/DEM-SNP/Maize1404
 
 python DEM_train_benchmark.py \
   --data-dir ../Maize1404.vars.cv.data \
-  --config configs/DEM-Vars_nested_cv.yaml \
+  --config configs/DEM-Vars_holdout_cv.yaml \
   --output-dir results/DEM-Vars/Maize1404
 ```
 

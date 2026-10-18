@@ -11,7 +11,7 @@ cd "$DEM_ROOT"
 for FOLD in "${FOLDS[@]}"; do
   python DEM_train_benchmark.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config configs/DEM-SNP_nested_cv.yaml \
+    --config configs/DEM-SNP_holdout_cv.yaml \
     --traits "${TRAITS[@]}" \
     --outer-folds "$FOLD" \
     -o "results/Rice655-rf-matched/DEM-SNP/fold_${FOLD}" \
@@ -19,7 +19,7 @@ for FOLD in "${FOLDS[@]}"; do
 
   python DEM_train_benchmark.py \
     --data-dir "../Rice655.current_fold_GWAS.vars.cv.data/fold_${FOLD}" \
-    --config configs/DEM-Vars_nested_cv.yaml \
+    --config configs/DEM-Vars_holdout_cv.yaml \
     --traits "${TRAITS[@]}" \
     --outer-folds "$FOLD" \
     -o "results/Rice655-rf-matched/DEM-Vars/fold_${FOLD}" \

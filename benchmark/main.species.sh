@@ -35,47 +35,47 @@ fi
 cd croparnet
 /usr/bin/time -v -o $COHORT.time.txt python src_benchmark/adapter.py \
   --data-dir ../$COHORT.cv.data \
-  --config configs/nested_cv.yaml \
+  --config configs/holdout_cv.yaml \
   -o results/$COHORT \
   --jobs-per-gpu 4 --overwrite
 
 cd ../cropformer
 /usr/bin/time -v -o $COHORT.time.txt python src_benchmark/adapter.py \
   --data-dir ../$COHORT.cv.data \
-  --config configs/nested_cv.yaml \
+  --config configs/holdout_cv.yaml \
   -o results/$COHORT \
   --jobs-per-gpu 4 --overwrite
 
 cd ../xgboost
 /usr/bin/time -v -o $COHORT.time.txt python xgboost_train_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
-  --config configs/xgboost_nested_cv.yaml \
+  --config configs/xgboost_holdout_cv.yaml \
   -o results/$COHORT \
   --n-jobs 4 --overwrite
 
 cd ../bayescpi
 /usr/bin/time -v -o $COHORT.time.txt python bayescpi_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
-  --config configs/nested_cv.yaml \
+  --config configs/holdout_cv.yaml \
   -o results/$COHORT --overwrite
 
 cd ../rrBLUP
 /usr/bin/time -v -o $COHORT.time.txt python rrblup_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
-  --config configs/nested_cv.yaml \
+  --config configs/holdout_cv.yaml \
   -o results/$COHORT --overwrite
 
 
 cd ../Lasso
 python lasso_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
-  --config configs/nested_cv.yaml \
+  --config configs/holdout_cv.yaml \
   -o results/$COHORT --overwrite
 
 cd ../ElasticNet
 python elasticnet_nested_cv.py \
   --data-dir ../$COHORT.cv.data \
-  --config configs/nested_cv.yaml \
+  --config configs/holdout_cv.yaml \
   -o results/$COHORT --overwrite
 
 cd ../CLCNet
@@ -83,7 +83,7 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2
 /usr/bin/time -v -o "$COHORT.time.txt" \
 python CLCNet_train_cv.py \
   --data-dir "../$COHORT.cv.data" \
-  --config configs/CLCNet_nested_cv.yaml \
+  --config configs/CLCNet_holdout_cv.yaml \
   --jobs-per-gpu 1 \
   -o "results/$COHORT" \
   --overwrite
@@ -91,20 +91,20 @@ python CLCNet_train_cv.py \
 cd ../MENET
 /usr/bin/time -v -o $COHORT.time.txt python MENET_train_cv.py \
   --data-dir ../$COHORT.cv.data \
-  --config configs/MeNet_nested_cv.yaml \
+  --config configs/MeNet_holdout_cv.yaml \
   --jobs-per-gpu 2 \
   -o results/$COHORT --overwrite
 
 cd ../DEM
 /usr/bin/time -v -o $COHORT.DEM-SNP.time.txt python DEM_train_benchmark.py \
   --data-dir ../$COHORT.cv.data \
-  --config configs/DEM-SNP_nested_cv.yaml \
+  --config configs/DEM-SNP_holdout_cv.yaml \
   --output-dir results/DEM-SNP/$COHORT \
   --jobs-per-gpu 2 --overwrite
 
 # /usr/bin/time -v -o $COHORT.DEM-Vars.time.txt python DEM_train_benchmark.py \
 #   --data-dir ../$COHORT.vars.cv.data \
-#   --config configs/DEM-Vars_nested_cv.yaml \
+#   --config configs/DEM-Vars_holdout_cv.yaml \
 #   --output-dir results/DEM-Vars/$COHORT \
 #   --jobs-per-gpu 2
 
@@ -112,7 +112,7 @@ conda activate aquila_dnawhisperer
 cd ../Whisperer_of_DNA
 /usr/bin/time -v -o $COHORT.time.txt python Whisperer_train_cv.py \
   --data-dir ../$COHORT.cv.data \
-  --config configs/Whisperer_nested_cv.yaml \
+  --config configs/Whisperer_holdout_cv.yaml \
   --output-dir results/$COHORT \
   --jobs-per-gpu 2 --overwrite
 
@@ -120,7 +120,7 @@ conda activate aquila
 cd ../BNNs
 /usr/bin/time -v -o $COHORT.time.txt python BNNs_train_cv.py \
   --data-dir ../$COHORT.cv.data \
-  --config configs/BNNs_nested_cv.yaml \
+  --config configs/BNNs_holdout_cv.yaml \
   --output-dir results/$COHORT \
   --jobs-per-gpu 2 --overwrite
 

@@ -19,7 +19,7 @@ from r_models_common.nested_cv import launch
 
 
 if __name__ == "__main__":
-    config_path = MODEL_ROOT / "configs" / "nested_cv.yaml"
+    config_path = MODEL_ROOT / "configs" / "holdout_cv.yaml"
     launch(
         "rrBLUP",
         "https://github.com/cran/rrBLUP",

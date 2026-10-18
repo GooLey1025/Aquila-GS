@@ -179,7 +179,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-dir", default=str(PROJECT_ROOT / "benchmark" / "test"))
     parser.add_argument(
         "--config",
-        default=str(SCRIPT_DIRECTORY / "configs" / "Whisperer_nested_cv.yaml"),
+        default=str(SCRIPT_DIRECTORY / "configs" / "Whisperer_holdout_cv.yaml"),
     )
     parser.add_argument("-o", "--output-dir", required=True)
     parser.add_argument(
