@@ -30,12 +30,14 @@ PROJECT_ROOT = SCRIPT_DIRECTORY.parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
 DEM_SOURCE_ROOT = SCRIPT_DIRECTORY / "src"
 for import_path in (
-    SOURCE_ROOT,
-    DEM_SOURCE_ROOT / "biodem" / "dem",
     DEM_SOURCE_ROOT / "biodem" / "utils",
+    DEM_SOURCE_ROOT / "biodem" / "dem",
+    SOURCE_ROOT,
 ):
-    if str(import_path) not in sys.path:
-        sys.path.insert(0, str(import_path))
+    entry = str(import_path)
+    while entry in sys.path:
+        sys.path.remove(entry)
+    sys.path.insert(0, entry)
 
 from aquila.data.preprocessing import PerTraitPreprocessor
 from aquila.training.distributed import derive_seed

@@ -26,8 +26,10 @@ import yaml
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIRECTORY.parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
-if str(SOURCE_ROOT) not in sys.path:
-    sys.path.insert(0, str(SOURCE_ROOT))
+_source_entry = str(SOURCE_ROOT)
+while _source_entry in sys.path:
+    sys.path.remove(_source_entry)
+sys.path.insert(0, _source_entry)
 
 try:
     from aquila.benchmark import (  # type: ignore[attr-defined]

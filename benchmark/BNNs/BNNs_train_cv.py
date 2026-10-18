@@ -29,9 +29,10 @@ BNN_DIRECTORY = SCRIPT_DIRECTORY
 BENCHMARK_SOURCE = BNN_DIRECTORY / "src_benchmark"
 PROJECT_ROOT = BNN_DIRECTORY.parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
-for import_path in (str(SOURCE_ROOT), str(BENCHMARK_SOURCE)):
-    if import_path not in sys.path:
-        sys.path.insert(0, import_path)
+for import_path in (str(BENCHMARK_SOURCE), str(SOURCE_ROOT)):
+    while import_path in sys.path:
+        sys.path.remove(import_path)
+    sys.path.insert(0, import_path)
 
 from aquila.benchmark import sanitize_json
 from aquila.data import load_prepared_data, resolve_outer_folds

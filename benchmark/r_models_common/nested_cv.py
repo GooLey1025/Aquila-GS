@@ -29,8 +29,18 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
-if str(SOURCE_ROOT) not in sys.path:
-    sys.path.insert(0, str(SOURCE_ROOT))
+# An installed aquila may already sit ahead of this checkout. Keep the
+# in-tree package first so aquila.benchmark.holdout resolves here.
+_source_entry = str(SOURCE_ROOT)
+while _source_entry in sys.path:
+    sys.path.remove(_source_entry)
+sys.path.insert(0, _source_entry)
+_loaded = sys.modules.get("aquila")
+_origin = getattr(_loaded, "__file__", None) if _loaded is not None else None
+if _origin and SOURCE_ROOT not in Path(_origin).resolve().parents:
+    for _name in list(sys.modules):
+        if _name == "aquila" or _name.startswith("aquila."):
+            del sys.modules[_name]
 
 from aquila.benchmark.holdout import is_holdout_protocol, run_holdout_search
 from aquila.data import resolve_outer_folds, resolve_prepared_split_paths

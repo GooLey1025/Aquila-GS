@@ -36,11 +36,12 @@ PROJECT_ROOT = MENET_DIRECTORY.parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
 for import_path in (
     str(MENET_DIRECTORY),
-    str(SOURCE_ROOT),
     str(BENCHMARK_SOURCE),
+    str(SOURCE_ROOT),
 ):
-    if import_path not in sys.path:
-        sys.path.insert(0, import_path)
+    while import_path in sys.path:
+        sys.path.remove(import_path)
+    sys.path.insert(0, import_path)
 
 from aquila.data import load_prepared_data, resolve_outer_folds
 from aquila.data.preprocessing import PerTraitPreprocessor

@@ -16,11 +16,18 @@ import json
 import math
 import random
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+
+_SOURCE_ROOT = Path(__file__).resolve().parents[3] / "src"
+_source_entry = str(_SOURCE_ROOT)
+while _source_entry in sys.path:
+    sys.path.remove(_source_entry)
+sys.path.insert(0, _source_entry)
 
 import numpy as np
 import torch
