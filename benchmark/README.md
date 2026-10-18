@@ -69,6 +69,10 @@ All models in the main benchmark use the same fold-specific SNP panels whenever 
 
 Three exceptions require explicit treatment. BNNs retains its internal Lasso-based feature-selection module because it is a defining component of the proposed architecture; consequently, its effective SNP subset can differ from those used by other models, although its nested-CV performance was not competitive in this benchmark. Cropformer originally applies mutual-information-coefficient (MIC) filtering with a default maximum of 10,000 SNPs; this optional filtering was disabled so that Cropformer receives the same SNP panel as the other models. DEM originally uses random-forest SNP selection. Removing this stage would expand each sample to approximately `number_of_SNPs × 10` genotype-class features, producing an impractically large model input and causing out-of-memory errors on the RTX 4090 benchmark server. DEM was therefore excluded from the main horizontal comparison and evaluated separately against Aquila-SNP using the same marker set selected by DEM, allowing the architectural capabilities of DEM and Aquila-SNP to be compared under matched markers.
 
+## VarsGT reference panel
+
+The Rice655 SNP, INDEL, and SV resources consumed by VarsGT are rebuilt with [`breeding_application/VarsGT/main.make_ref.sh`](../breeding_application/VarsGT/main.make_ref.sh). The script installs a new genotyping panel into an existing VarsGT index directory and leaves the Giraffe graph files unchanged. Inputs, environment variables, installed filenames, and the validation checks are described in [Rebuild the Rice655 VarsGT reference panel](../breeding_application/VarsGT/docs/make_ref.md).
+
 ## Reproduce of 655rice dataset
 
 ### [Aquila](https://github.com/GooLey1025/Aquila-GS)
