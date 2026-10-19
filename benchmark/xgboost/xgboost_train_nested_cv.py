@@ -849,16 +849,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     if args.max_candidates is not None:
         candidates = candidates[: args.max_candidates]
-    if not candidates:
+    if not holdout and not candidates:
         raise ValueError("The XGBoost HPO grid is empty")
 
     summaries = []
     for trait_name in traits:
         trait_index = trait_names.index(trait_name)
         for outer_fold in outer_folds:
+            search_label = (
+                "bayesian_holdout"
+                if holdout
+                else f"candidates={len(candidates)} inner_folds={inner_count}"
+            )
             print(
                 f"[INFO] XGBoost trait={trait_name} outer_fold={outer_fold} "
-                f"candidates={len(candidates)} inner_folds={inner_count}"
+                f"{search_label}"
             )
             summaries.append(
                 {
