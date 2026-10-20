@@ -217,13 +217,29 @@ def regression_metrics(observed: np.ndarray, predicted: np.ndarray) -> dict[str,
     residual = observed - predicted
     mse = float(np.mean(residual**2))
     denominator = float(np.sum((observed - np.mean(observed)) ** 2))
-    pearson = (
-        float(np.corrcoef(observed, predicted)[0, 1])
-        if len(observed) >= 2
-        and np.std(observed) > 0
-        and np.std(predicted) > 0
-        else math.nan
-    )
+    observed_std = float(np.std(observed))
+    predicted_std = float(np.std(predicted))
+    predictions_finite = bool(np.isfinite(predicted).all())
+    if (
+        len(observed) >= 2
+        and observed_std > 0
+        and predicted_std > 0
+        and predictions_finite
+        and bool(np.isfinite(observed).all())
+    ):
+        pearson = float(np.corrcoef(observed, predicted)[0, 1])
+    elif (
+        len(observed) >= 2
+        and observed_std > 0
+        and predicted_std == 0.0
+        and predictions_finite
+    ):
+        # Full shrinkage predicts one constant. Correlation is undefined;
+        # score that as no linear association so Bayesian search can reject
+        # the penalty and keep sampling.
+        pearson = 0.0
+    else:
+        pearson = math.nan
     return {
         "pearson": pearson,
         "r2": 1.0 - float(np.sum(residual**2)) / denominator

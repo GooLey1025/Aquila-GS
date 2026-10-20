@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import subprocess
 from pathlib import Path
 
@@ -98,6 +99,16 @@ def test_five_metrics() -> None:
     assert metrics["pearson"] == pytest.approx(1.0)
     assert metrics["r2"] == pytest.approx(1.0)
     assert metrics["rmse"] == pytest.approx(0.0)
+
+
+def test_constant_prediction_scores_zero_pearson() -> None:
+    metrics = regression_metrics(
+        np.array([1.0, 2.0, 3.0]), np.array([0.0, 0.0, 0.0])
+    )
+    assert metrics["pearson"] == pytest.approx(0.0)
+    assert math.isnan(regression_metrics(
+        np.array([1.0, 2.0, 3.0]), np.array([1.0, math.nan, 1.0])
+    )["pearson"])
 
 
 def test_strict_json_and_sample_standard_deviation(tmp_path: Path) -> None:
