@@ -47,6 +47,16 @@ def parse_args():
     )
 
     parser.add_argument(
+        '--data-dir',
+        type=str,
+        default=None,
+        help=(
+            'Prepared dataset from aquila_data_hpo.py. Trials load this cache '
+            'instead of decoding the VCF again.'
+        ),
+    )
+
+    parser.add_argument(
         '-o',
         '--output',
         type=str,
@@ -364,6 +374,27 @@ def detect_available_gpus() -> List[int]:
         return []
 
 
+def _prepared_data_mode(data_dir: Path) -> str:
+    """Return metadata data_mode, or an empty string when the cache is incomplete."""
+    metadata_path = data_dir / "metadata.json"
+    if not metadata_path.is_file():
+        return ""
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    return str(metadata.get("data_mode", "")).strip().lower()
+
+
+def _training_log_excerpt(log_file: Path, limit: int = 40) -> str:
+    """Return the last lines of a trial log for the failure report."""
+    if not log_file.is_file():
+        return "training log was not written"
+    text = log_file.read_text(encoding="utf-8", errors="replace").strip()
+    if not text:
+        return "training log is empty"
+    lines = text.splitlines()
+    return "\n".join(lines[-limit:])
+
+
 def worker_process(
     worker_id: int,
     gpu_queue: mp.Queue,
@@ -385,7 +416,8 @@ def worker_process(
     data_split_seed: int,
     data_split_file: Optional[str],
     skew_threshold: float,
-    data_restart: bool
+    data_restart: bool,
+    data_dir: Optional[str] = None,
 ) -> None:
     """
     Worker process that runs HPO trials in parallel.
@@ -458,23 +490,35 @@ def worker_process(
             save_config(trial_config, trial_config_file)
 
             # Build command to call aquila_train.py
-            cmd = [
-                sys.executable,
-                str(aquila_train_script.resolve()),
-                '--config', str(trial_config_file.resolve()),
-                '--vcf', vcf_file,
-                '--pheno', pheno_file,
-                '--encoding-type', encoding_type,
-                '--output', str(trial_output_dir.resolve()),
-                '--seed', str(seed),
-                '--device', 'cuda:0',  # Use cuda:0 since CUDA_VISIBLE_DEVICES is set
-                '--data-split-seed', str(data_split_seed),
-                '--skew-threshold', str(skew_threshold),
-            ]
+            if data_dir:
+                cmd = [
+                    sys.executable,
+                    str(aquila_train_script.resolve()),
+                    '--config', str(trial_config_file.resolve()),
+                    '--data-dir', data_dir,
+                    '--output', str(trial_output_dir.resolve()),
+                    '--seed', str(seed),
+                    '--device', 'cuda:0',
+                    '--precision', 'bf16',
+                ]
+            else:
+                cmd = [
+                    sys.executable,
+                    str(aquila_train_script.resolve()),
+                    '--config', str(trial_config_file.resolve()),
+                    '--vcf', vcf_file,
+                    '--pheno', pheno_file,
+                    '--encoding-type', encoding_type,
+                    '--output', str(trial_output_dir.resolve()),
+                    '--seed', str(seed),
+                    '--device', 'cuda:0',  # Use cuda:0 since CUDA_VISIBLE_DEVICES is set
+                    '--data-split-seed', str(data_split_seed),
+                    '--skew-threshold', str(skew_threshold),
+                ]
 
-            # Add data split file if provided
-            if data_split_file:
-                cmd.extend(['--data-split-file', data_split_file])
+                # Add data split file if provided
+                if data_split_file:
+                    cmd.extend(['--data-split-file', data_split_file])
 
             if use_mixed_precision:
                 cmd.append('--mixed-precision')
@@ -540,9 +584,11 @@ def worker_process(
                     'elapsed_time': elapsed_time
                 })
             else:
+                error_text = _training_log_excerpt(log_file)
                 print(
                     f"Worker {worker_id} (GPU {gpu_id}): Trial {trial_number} failed (return code: {result.returncode})")
                 print(f"  Log: {log_file}")
+                print(error_text)
 
                 # Report failure to study
                 study.tell(trial, state=optuna.trial.TrialState.FAIL)
@@ -551,6 +597,7 @@ def worker_process(
                 result_queue.put({
                     'trial_number': trial_number,
                     'status': 'failed',
+                    'error': error_text,
                     'elapsed_time': elapsed_time
                 })
 
@@ -622,21 +669,44 @@ def main():
         print(f"\n❌ Error loading HPO configuration: {e}")
         return
 
+    data_dir = None
+    if args.data_dir:
+        data_dir_path = Path(args.data_dir)
+        if not data_dir_path.is_absolute():
+            data_dir_path = data_dir_path.resolve()
+        if not data_dir_path.is_dir():
+            print(f"Error: Prepared data directory not found: {data_dir_path}")
+            return
+        data_mode = _prepared_data_mode(data_dir_path)
+        if data_mode != "hpo":
+            print(
+                f"Error: {data_dir_path} has data_mode={data_mode!r}. "
+                "aquila_train_hpo.py only trains a cache written by "
+                "aquila_data_hpo.py (data_mode: hpo)."
+            )
+            return
+        data_dir = str(data_dir_path)
+
     # Override config with command line arguments
     if args.vcf:
-        config['data']['geno_file'] = args.vcf
+        config.setdefault('data', {})['geno_file'] = args.vcf
     if args.pheno:
-        config['data']['pheno_file'] = args.pheno
+        config.setdefault('data', {})['pheno_file'] = args.pheno
     encoding_type_resolved = (
         args.encoding_type
         if args.encoding_type is not None
         else config.get('data', {}).get('encoding_type', 'diploid_onehot')
     )
-    config['data']['encoding_type'] = encoding_type_resolved
+    if not data_dir or 'data' in config:
+        config.setdefault('data', {})['encoding_type'] = encoding_type_resolved
 
-    # Get data paths
-    vcf_file = args.vcf or config['data']['geno_file']
-    pheno_file = args.pheno or config['data']['pheno_file']
+    # Get data paths. Prepared HPO data already contains the encoded matrix.
+    if data_dir:
+        vcf_file = args.vcf or config.get('data', {}).get('geno_file', '')
+        pheno_file = args.pheno or config.get('data', {}).get('pheno_file', '')
+    else:
+        vcf_file = args.vcf or config['data']['geno_file']
+        pheno_file = args.pheno or config['data']['pheno_file']
 
     # Convert data file paths to absolute paths if they are relative
     if vcf_file and not Path(vcf_file).is_absolute():
@@ -697,7 +767,9 @@ def main():
     print(f"  Output directory: {output_dir}")
     print(f"  Study name: {study_name}")
     print(f"  Storage: {storage_url}")
-    if data_split_file:
+    if data_dir:
+        print(f"  Prepared data dir: {data_dir}")
+    elif data_split_file:
         print(f"  Data split file: {data_split_file} (fixed split)")
     else:
         print(f"  Data split seed: {args.data_split_seed} (random split)")
@@ -767,7 +839,8 @@ def main():
                 args.data_split_seed,
                 data_split_file,  # Use converted absolute path
                 args.skew_threshold,
-                args.data_restart
+                args.data_restart,
+                data_dir,
             )
         )
         worker.start()

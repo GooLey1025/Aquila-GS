@@ -11,7 +11,7 @@ import argparse
 import json
 import math
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -65,7 +65,7 @@ LINE_WIDTH = 1.05
 # These cohorts select a different GWAS marker panel for each outer fold, so
 # their results live under results/<cohort>/fold_<k>/ rather than one shared
 # panel summary such as results/lasso/summary.json.
-CURRENT_FOLD_GWAS_COHORTS = frozenset({"Rice655", "Rice1171"})
+CURRENT_FOLD_GWAS_COHORTS = frozenset({"Rice655", "Rice655_10folds", "Rice1171"})
 SHARED_PANEL_SUMMARY_DIRS = {
     "Lasso": "lasso",
     "ElasticNet": "elasticnet",
@@ -273,6 +273,15 @@ def extract_result_rows(payload: Mapping[str, Any]) -> dict[str, float]:
         number = finite_float(result.get("test_pearson"))
         if number is None:
             number = pearson_from_metric_bundle(result.get("metrics"), str(trait))
+        if number is None:
+            for key in (
+                "test_metrics_standardized",
+                "test_metrics_normalized",
+                "test_metrics_original",
+            ):
+                number = pearson_from_metric_bundle(result.get(key), str(trait))
+                if number is not None:
+                    break
         if number is not None:
             grouped.setdefault(str(trait), []).append(number)
     return {
@@ -331,6 +340,14 @@ def extract_aquila_fold_metrics(directory: Path) -> dict[str, float]:
     }
 
 
+def cohort_species(cohort: str) -> str:
+    """Drop a fold-count suffix so Rice655_10folds still matches Rice655 data."""
+    for suffix in ("_10folds", "_5folds"):
+        if cohort.endswith(suffix):
+            return cohort[: -len(suffix)]
+    return cohort
+
+
 def cohort_matches(payload: Mapping[str, Any], cohort: str) -> bool:
     declared = payload.get("cohort")
     if declared is not None:
@@ -340,11 +357,16 @@ def cohort_matches(payload: Mapping[str, Any], cohort: str) -> bool:
         return False
     normalized = str(data_dir).replace("\\", "/").rstrip("/")
     path_names = [part.casefold() for part in Path(normalized).parts]
-    cohort_key = cohort.casefold()
+    keys = {cohort.casefold(), cohort_species(cohort).casefold()}
+    accepted_names = {key for item in keys for key in (item, f"{item}.cv.data")}
     return (
-        Path(normalized).name in {cohort, f"{cohort}.cv.data"}
-        or f"/{cohort}/" in f"{normalized}/"
-        or any(name.startswith(cohort_key) for name in path_names)
+        Path(normalized).name in accepted_names
+        or any(f"/{key}/" in f"{normalized.casefold()}/" for key in keys)
+        or any(
+            name == key or name.startswith(f"{key}.") or name.startswith(f"{key}_")
+            for name in path_names
+            for key in keys
+        )
     )
 
 
@@ -523,17 +545,29 @@ def load_model_result(
 
 
 def load_expected_traits(benchmark_dir: Path, cohort: str) -> list[str]:
-    candidates = (
-        benchmark_dir / f"{cohort}.cv.data" / "metadata.json",
-        benchmark_dir
-        / f"{cohort}.current_fold_GWAS.cv.data"
-        / "fold_0"
-        / "metadata.json",
-        benchmark_dir
-        / f"{cohort}.current_fold_GWAS.vars.cv.data"
-        / "fold_0"
-        / "metadata.json",
+    species = cohort_species(cohort)
+    data_dirs = []
+    if species != cohort:
+        data_dirs.extend(
+            [
+                f"{species}.current_fold_GWAS.cv.blup.data",
+                f"{species}.current_fold_GWAS.vars.cv.blup.data",
+            ]
+        )
+    data_dirs.extend(
+        [
+            f"{cohort}.cv.data",
+            f"{cohort}.current_fold_GWAS.cv.data",
+            f"{cohort}.current_fold_GWAS.vars.cv.data",
+            f"{species}.current_fold_GWAS.cv.data",
+            f"{species}.current_fold_GWAS.vars.cv.data",
+        ]
     )
+    candidates = []
+    for data_dir in data_dirs:
+        root = benchmark_dir / data_dir
+        candidates.append(root / "metadata.json")
+        candidates.append(root / "fold_0" / "metadata.json")
     for metadata_file in candidates:
         if not metadata_file.is_file():
             continue
@@ -891,11 +925,21 @@ def collect_results(
         {trait for result in results for trait in result.values},
         key=str.casefold,
     )
-    traits = expected_traits or discovered_traits
-    for trait in discovered_traits:
-        if trait not in traits:
-            traits.append(trait)
-    return results, traits
+    if expected_traits:
+        allowed = set(expected_traits)
+        results = [
+            replace(
+                result,
+                values={
+                    trait: value
+                    for trait, value in result.values.items()
+                    if trait in allowed
+                },
+            )
+            for result in results
+        ]
+        return results, list(expected_traits)
+    return results, discovered_traits
 
 
 def make_long_table(results: Sequence[ModelResult], traits: Sequence[str]) -> pd.DataFrame:

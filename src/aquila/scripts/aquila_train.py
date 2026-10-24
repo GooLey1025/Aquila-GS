@@ -33,6 +33,19 @@ import pandas as pd
 from aquila.metrics import MetricsCalculator
 
 
+def _loader_split_ids(loader) -> list:
+    """Return every sample ID assigned to this loader's dataset.
+
+    ``drop_last`` only skips a short batch inside an epoch. The saved split
+    records the dataset assignment, including samples that some epochs skip.
+    """
+    dataset = loader.dataset
+    if isinstance(dataset, torch.utils.data.Subset):
+        source = dataset.dataset
+        return [source.sample_ids[int(index)] for index in dataset.indices]
+    return list(dataset.sample_ids)
+
+
 def save_postprocess_data(
     train_loader,
     val_loader,
@@ -458,9 +471,38 @@ def main():
     # Parse arguments
     args = parse_args()
     if args.data_dir:
-        from aquila.scripts.aquila_train_cv_production import train_prepared_model
+        import json
 
         output_dir = args.output or f"outputs/seed_{args.seed}"
+        metadata_path = Path(args.data_dir) / "metadata.json"
+        data_mode = ""
+        if metadata_path.is_file():
+            with metadata_path.open("r", encoding="utf-8") as metadata_handle:
+                data_mode = str(json.load(metadata_handle).get("data_mode", ""))
+        if data_mode.lower() == "hpo":
+            from aquila.scripts.aquila_train_cv_production import (
+                train_hpo_prepared_model,
+            )
+
+            train_hpo_prepared_model(
+                data_dir=args.data_dir,
+                config_path=args.config,
+                output_dir=output_dir,
+                seed=args.seed,
+                precision=args.precision,
+                live_metrics_log=args.live_metrics_log,
+                use_deterministic=args.use_deterministic,
+                device=args.device,
+            )
+            return
+        if data_mode.lower() != "deployment":
+            raise FileNotFoundError(
+                f"{args.data_dir} is not a prepared dataset "
+                f"(data_mode={data_mode!r}). HPO needs a cache from "
+                "aquila_data_hpo.py; full-data training needs a deployment cache."
+            )
+        from aquila.scripts.aquila_train_cv_production import train_prepared_model
+
         train_prepared_model(
             data_dir=args.data_dir,
             config_path=args.config,
@@ -627,6 +669,7 @@ def main():
         normalize_regression=train_config.get('normalize_regression', True),
         encoding_type=encoding_type,
         variant_type=config.get('data', {}).get('variant_type'),
+        id_prefix=config.get('data', {}).get('id_prefix'),
         cache_dir=output_dir if args.save_cache else None,
         data_restart=args.data_restart,
         skew_threshold=args.skew_threshold,
@@ -697,32 +740,23 @@ def main():
     if test_loader:
         print_rank0(f"Test samples: {len(test_loader.dataset)}")
 
-    # Save data split information (sample IDs with train/valid/test flags)
+    # Save the dataset split. Do not walk the loaders: drop_last omits a
+    # remainder batch and would leave those training samples out of the file.
     if rank == 0:
-        split_data = []
-
-        # Collect train sample IDs
-        for batch in train_loader:
-            if 'sample_id' in batch:
-                for sample_id in batch['sample_id']:
-                    split_data.append(
-                        {'Sample_ID': sample_id, 'Split': 'train'})
-
-        # Collect validation sample IDs
+        split_data = [
+            {'Sample_ID': sample_id, 'Split': 'train'}
+            for sample_id in _loader_split_ids(train_loader)
+        ]
         if val_loader:
-            for batch in val_loader:
-                if 'sample_id' in batch:
-                    for sample_id in batch['sample_id']:
-                        split_data.append(
-                            {'Sample_ID': sample_id, 'Split': 'valid'})
-
-        # Collect test sample IDs
+            split_data.extend(
+                {'Sample_ID': sample_id, 'Split': 'valid'}
+                for sample_id in _loader_split_ids(val_loader)
+            )
         if test_loader:
-            for batch in test_loader:
-                if 'sample_id' in batch:
-                    for sample_id in batch['sample_id']:
-                        split_data.append(
-                            {'Sample_ID': sample_id, 'Split': 'test'})
+            split_data.extend(
+                {'Sample_ID': sample_id, 'Split': 'test'}
+                for sample_id in _loader_split_ids(test_loader)
+            )
 
         # Save to TSV file
         if split_data:
@@ -965,8 +999,8 @@ def main():
         val_loader=val_loader,
         num_regression_tasks=num_regression_tasks,
         num_classification_tasks=num_classification_tasks,
-        learning_rate=train_config.get('learning_rate', 1e-4),
-        weight_decay=train_config.get('weight_decay', 1e-5),
+        learning_rate=float(train_config.get('learning_rate', 1e-4)),
+        weight_decay=float(train_config.get('weight_decay', 1e-5)),
         loss_type=train_config.get('loss_type', 'mse'),
         uncertainty_weighting=train_config.get('uncertainty_weighting', True),
         device=device,

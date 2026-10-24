@@ -188,11 +188,11 @@ def load_prepared_data(directory: str | Path) -> PreparedData:
             metadata,
             features,
         )
-    elif data_mode == "deployment":
+    elif data_mode in {"deployment", "hpo"}:
         _validate_deployment_artifacts(data_path, metadata, sample_count)
     else:
         raise ValueError(
-            "metadata data_mode must be either 'nested_cv' or 'deployment'"
+            "metadata data_mode must be 'nested_cv', 'deployment', or 'hpo'"
         )
 
     return PreparedData(
@@ -267,8 +267,13 @@ def _validate_deployment_artifacts(
                 "Production samples.tsv does not match metadata sample order"
             )
     fold_count = metadata.get("cv_folds")
-    if not isinstance(fold_count, int) or fold_count < 2:
-        raise ValueError("metadata cv_folds must be an integer of at least two")
+    data_mode = str(metadata.get("data_mode", "deployment")).lower()
+    minimum_folds = 1 if data_mode == "hpo" else 2
+    if not isinstance(fold_count, int) or fold_count < minimum_folds:
+        raise ValueError(
+            "metadata cv_folds must be an integer of at least "
+            f"{minimum_folds}"
+        )
     all_indices = set(range(sample_count))
     observed_valid: set[int] = set()
     for fold_id in range(fold_count):
@@ -295,7 +300,7 @@ def _validate_deployment_artifacts(
                 f"Missing production fold caches in {fold_path}: "
                 + ", ".join(missing)
             )
-    if observed_valid != all_indices:
+    if data_mode != "hpo" and observed_valid != all_indices:
         raise ValueError("Production validation folds do not cover every sample")
     full_path = data_path / "full"
     for name in ("Y_processed.pt", "preprocessing.json"):

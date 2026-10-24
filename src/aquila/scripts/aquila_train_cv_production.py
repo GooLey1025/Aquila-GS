@@ -215,6 +215,18 @@ def load_deployment_folds(prepared: PreparedData) -> list[DeploymentFold]:
                 valid=np.load(fold_path / "valid_idx.npy", allow_pickle=False),
             )
         )
+    if str(prepared.metadata.get("data_mode", "")).lower() == "hpo":
+        if len(folds) != 1:
+            raise ValueError("HPO prepared data must contain exactly one fold")
+        split = folds[0]
+        train = np.asarray(split.train, dtype=np.int64)
+        valid = np.asarray(split.valid, dtype=np.int64)
+        all_indices = np.arange(prepared.sample_count, dtype=np.int64)
+        if np.intersect1d(train, valid).size:
+            raise ValueError("HPO train and validation sets overlap")
+        if not np.array_equal(np.sort(np.concatenate((train, valid))), all_indices):
+            raise ValueError("HPO split does not cover every prepared sample")
+        return folds
     validate_deployment_folds(folds, prepared.sample_count)
     return folds
 
@@ -1415,6 +1427,91 @@ def _refit_full_dataset(
         "scheduler_epochs": scheduler_epochs,
     }
     return selected_config, processor, training, checkpoint, training_seed
+
+
+def train_hpo_prepared_model(
+    *,
+    data_dir: str | Path,
+    config_path: str | Path,
+    output_dir: str | Path,
+    seed: int,
+    precision: str = "bf16",
+    live_metrics_log: bool = False,
+    use_deterministic: bool = False,
+    device: str | None = None,
+) -> None:
+    """Train the one fixed split stored by aquila_data_hpo.py.
+
+    Features are uploaded once when ``train.gpu_resident`` is true. The
+    validation Pearson correlation is written to ``best_metrics.json`` so
+    ``aquila_train_hpo.py`` can score the trial.
+    """
+    output_directory = Path(output_dir)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    prepared = load_prepared_data(data_dir)
+    if str(prepared.metadata.get("data_mode", "")).lower() != "hpo":
+        raise ValueError(
+            "HPO split training requires data prepared by aquila_data_hpo.py"
+        )
+    config = load_config(config_path)
+    config.setdefault("train", {})
+    config["train"]["precision"] = precision
+    config["train"]["seed"] = int(seed)
+    resolve_train_deterministic(
+        config,
+        True if use_deterministic else None,
+    )
+    if live_metrics_log:
+        config["train"]["live_metrics_log"] = True
+    config["train"].pop("mixed_precision", None)
+    _validate_preprocessing_cache(prepared, config)
+    regression_tasks, classification_tasks = _task_lists(prepared)
+    folds = load_deployment_folds(prepared)
+    resolved_device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+    if resolved_device == "cuda":
+        resolved_device = "cuda:0"
+    configure_cuda_runtime(
+        resolved_device,
+        deterministic=train_deterministic_enabled(config),
+    )
+    normalized_hpo = normalize_hpo_config(config.get("hpo", {}))
+    training = _train_deployment_fold(
+        prepared=prepared,
+        config=config,
+        split=folds[0],
+        candidate_id=0,
+        parameters={},
+        device=resolved_device,
+        regression_tasks=regression_tasks,
+        classification_tasks=classification_tasks,
+        metric=str(normalized_hpo.get("metric", "best/val_r")),
+        direction=str(normalized_hpo.get("direction", "maximize")),
+        patience=int(config["train"].get("early_stopping_patience", 40)),
+        loader_options=_loader_kwargs(config.get("train", {})),
+        metrics_log_path=(
+            output_directory / "metrics.jsonl" if live_metrics_log else None
+        ),
+    )
+    metrics = _json_safe(dict(training.best_metrics))
+    if "avg_pearson" not in metrics:
+        raise KeyError("HPO training did not return avg_pearson")
+    metrics["val_r"] = float(metrics["avg_pearson"])
+    metrics["val_pearson"] = float(metrics["avg_pearson"])
+    _write_json(output_directory / "best_metrics.json", metrics)
+    torch.save(
+        {
+            "model_state_dict": training.best_state_dict,
+            "best_metrics": metrics,
+            "best_epoch": int(training.best_epoch),
+            "config": config,
+            "metadata": prepared.metadata,
+        },
+        output_directory / "best_model.pt",
+    )
+    print(
+        f"HPO split fold 0 finished at epoch {training.best_epoch} "
+        f"with val_r={metrics['val_r']:.6f}"
+    )
 
 
 def train_prepared_model(
