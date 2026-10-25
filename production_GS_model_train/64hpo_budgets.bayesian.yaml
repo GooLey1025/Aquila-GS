@@ -1,7 +1,7 @@
 hpo:
   enabled: true
   method: bayesian
-  n_trials: 64
+  n_trials: 200
   metric: best/val_r
   direction: maximize
   seed: 42
@@ -32,7 +32,7 @@ train:
   loss_type: mse
   normalize_regression: true
   uncertainty_weighting: true
-  early_stopping_patience: 40
+  early_stopping_patience: 5
   # Ignore tiny valid_r gains; still consume early-stopping patience.
   early_stopping_min_delta: 0.0001
   # clip_grad_norm_ syncs each step (~1–2pp util); null favors sustained ~99%.

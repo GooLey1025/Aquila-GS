@@ -12,7 +12,7 @@ VCF_FILE=species_data/wheat994/wheat994.coding.ld.vcf.gz
 
 COHORT=Rice1171_pheno_10folds
 PHENO_FILE=species_data/Rice1171/1171rice.pheno
-VCF_FILE=species_data/Rice1171/1171rice.final.imputed.WG_LD.vcf.gz
+VCF_FILE=species_data/Rice1171/Rice1171.coding.ld.vcf.gz
 
 export PATH="$CONDA_PREFIX/bin:$PATH"
 
@@ -21,7 +21,6 @@ aquila_cv.py --phenotype $PHENO_FILE -o $COHORT.nested_cv.json --outer-folds 10 
 
 if [[ "$COHORT" == *Rice1171* ]]; then
   aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --id-prefix "SNP-" --fold-mapping $COHORT.nested_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite
-  aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --fold-mapping $COHORT.nested_cv.json -o $COHORT.vars.cv.data --save-raw-genotype --overwrite
 else
   # For Aquila-SNP data
   aquila_data_cv.py --vcf $VCF_FILE --phenotype $PHENO_FILE --encoding-type diploid_onehot --variant-type snp --fold-mapping $COHORT.nested_cv.json -o $COHORT.cv.data --save-raw-genotype --overwrite

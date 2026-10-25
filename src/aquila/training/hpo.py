@@ -483,6 +483,60 @@ round_mean_epoch = half_up_mean_epoch
 round_median_epoch = half_up_median_epoch
 
 
+def select_one_sd_epoch(
+    fold_scores: Sequence[Mapping[int, float]],
+    *,
+    scale: float = 1.0,
+    direction: str = "maximize",
+) -> Dict[str, Any]:
+    """Pick the earliest epoch whose CV mean lies within ``scale`` SDs of the best.
+
+    The standard deviation is scikit-learn's ``std_test_score`` at the epoch
+    with the best mean: the population standard deviation of that epoch's fold
+    scores. ``scale=1`` is one SD and ``scale=2`` is two SD. Only epochs
+    observed by every fold are eligible.
+    """
+    if scale <= 0:
+        raise ValueError("epoch selection scale must be positive")
+    if direction not in {"maximize", "minimize"}:
+        raise ValueError("direction must be maximize or minimize")
+    if not fold_scores:
+        raise ValueError("At least one fold curve is required")
+    common = set(int(epoch) for epoch in fold_scores[0])
+    for curve in fold_scores[1:]:
+        common &= set(int(epoch) for epoch in curve)
+    if not common:
+        raise ValueError("No epoch is present in every fold curve")
+    epochs = np.asarray(sorted(common), dtype=int)
+    scores = np.asarray(
+        [[float(curve[int(epoch)]) for epoch in epochs] for curve in fold_scores],
+        dtype=float,
+    )
+    mean = scores.mean(axis=0)
+    best_index = int(np.argmax(mean) if direction == "maximize" else np.argmin(mean))
+    std_at_best = float(np.std(scores[:, best_index], ddof=0))
+    best_mean = float(mean[best_index])
+    if direction == "maximize":
+        threshold = best_mean - float(scale) * std_at_best
+        eligible = np.flatnonzero(mean + 1e-8 >= threshold)
+    else:
+        threshold = best_mean + float(scale) * std_at_best
+        eligible = np.flatnonzero(mean - 1e-8 <= threshold)
+    chosen_index = int(eligible[0])
+    return {
+        "epoch": int(epochs[chosen_index]),
+        "best_mean_epoch": int(epochs[best_index]),
+        "best_mean": best_mean,
+        "std_at_best": std_at_best,
+        "scale": float(scale),
+        "threshold": float(threshold),
+        "mean_at_epoch": float(mean[chosen_index]),
+        "n_folds": int(scores.shape[0]),
+        "complete_epoch_min": int(epochs[0]),
+        "complete_epoch_max": int(epochs[-1]),
+    }
+
+
 def _grid_values(name: str, definition: Mapping[str, Any]) -> list[Any]:
     if "values" in definition:
         values = list(definition["values"])

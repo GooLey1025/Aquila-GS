@@ -63,6 +63,7 @@ from aquila.training.hpo import (
     parameter_key,
     run_hpo,
     select_best_candidate,
+    select_one_sd_epoch,
     unique_bayesian_trial,
 )
 from aquila.training.trainer import (
@@ -198,6 +199,27 @@ def parse_args() -> argparse.Namespace:
         "--use-deterministic",
         action="store_true",
         help="Force deterministic CUDA algorithms.",
+    )
+    parser.add_argument(
+        "--epoch-selection",
+        choices=("one-sd", "median"),
+        default="one-sd",
+        help=(
+            "How cv-refit chooses the full-data training length. "
+            "one-sd uses the earliest epoch whose mean validation score is "
+            "within --epoch-selection-scale standard deviations of the best "
+            "mean. median uses the half-up median of the per-fold best epochs. "
+            "Ignored in per-fold mode."
+        ),
+    )
+    parser.add_argument(
+        "--epoch-selection-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Standard-deviation multiplier for --epoch-selection one-sd. "
+            "1 selects within one SD, 1.5 within 1.5 SD, and 2 within two SD."
+        ),
     )
     return parser.parse_args()
 
@@ -1319,6 +1341,7 @@ def _refit_full_dataset(
     cv_seed: int,
     training_seed: int | None = None,
     metrics_log_path: str | Path | None = None,
+    refit_epochs: int | None = None,
 ):
     if hpo_result is None:
         selected_config = copy.deepcopy(dict(config))
@@ -1373,7 +1396,9 @@ def _refit_full_dataset(
             training_seed,
         ),
     )
-    if hpo_result is not None:
+    if refit_epochs is not None:
+        final_epoch = int(refit_epochs)
+    elif hpo_result is not None:
         final_epoch = int(hpo_result.best.final_epoch)
     elif train_config.get("fixed_epochs") is not None:
         final_epoch = int(train_config["fixed_epochs"])
@@ -1541,6 +1566,71 @@ def train_prepared_model(
     )
 
 
+def _load_candidate_valid_curves(
+    output_directory: Path,
+    candidate_id: int,
+    fold_count: int,
+) -> list[Dict[int, float]]:
+    """Read current-epoch validation scores for one HPO candidate."""
+    curves: list[Dict[int, float]] = []
+    missing: list[str] = []
+    for fold_id in range(fold_count):
+        path = (
+            output_directory
+            / f"candidate_{candidate_id}"
+            / f"fold_{fold_id}"
+            / "metrics.jsonl"
+        )
+        if not path.is_file():
+            missing.append(str(path))
+            continue
+        curve: Dict[int, float] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            curve[int(row["epoch"])] = float(row["valid_r"])
+        curves.append(curve)
+    if missing:
+        raise FileNotFoundError(
+            "One-SD epoch selection needs the per-epoch validation logs "
+            "written by --live-metrics-log. Missing: " + ", ".join(missing)
+        )
+    return curves
+
+
+def _select_refit_epoch(
+    *,
+    args: argparse.Namespace,
+    hpo_result: HPOResult,
+    output_directory: Path,
+    fold_count: int,
+) -> tuple[int, Dict[str, Any]]:
+    """Choose the full-data refit length from the selected candidate."""
+    median_epoch = int(hpo_result.best.final_epoch)
+    method = str(args.epoch_selection)
+    selection: Dict[str, Any] = {
+        "method": method,
+        "median_epoch": median_epoch,
+    }
+    if method == "median":
+        selection["epoch"] = median_epoch
+        return median_epoch, selection
+    scale = float(args.epoch_selection_scale)
+    curves = _load_candidate_valid_curves(
+        output_directory,
+        int(hpo_result.best.candidate_id),
+        fold_count,
+    )
+    details = select_one_sd_epoch(
+        curves,
+        scale=scale,
+        direction=str(hpo_result.direction),
+    )
+    selection.update(details)
+    return int(details["epoch"]), selection
+
+
 def _run_cv_refit_mode(
     *,
     args: argparse.Namespace,
@@ -1572,6 +1662,17 @@ def _run_cv_refit_mode(
         live_metrics_log=bool(train_config.get("live_metrics_log", False)),
     )
     hpo_result = _run_hpo(context, gpu_ids)
+    refit_epochs, epoch_selection = _select_refit_epoch(
+        args=args,
+        hpo_result=hpo_result,
+        output_directory=output_directory,
+        fold_count=len(folds),
+    )
+    print(
+        "Refit epoch selection: "
+        f"{epoch_selection['method']} -> epoch {refit_epochs} "
+        f"(median of fold best epochs {epoch_selection['median_epoch']})"
+    )
     configure_cuda_runtime(
         device,
         deterministic=train_deterministic_enabled(config),
@@ -1587,6 +1688,7 @@ def _run_cv_refit_mode(
             loader_options=_loader_kwargs(train_config),
             fold_count=len(folds),
             cv_seed=cv_seed,
+            refit_epochs=refit_epochs,
         )
     )
     torch.save(checkpoint, output_directory / "best_model.pt")
@@ -1604,7 +1706,9 @@ def _run_cv_refit_mode(
             "best_candidate_id": hpo_result.best.candidate_id,
             "best_parameters": dict(hpo_result.best.parameters),
             "best_validation_mean": hpo_result.best.objective,
-            "final_epoch": hpo_result.best.final_epoch,
+            "median_epoch": epoch_selection["median_epoch"],
+            "epoch_selection": epoch_selection,
+            "final_epoch": refit_epochs,
             "candidates": _candidate_records(hpo_result),
         },
     )
@@ -1641,7 +1745,9 @@ def _run_cv_refit_mode(
             "best_validation_mean": hpo_result.best.objective,
             "selected_hyperparameters": dict(hpo_result.best.parameters),
             "fold_best_epochs": list(hpo_result.best.best_epochs),
-            "final_epoch": hpo_result.best.final_epoch,
+            "median_epoch": epoch_selection["median_epoch"],
+            "epoch_selection": epoch_selection,
+            "final_epoch": refit_epochs,
             "scheduler_epochs": checkpoint["scheduler_epochs"],
             "data_dir": str(Path(args.data_dir).resolve()),
             "config": str(Path(args.config).resolve()),

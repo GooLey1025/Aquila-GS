@@ -25,10 +25,8 @@ aquila_data_cv_production.py \
 
 aquila_train_cv_production.py \
   --data-dir 655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.production.10folds.data \
-  --config 64hpo_budgets.bayesian.yaml \
-  --fold 0 \
-  --n-trials 500 \
-  -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.fold0-hpo \
+  --config aquila-snp.hpo.yaml \
+  -o results/655rice.msmp_panel.imputed.snp_indel_sv.clean.aquila-snp.10folds-hpo \
   --precision bf16 --live-metrics-log \
   --use-deterministic --overwrite
 
