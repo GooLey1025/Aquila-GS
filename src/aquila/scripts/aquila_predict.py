@@ -164,6 +164,15 @@ def parse_args():
         default=None,
         help='Path to normalization_stats.pkl file (optional, will look in output-dir if not provided)'
     )
+    parser.add_argument(
+        '--preprocessing',
+        type=str,
+        default=None,
+        help=(
+            'Fitted phenotype preprocessing JSON. Used when the checkpoint '
+            'does not embed a preprocessor, such as an HPO trial checkpoint.'
+        ),
+    )
 
     return parser.parse_args()
 
@@ -965,6 +974,11 @@ def main():
 
     serialized_preprocessing = checkpoint.get('preprocessing')
     preprocessor = load_embedded_preprocessor(serialized_preprocessing)
+    if preprocessor is None and args.preprocessing:
+        from aquila.data.preprocessing import PerTraitPreprocessor
+
+        preprocessor = PerTraitPreprocessor.load_json(args.preprocessing)
+        print(f"\nLoaded preprocessing: {args.preprocessing}")
     is_nested_checkpoint = any(
         key in checkpoint for key in ('config', 'metadata', 'preprocessing')
     )

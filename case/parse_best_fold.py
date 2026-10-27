@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Parse results_summary.tsv to find the best fold (highest val_r_mean),
-then return the path to data_split.tsv for that fold with a specified seed.
+then return that fold's generated data_split.tsv.
+
+The fold split is written once to seed_0 and shared by every training seed.
+Per-seed copies can omit samples when they are saved from a DataLoader.
 """
 
 import argparse
@@ -16,7 +19,7 @@ def parse_best_fold(results_summary_path, output_dir=None, default_seed=42, verb
     Args:
         results_summary_path: Path to results_summary.tsv
         output_dir: If provided, write the best fold info to this directory
-        default_seed: Seed to use for data_split.tsv (default: 42)
+        default_seed: Training-seed directory used only when seed_0 is absent.
         verbose: If True, print detailed info (default: True)
     
     Returns:
@@ -42,9 +45,15 @@ def parse_best_fold(results_summary_path, output_dir=None, default_seed=42, verb
     # Get the directory containing results_summary.tsv
     results_dir = os.path.dirname(os.path.abspath(results_summary_path))
     
-    # Construct path to data_split.tsv with specified seed
-    data_split_path = os.path.join(results_dir, best_fold, f"seed_{default_seed}", "data_split.tsv")
-    
+    # seed_0 holds the fold split generated before training. Training-seed
+    # copies are not a different split.
+    data_split_path = os.path.join(results_dir, best_fold, "seed_0", "data_split.tsv")
+
+    if not os.path.exists(data_split_path):
+        data_split_path = os.path.join(
+            results_dir, best_fold, f"seed_{default_seed}", "data_split.tsv"
+        )
+
     # Check if the file exists
     if not os.path.exists(data_split_path):
         # Try to find any available seed for this fold
@@ -81,7 +90,13 @@ def main():
     parser = argparse.ArgumentParser(description='Parse best fold from results_summary.tsv')
     parser.add_argument('results_summary', help='Path to results_summary.tsv')
     parser.add_argument('-o', '--output-dir', help='Output directory for best_fold_info.txt', default=None)
-    parser.add_argument('-s', '--seed', type=int, default=42, help='Seed to use (default: 42)')
+    parser.add_argument(
+        '-s',
+        '--seed',
+        type=int,
+        default=42,
+        help='Fallback training-seed directory when seed_0/data_split.tsv is absent',
+    )
     parser.add_argument('--print-only-path', action='store_true', help='Print ONLY the data_split.tsv path, nothing else (for shell scripts)')
 
     args = parser.parse_args()

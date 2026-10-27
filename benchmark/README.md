@@ -212,7 +212,7 @@ done
 BayesCpi uses the single fixed configuration in `bayescpi/configs/nested_cv.yaml`, so the shared R benchmark runner automatically skips inner CV and fits once on the complete outer-training partition. `niter`, `nburn`, and `thin` control MCMC sampling accuracy, convergence, and runtime; they are fixed before evaluation rather than selected using outer-test performance. Convergence should be checked through MCMC diagnostics when changing these values. The historical script name is retained for command-line compatibility.
 
 ```sh
-pcd bayescpi
+cd bayescpi
 for FOLD in {0..9}; do
   python bayescpi_nested_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \

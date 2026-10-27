@@ -532,6 +532,7 @@ def create_data_loaders(
     data_split_seed: int = 42,
     augmentation_config: Optional[Dict] = None,
     data_split_file: Optional[str] = None,
+    id_prefix: Optional[str] = None,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], Optional[Dict]]:
     """
     Create train/val/test data loaders with z-score normalization for regression targets.
@@ -730,7 +731,12 @@ def create_data_loaders(
 
     if is_multi_branch:
         # Multi-branch VCF: returns dict
-        variant_data = parse_geno_with_encoding(geno_path, encoding_type, variant_type_from_param)
+        variant_data = parse_geno_with_encoding(
+            geno_path,
+            encoding_type,
+            variant_type_from_param,
+            id_prefix=id_prefix,
+        )
         # Extract sample IDs from first variant type
         first_variant_type = list(variant_data.keys())[0]
         sample_ids = variant_data[first_variant_type]['sample_ids']
@@ -740,7 +746,12 @@ def create_data_loaders(
     else:
         # Single-branch: returns dict (new format) or tuple (old format)
         # Supports: token, diploid_onehot, snp_vcf, indel_vcf, sv_vcf
-        result = parse_geno_with_encoding(geno_path, encoding_type, variant_type_from_param)
+        result = parse_geno_with_encoding(
+            geno_path,
+            encoding_type,
+            variant_type_from_param,
+            id_prefix=id_prefix,
+        )
         if isinstance(result, dict):
             snp_matrix = result['matrix']
             sample_ids = result['sample_ids']
