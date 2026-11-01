@@ -41,12 +41,12 @@ train:
   loss_type: mse
   normalize_regression: true
   uncertainty_weighting: true
-  early_stopping_patience: 40
+  early_stopping_patience: 15
   early_stopping_min_delta: 0.0001
   gradient_clip_norm: null
   scheduler_type: cosine_warmup
   learning_rate: 1e-3
-  num_epochs: 200
+  num_epochs: 100
   scheduler_params:
     warmup_epochs: 20
     warmup_start_factor: 0.01
