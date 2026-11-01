@@ -10,7 +10,6 @@ Generate one SampleID validation-fold map on the phenotype table (VCF ∩ phenot
 aquila_cv.py \
   --phenotype ../benchmark/Rice655.pheno \
   --outer-folds 10 \
-  --inner-folds 2 \
   --seed 42 \
   --min-observed 10 \
   -o 655rice.production.more_sv_markers.final.imputed.panel.10folds.nested_cv.json
@@ -94,6 +93,134 @@ aquila_train_cv_production.py \
   --data-dir 655rice.production.more_sv_markers.final.imputed.panel.aquila-snp.PH_BLUP.per-fold.10folds.data \
   --config aquila-snp.hpo.yaml \
   -o 655rice.production.more_sv_markers.final.imputed.panel.aquila-snp.PH_BLUP.per-fold.10folds.hpo \
+  --precision bf16 \
+  --live-metrics-log \
+  --use-deterministic \
+  --overwrite
+```
+
+## Per-fold Aquila-SNP: HD_BLUP
+
+```bash
+aquila_data_cv_production.py \
+  --vcf 655rice.production.more_sv_markers.final.imputed.panel.vcf.gz \
+  --phenotype ../benchmark/Rice655.pheno \
+  --traits HD_BLUP \
+  --encoding-type diploid_onehot \
+  --variant-type snp \
+  --id-prefix SNP- \
+  --folds 10 \
+  --seed 42 \
+  --cv-mapping 655rice.production.more_sv_markers.final.imputed.panel.10folds.nested_cv.json \
+  -o 655rice.production.more_sv_markers.final.imputed.panel.aquila-snp.HD_BLUP.per-fold.10folds.data \
+  --overwrite
+
+aquila_train_cv_production.py \
+  --mode per-fold \
+  --data-dir 655rice.production.more_sv_markers.final.imputed.panel.aquila-snp.HD_BLUP.per-fold.10folds.data \
+  --config aquila-snp.hpo.yaml \
+  -o 655rice.production.more_sv_markers.final.imputed.panel.aquila-snp.HD_BLUP.per-fold.10folds.hpo \
+  --precision bf16 \
+  --live-metrics-log \
+  --use-deterministic \
+  --overwrite
+```
+
+## Per-fold Aquila-Vars: multi-trait
+
+Aquila-Vars uses the same fold map and per-fold training as Aquila-SNP. Leave out `--variant-type` and `--id-prefix` so SNP, INDEL, and SV stay as separate branches.
+
+```bash
+aquila_data_cv_production.py \
+  --vcf 655rice.production.more_sv_markers.final.imputed.panel.vcf.gz \
+  --phenotype ../benchmark/Rice655.pheno \
+  --encoding-type diploid_onehot \
+  --folds 10 \
+  --seed 42 \
+  --cv-mapping 655rice.production.more_sv_markers.final.imputed.panel.10folds.nested_cv.json \
+  -o 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.multi_trait.per-fold.10folds.data \
+  --overwrite
+
+aquila_train_cv_production.py \
+  --mode per-fold \
+  --data-dir 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.multi_trait.per-fold.10folds.data \
+  --config aquila-vars.hpo.yaml \
+  -o 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.multi_trait.per-fold.10folds.hpo \
+  --precision bf16 \
+  --live-metrics-log \
+  --use-deterministic \
+  --overwrite
+```
+
+## Per-fold Aquila-Vars: GYP_BLUP
+
+```bash
+aquila_data_cv_production.py \
+  --vcf 655rice.production.more_sv_markers.final.imputed.panel.vcf.gz \
+  --phenotype ../benchmark/Rice655.pheno \
+  --traits GYP_BLUP \
+  --encoding-type diploid_onehot \
+  --folds 10 \
+  --seed 42 \
+  --cv-mapping 655rice.production.more_sv_markers.final.imputed.panel.10folds.nested_cv.json \
+  -o 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.GYP_BLUP.per-fold.10folds.data \
+  --overwrite
+
+aquila_train_cv_production.py \
+  --mode per-fold \
+  --data-dir 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.GYP_BLUP.per-fold.10folds.data \
+  --config aquila-vars.hpo.yaml \
+  -o 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.GYP_BLUP.per-fold.10folds.hpo \
+  --precision bf16 \
+  --live-metrics-log \
+  --use-deterministic \
+  --overwrite
+```
+
+## Per-fold Aquila-Vars: HD_BLUP
+
+```bash
+aquila_data_cv_production.py \
+  --vcf 655rice.production.more_sv_markers.final.imputed.panel.vcf.gz \
+  --phenotype ../benchmark/Rice655.pheno \
+  --traits HD_BLUP \
+  --encoding-type diploid_onehot \
+  --folds 10 \
+  --seed 42 \
+  --cv-mapping 655rice.production.more_sv_markers.final.imputed.panel.10folds.nested_cv.json \
+  -o 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.HD_BLUP.per-fold.10folds.data \
+  --overwrite
+
+aquila_train_cv_production.py \
+  --mode per-fold \
+  --data-dir 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.HD_BLUP.per-fold.10folds.data \
+  --config aquila-vars.hpo.yaml \
+  -o 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.HD_BLUP.per-fold.10folds.hpo \
+  --precision bf16 \
+  --live-metrics-log \
+  --use-deterministic \
+  --overwrite
+```
+
+## Per-fold Aquila-Vars: PH_BLUP
+
+```bash
+aquila_data_cv_production.py \
+  --vcf 655rice.production.more_sv_markers.final.imputed.panel.vcf.gz \
+  --phenotype ../benchmark/Rice655.pheno \
+  --traits PH_BLUP \
+  --encoding-type diploid_onehot \
+  --folds 10 \
+  --seed 42 \
+  --cv-mapping 655rice.production.more_sv_markers.final.imputed.panel.10folds.nested_cv.json \
+  -o 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.PH_BLUP.per-fold.10folds.data \
+  --overwrite
+
+aquila_train_cv_production.py \
+  --mode per-fold \
+  --data-dir 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.PH_BLUP.per-fold.10folds.data \
+  --config aquila-vars.hpo.yaml \
+  -o 655rice.production.more_sv_markers.final.imputed.panel.aquila-vars.PH_BLUP.per-fold.10folds.hpo \
   --precision bf16 \
   --live-metrics-log \
   --use-deterministic \
