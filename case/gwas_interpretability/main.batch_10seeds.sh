@@ -1,15 +1,22 @@
-# Population-level integrated gradients for the 10 Rice655 r2=0.045
+# Population-level integrated gradients for the 10 Rice655 production
 # Aquila-SNP seeds (42, plus 43-51), then the GWAS comparison PNGs.
-# Seed 42 is the original production checkpoint. Seeds 43-51 are the
-# extra initialization refits. All PNGs are copied into PNG_DIR.
-export MODEL_ROOT=../../production_GS_model_train/results/655rice.r2_0.045.aquila-snp
-export VCF=../../production_GS_model_train/655rice.r2_0.045.panel.vcf.gz
+# Seed 42 is the existing multi-trait one-sd production checkpoint.
+# Seeds 43-51 are refit on the same data and locked hyperparameters for
+# the same 16 epochs (scheduler length stays 30). All PNGs are copied into PNG_DIR.
+export MODEL_ROOT=../../production_GS_model_train/655rice.production.more_sv_markers.final.imputed.panel.aquila-snp.production.multi_trait.one-sd.10folds.hpo
+export DATA_DIR=../../production_GS_model_train/655rice.production.more_sv_markers.final.imputed.panel.aquila-snp.production.multi_trait.one-sd.10folds.data
+export LOCKED_CONFIG=./production.multi_trait.one-sd.seed_refit.yaml
+export VCF=../../production_GS_model_train/655rice.production.more_sv_markers.final.imputed.panel.vcf.gz
 export PHENO=../../benchmark/Rice655.pheno
-rsync -rlthP 6000:/data3/home/gulei/projects/GraphPan/Multi_Source_Marker_Panel_generation/655rice.full_marker_panel/marker_selection/current_gwas/association_results ./Rice655.full_marker_panel_gwas_results
-export GWAS_DIR=./Rice655.full_marker_panel_gwas_results/association_results
-rsync -rlthP 6000:/data3/home/gulei/projects/GraphPan/Multi_Source_Marker_Panel_generation/655rice.full_marker_panel/marker_panel/655rice.canonical_markers.tsv .
+if [[ ! -e ./Rice655.full_marker_panel_gwas_results ]]; then
+  rsync -rlthP 6000:/data3/home/gulei/projects/GraphPan/Multi_Source_Marker_Panel_generation/655rice.full_marker_panel/marker_selection/current_gwas/association_results ./Rice655.full_marker_panel_gwas_results
+fi
+export GWAS_DIR=./Rice655.full_marker_panel_gwas_results
+if [[ ! -e ./655rice.canonical_markers.tsv ]]; then
+  rsync -rlthP 6000:/data3/home/gulei/projects/GraphPan/Multi_Source_Marker_Panel_generation/655rice.full_marker_panel/marker_panel/655rice.canonical_markers.tsv .
+fi
 export MARKERS=./655rice.canonical_markers.tsv
-export PREFIX=655rice.r2_0.045.aquila-snp
+export PREFIX=655rice.production.gwas_interpretability
 export PNG_DIR=./ig_png_10seeds
 export WORK_DIR=./ig_10seeds_work
 
@@ -30,6 +37,17 @@ run_seed() {
     MODEL_DIR="$MODEL_ROOT"
   else
     MODEL_DIR="${MODEL_ROOT}/seeds/seed_${SEED}"
+    if [[ ! -f "${MODEL_DIR}/best_model.pt" ]]; then
+      echo "[train] seed ${SEED} gpu ${GPU}"
+      aquila_train.py \
+        --data-dir "$DATA_DIR" \
+        --config "$LOCKED_CONFIG" \
+        --seed "$SEED" \
+        -o "$MODEL_DIR" \
+        --precision bf16 \
+        --live-metrics-log \
+        --use-deterministic
+    fi
   fi
   local SEED_WORK="${WORK_DIR}/seed_${SEED}"
   mkdir -p "$SEED_WORK"
@@ -100,4 +118,4 @@ run_seed() {
 }
 
 export -f run_seed
-parallel --line-buffer --tagstring 'seed {1}' -j 3 run_seed {1} {%} ::: "${SEEDS[@]}"
+parallel --line-buffer --tagstring 'seed {1}' -j 2 run_seed {1} {%} ::: "${SEEDS[@]}"

@@ -160,8 +160,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Override hpo.n_trials. Per-fold mode defaults to 500 when this "
-            "option is omitted; cv-refit otherwise keeps the YAML value."
+            "Override hpo.n_trials. When omitted, both modes keep the YAML value."
         ),
     )
     parser.add_argument(
@@ -203,13 +202,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epoch-selection",
         choices=("one-sd", "median"),
-        default="one-sd",
+        default="median",
         help=(
-            "How cv-refit chooses the full-data training length. "
-            "one-sd uses the earliest epoch whose mean validation score is "
-            "within --epoch-selection-scale standard deviations of the best "
-            "mean. median uses the half-up median of the per-fold best epochs. "
-            "Ignored in per-fold mode."
+            "How cv-refit chooses the full-data and per-fold training length. "
+            "median (default) uses the half-up median of the per-fold best "
+            "epochs. one-sd uses the earliest epoch whose mean validation "
+            "score is within --epoch-selection-scale standard deviations of "
+            "the best mean. Ignored in per-fold mode."
         ),
     )
     parser.add_argument(
@@ -290,14 +289,19 @@ def configure_hpo_mode(
         raise TypeError("hpo configuration must be a mapping")
     normalized = normalize_hpo_config(hpo)
     if mode == "per-fold":
-        if normalized["method"] != "bayesian":
-            raise ValueError("per-fold mode requires hpo.method: bayesian")
-        resolved_trials = 500 if n_trials is None else int(n_trials)
-        if resolved_trials < 1:
-            raise ValueError("n-trials must be positive")
+        if normalized["method"] not in {"bayesian", "grid"}:
+            raise ValueError("per-fold mode requires hpo.method: bayesian or grid")
         hpo["enabled"] = True
-        hpo["method"] = "bayesian"
-        hpo["n_trials"] = resolved_trials
+        if normalized["method"] == "bayesian":
+            resolved_trials = (
+                int(normalized["n_trials"]) if n_trials is None else int(n_trials)
+            )
+            if resolved_trials < 1:
+                raise ValueError("n-trials must be positive")
+            hpo["method"] = "bayesian"
+            hpo["n_trials"] = resolved_trials
+        elif n_trials is not None:
+            raise ValueError("--n-trials applies only to Bayesian HPO")
     elif mode == "cv-refit":
         if n_trials is not None:
             if int(n_trials) < 1:
@@ -768,6 +772,110 @@ def _load_running_best_training(
     return candidate_id, training
 
 
+def _run_per_fold_grid_study(
+    *,
+    context: DeploymentHPOContext,
+    split: DeploymentFold,
+    device: str,
+) -> tuple[HPOResult, TrainingResult]:
+    """Evaluate every grid point on one fold and keep its best checkpoint."""
+    normalized = normalize_hpo_config(context.config.get("hpo", {}))
+    parameter_sets = generate_grid_candidates(normalized["parameters"])
+    if not parameter_sets:
+        raise ValueError("Grid HPO requires at least one parameter combination")
+    fold_output = Path(context.output_directory) / f"fold_{split.fold}"
+    fold_output.mkdir(parents=True, exist_ok=True)
+    base_train = context.config.get("train", {})
+    fold_data = _prepare_deployment_fold_data(
+        prepared=context.prepared_data,
+        split=split,
+        device=device,
+        gpu_resident=bool(base_train.get("gpu_resident", True)),
+    )
+    maximize = normalized["direction"] == "maximize"
+    candidates: list[CandidateResult] = []
+    best_candidate: CandidateResult | None = None
+    best_training: TrainingResult | None = None
+    print(
+        f"[INFO] Fold {split.fold}: evaluating {len(parameter_sets)} grid "
+        f"combinations; fold data cached on {device}",
+        flush=True,
+    )
+    for candidate_id, parameters in enumerate(parameter_sets):
+        metrics_log_path = None
+        if context.live_metrics_log:
+            metrics_log_path = (
+                fold_output / f"candidate_{candidate_id}" / "metrics.jsonl"
+            )
+        training = _train_deployment_fold(
+            prepared=context.prepared_data,
+            config=context.config,
+            split=split,
+            candidate_id=candidate_id,
+            parameters=parameters,
+            device=device,
+            regression_tasks=context.regression_tasks,
+            classification_tasks=context.classification_tasks,
+            metric=context.metric,
+            direction=context.direction,
+            patience=context.patience,
+            loader_options=context.loader_options,
+            metrics_log_path=metrics_log_path,
+            fold_data=fold_data,
+            materialize_checkpoint=False,
+        )
+        objective = _metric_from_metrics(training.best_metrics, context.metric)
+        if not math.isfinite(objective):
+            raise ValueError(
+                f"Non-finite HPO objective in fold {split.fold}, "
+                f"grid candidate {candidate_id}"
+            )
+        candidate = CandidateResult(
+            candidate_id=candidate_id,
+            parameters=copy.deepcopy(parameters),
+            objective=float(objective),
+            inner_results=(
+                InnerFoldResult(
+                    inner_fold=int(split.fold),
+                    metric=float(objective),
+                    best_epoch=int(training.best_epoch),
+                    metrics=copy.deepcopy(dict(training.best_metrics)),
+                ),
+            ),
+        )
+        candidates.append(candidate)
+        is_better = best_candidate is None or (
+            objective > best_candidate.objective
+            if maximize
+            else objective < best_candidate.objective
+        )
+        if is_better:
+            best_candidate = candidate
+            best_training = _materialize_best_training(training)
+            _save_running_per_fold_best(
+                context=context,
+                split=split,
+                candidate=candidate,
+                training=best_training,
+            )
+        print(
+            f"[Fold {split.fold} grid HPO] {candidate_id + 1}/"
+            f"{len(parameter_sets)} objective={objective:.6f} "
+            f"best_epoch={training.best_epoch}",
+            flush=True,
+        )
+    result = select_best_candidate(
+        candidates,
+        normalized["direction"],
+        method="grid",
+    )
+    if best_training is None or best_candidate is None:
+        raise RuntimeError(f"Fold {split.fold} grid HPO completed without a model")
+    if result.best.candidate_id != best_candidate.candidate_id:
+        raise RuntimeError("In-memory best checkpoint does not match HPO winner")
+    return result, best_training
+
+
 def _run_per_fold_study(
     *,
     context: DeploymentHPOContext,
@@ -1068,11 +1176,23 @@ def _per_fold_hpo_worker(
     )
     split_by_id = {split.fold: split for split in context.folds}
     split = split_by_id[job.fold_id]
-    hpo_result, training = _run_per_fold_study(
-        context=context,
-        split=split,
-        device=device,
-    )
+    method = normalize_hpo_config(context.config.get("hpo", {}))["method"]
+    if method == "grid":
+        if context.resume:
+            raise ValueError("--resume is only supported for Bayesian per-fold HPO")
+        hpo_result, training = _run_per_fold_grid_study(
+            context=context,
+            split=split,
+            device=device,
+        )
+    elif method == "bayesian":
+        hpo_result, training = _run_per_fold_study(
+            context=context,
+            split=split,
+            device=device,
+        )
+    else:
+        raise ValueError("per-fold mode requires hpo.method: bayesian or grid")
     return _persist_per_fold_result(
         context=context,
         split=split,
@@ -1340,6 +1460,158 @@ def _write_json(path: Path, value: Any) -> None:
         handle.write("\n")
 
 
+def _resolve_refit_epochs(
+    *,
+    config: Mapping[str, Any],
+    hpo_result: HPOResult | None,
+    refit_epochs: int | None,
+) -> tuple[int, int]:
+    """Return ``(final_epoch, scheduler_epochs)`` for locked refit training."""
+    train_config = config.get("train", {})
+    if refit_epochs is not None:
+        final_epoch = int(refit_epochs)
+    elif hpo_result is not None:
+        final_epoch = int(hpo_result.best.final_epoch)
+    elif train_config.get("fixed_epochs") is not None:
+        final_epoch = int(train_config["fixed_epochs"])
+    else:
+        final_epoch = int(train_config["num_epochs"])
+    scheduler_epochs = int(train_config.get("num_epochs", final_epoch))
+    return final_epoch, scheduler_epochs
+
+
+def _persist_cv_refit_fold_models(
+    *,
+    prepared: PreparedData,
+    config: Mapping[str, Any],
+    hpo_result: HPOResult,
+    folds: Sequence[DeploymentFold],
+    regression_tasks: Sequence[str],
+    classification_tasks: Sequence[str],
+    loader_options: Mapping[str, Any],
+    device: str,
+    output_directory: Path,
+    cv_seed: int,
+    refit_epochs: int,
+) -> list[Dict[str, Any]]:
+    """Train and save ``fold_<k>/best_model.pt`` with the locked hyperparameters.
+
+    Each fold uses the same selected hyperparameters and epoch count as the
+    full-data refit, so the directory can be used for ensemble prediction and
+    ensemble integrated gradients without a second training pass.
+    """
+    selected_config = merge_config(config, hpo_result.best.parameters)
+    selected_parameters = dict(hpo_result.best.parameters)
+    final_epoch, scheduler_epochs = _resolve_refit_epochs(
+        config=selected_config,
+        hpo_result=hpo_result,
+        refit_epochs=refit_epochs,
+    )
+    train_config = selected_config.get("train", {})
+    batch_size = int(train_config.get("batch_size", 32))
+    gpu_resident = bool(train_config.get("gpu_resident", True)) and str(
+        device
+    ).startswith("cuda")
+    summaries: list[Dict[str, Any]] = []
+    print(
+        f"Saving locked fold checkpoints for {len(folds)} folds "
+        f"({final_epoch} epochs, scheduler horizon {scheduler_epochs})"
+    )
+    for split in folds:
+        fold_directory = Path(output_directory) / f"fold_{split.fold}"
+        fold_directory.mkdir(parents=True, exist_ok=True)
+        print(
+            f"[fold-refit] fold {split.fold}: {len(split.train)} train, "
+            f"{len(split.valid)} held out"
+        )
+        train_data, _valid_data = _prepare_deployment_fold_data(
+            prepared=prepared,
+            split=split,
+            device=device,
+            gpu_resident=gpu_resident,
+        )
+        effective_loader_options = dict(loader_options)
+        if gpu_resident:
+            effective_loader_options = {"num_workers": 0, "pin_memory": False}
+        loader = train_data.loader(
+            np.arange(len(split.train)),
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            **effective_loader_options,
+        )
+        training_seed = resolve_training_seed(
+            selected_config,
+            fallback=int(prepared.metadata.get("seed", 42)),
+        )
+        trainer = NestedCVTrainer(
+            _make_seeded_model(
+                selected_config,
+                prepared,
+                regression_tasks,
+                classification_tasks,
+                training_seed,
+            ),
+            num_regression_tasks=len(regression_tasks),
+            num_classification_tasks=len(classification_tasks),
+            **_trainer_kwargs(
+                selected_config,
+                device,
+                regression_tasks,
+                training_seed,
+            ),
+        )
+        training = trainer.train_fixed_epochs(
+            loader,
+            epochs=final_epoch,
+            scheduler_epochs=scheduler_epochs,
+            metrics_log_path=fold_directory / "metrics.jsonl",
+        )
+        processor = PerTraitPreprocessor.load_json(
+            prepared.directory / "cv" / f"fold_{split.fold}" / "preprocessing.json"
+        )
+        checkpoint = _per_fold_checkpoint(
+            prepared=prepared,
+            split=split,
+            config=config,
+            parameters=selected_parameters,
+            training=training,
+            processor=processor,
+            cv_seed=cv_seed,
+        )
+        checkpoint["hpo_candidate_id"] = int(hpo_result.best.candidate_id)
+        checkpoint["hpo_objective"] = float(hpo_result.best.objective)
+        checkpoint["final_epoch"] = int(final_epoch)
+        checkpoint["scheduler_epochs"] = int(scheduler_epochs)
+        checkpoint["cv_refit_fold_model"] = True
+        _atomic_torch_save(checkpoint, fold_directory / "best_model.pt")
+        processor.save_json(fold_directory / "preprocessing.json")
+        with (fold_directory / "config.yaml").open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(checkpoint["config"], handle, sort_keys=False)
+        _write_json(fold_directory / "training_history.json", training.history)
+        summary = {
+            "status": "completed",
+            "mode": "cv-refit-fold",
+            "model_type": "production",
+            "evaluation_set": "none",
+            "refit_full_dataset": False,
+            "fold": int(split.fold),
+            "folds": len(folds),
+            "train_samples": int(len(split.train)),
+            "validation_samples": int(len(split.valid)),
+            "hpo_candidate_id": int(hpo_result.best.candidate_id),
+            "selected_hyperparameters": selected_parameters,
+            "final_epoch": int(final_epoch),
+            "scheduler_epochs": int(scheduler_epochs),
+            "training_seed": int(training_seed),
+            "checkpoint": str((fold_directory / "best_model.pt").resolve()),
+        }
+        _write_json(fold_directory / "summary.json", summary)
+        summaries.append(summary)
+        print(f"[fold-refit] fold {split.fold}: {fold_directory / 'best_model.pt'}")
+    return summaries
+
+
 def _refit_full_dataset(
     *,
     prepared: PreparedData,
@@ -1408,15 +1680,11 @@ def _refit_full_dataset(
             training_seed,
         ),
     )
-    if refit_epochs is not None:
-        final_epoch = int(refit_epochs)
-    elif hpo_result is not None:
-        final_epoch = int(hpo_result.best.final_epoch)
-    elif train_config.get("fixed_epochs") is not None:
-        final_epoch = int(train_config["fixed_epochs"])
-    else:
-        final_epoch = int(train_config["num_epochs"])
-    scheduler_epochs = int(train_config.get("num_epochs", final_epoch))
+    final_epoch, scheduler_epochs = _resolve_refit_epochs(
+        config=selected_config,
+        hpo_result=hpo_result,
+        refit_epochs=refit_epochs,
+    )
     training = trainer.train_fixed_epochs(
         loader,
         epochs=final_epoch,
@@ -1774,6 +2042,19 @@ def _run_cv_refit_mode(
         device,
         deterministic=train_deterministic_enabled(config),
     )
+    fold_summaries = _persist_cv_refit_fold_models(
+        prepared=prepared,
+        config=config,
+        hpo_result=hpo_result,
+        folds=folds,
+        regression_tasks=regression_tasks,
+        classification_tasks=classification_tasks,
+        loader_options=_loader_kwargs(train_config),
+        device=device,
+        output_directory=output_directory,
+        cv_seed=cv_seed,
+        refit_epochs=refit_epochs,
+    )
     selected_config, processor, training, checkpoint, training_seed = (
         _refit_full_dataset(
             prepared=prepared,
@@ -1826,6 +2107,10 @@ def _run_cv_refit_mode(
         "cuda": torch.version.cuda,
     }
     _write_json(output_directory / "runtime.json", runtime)
+    fold_checkpoints = [
+        str((output_directory / f"fold_{split.fold}" / "best_model.pt").resolve())
+        for split in folds
+    ]
     _write_json(
         output_directory / "summary.json",
         {
@@ -1849,12 +2134,15 @@ def _run_cv_refit_mode(
             "data_dir": str(Path(args.data_dir).resolve()),
             "config": str(Path(args.config).resolve()),
             "checkpoint": str((output_directory / "best_model.pt").resolve()),
+            "fold_checkpoints": fold_checkpoints,
+            "fold_summaries": fold_summaries,
             "runtime": runtime,
         },
     )
     print(
         f"Completed production CV ({len(folds)} folds) and full-data refit; "
-        f"checkpoint: {output_directory / 'best_model.pt'}"
+        f"checkpoint: {output_directory / 'best_model.pt'}; "
+        f"fold checkpoints: {output_directory}/fold_*/best_model.pt"
     )
 
 
@@ -1939,6 +2227,10 @@ def main() -> None:
 
     train_config = config.get("train", {})
     normalized_hpo = normalize_hpo_config(config.get("hpo", {}))
+    if normalized_hpo["method"] == "grid":
+        trials_per_fold = len(generate_grid_candidates(normalized_hpo["parameters"]))
+    else:
+        trials_per_fold = int(normalized_hpo["n_trials"])
     context = DeploymentHPOContext(
         prepared_data=prepared,
         config=copy.deepcopy(config),
@@ -1961,7 +2253,7 @@ def main() -> None:
         "refit_full_dataset": False,
         "prepared_folds": len(all_folds),
         "selected_folds": [int(split.fold) for split in selected_folds],
-        "hpo_trials_per_fold": int(normalized_hpo["n_trials"]),
+        "hpo_trials_per_fold": trials_per_fold,
         "elapsed_seconds": time.time() - started,
         "folds": fold_summaries,
         "warning": (

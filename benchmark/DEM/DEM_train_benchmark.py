@@ -491,11 +491,10 @@ def run_outer_fold(
     normalized = evaluate_regression(
         predictions, selected.held_out.targets, mask, [job.trait_name]
     )
+    from aquila.data.cv import outer_evaluation_paths
+
     preprocessor_path = (
-        Path(context.data_directory)
-        / "cv"
-        / f"outer_fold_{job.outer_fold}"
-        / "final"
+        outer_evaluation_paths(context.data_directory, job.outer_fold, "test")[0]
         / "preprocessing.json"
     )
     processor = PerTraitPreprocessor.load_json(preprocessor_path)

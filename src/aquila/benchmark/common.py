@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from aquila.data import PerTraitPreprocessor, load_fold_indices, load_prepared_data
+from aquila.data.cv import outer_evaluation_paths
 from aquila.training.evaluator import RegressionEvaluator
 
 
@@ -300,18 +301,25 @@ class PreparedBenchmark:
         outer_cv = self.directory / "cv" / f"outer_fold_{outer_fold}"
         outer_vcf = self.directory / "raw_genotype" / f"outer_fold_{outer_fold}"
         if inner_fold is None:
-            processed = outer_cv / "final"
+            train_dir, train_index, train_vcf = outer_evaluation_paths(
+                self.directory, outer_fold, "train"
+            )
+            test_dir, test_index, test_vcf = outer_evaluation_paths(
+                self.directory, outer_fold, "test"
+            )
+            train_vcf = _resolve_vcf_path(train_vcf.parent, "train")
+            test_vcf = _resolve_vcf_path(test_vcf.parent, "test")
             paths = FoldPaths(
                 self.directory,
                 outer_fold,
                 None,
-                outer_cv / "train_idx.npy",
-                outer_cv / "test_idx.npy",
-                _resolve_vcf_path(outer_vcf, "train"),
-                _resolve_vcf_path(outer_vcf, "test"),
-                processed / "Y_train_processed.pt",
-                processed / "Y_test_processed.pt",
-                processed / "preprocessing.json",
+                train_index,
+                test_index,
+                train_vcf,
+                test_vcf,
+                train_dir / "Y_train_processed.pt",
+                test_dir / "Y_test_processed.pt",
+                test_dir / "preprocessing.json",
             )
         else:
             self._validate_fold_number(inner_fold, self.inner_fold_count, "inner")

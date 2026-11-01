@@ -582,11 +582,10 @@ def run_outer_fold(
         np.ones((len(predictions), 1), dtype=bool),
         [trait_name],
     ).metrics
+    from aquila.data.cv import outer_evaluation_paths
+
     preprocessor_path = (
-        data_directory
-        / "cv"
-        / f"outer_fold_{outer_fold}"
-        / "final"
+        outer_evaluation_paths(data_directory, outer_fold, "test")[0]
         / "preprocessing.json"
     )
     preprocessor = PerTraitPreprocessor.load_json(preprocessor_path)

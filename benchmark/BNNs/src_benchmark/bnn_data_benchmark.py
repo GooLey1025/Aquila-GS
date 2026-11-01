@@ -137,11 +137,9 @@ def _split_paths(
     if role not in valid_roles:
         raise ValueError(f"Invalid split role {role!r}")
     if inner_fold is None:
-        return (
-            outer_path / "final",
-            outer_path / f"{role}_idx.npy",
-            raw_path / f"{role}.vcf.gz",
-        )
+        from aquila.data.cv import outer_evaluation_paths
+
+        return outer_evaluation_paths(data_directory, outer_fold, role)
     split_path = outer_path / f"inner_fold_{inner_fold}"
     return (
         split_path,

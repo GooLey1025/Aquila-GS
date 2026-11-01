@@ -9,8 +9,8 @@
 set -euo pipefail
 
 export WORK_DIR=./ig_10seeds_work
-export GWAS_DIR=./Rice655.full_marker_panel_gwas_results/association_results
-export PREFIX=655rice.r2_0.045.aquila-snp
+export GWAS_DIR=./Rice655.full_marker_panel_gwas_results
+export PREFIX=655rice.production.gwas_interpretability
 export OUT_DIR=./ig_ensemble
 export PNG_DIR=./ig_png_ensemble
 SEEDS=(42 43 44 45 46 47 48 49 50 51)

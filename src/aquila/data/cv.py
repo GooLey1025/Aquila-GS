@@ -130,6 +130,103 @@ def generate_nested_folds_from_assignments(
     return folds
 
 
+# One inner validation part out of five, so inner train:valid = 4:1.
+HOLDOUT_INNER_SPLITS = 5
+
+
+def _inner_holdout_split(
+    outer_train: np.ndarray,
+    *,
+    seed: int,
+    outer_index: int,
+) -> Dict[str, object]:
+    """Take the first KFold part as validation and the other four as training."""
+    if outer_train.size < HOLDOUT_INNER_SPLITS:
+        raise ValueError(
+            "A 4:1 inner split needs at least "
+            f"{HOLDOUT_INNER_SPLITS} outer-training samples; outer fold "
+            f"{outer_index} has {outer_train.size}"
+        )
+    splitter = KFold(
+        n_splits=HOLDOUT_INNER_SPLITS,
+        shuffle=True,
+        random_state=int(seed) + int(outer_index) + 1,
+    )
+    train_positions, valid_positions = next(splitter.split(outer_train))
+    return {
+        "fold": 0,
+        "train": outer_train[train_positions].copy(),
+        "valid": outer_train[valid_positions].copy(),
+    }
+
+
+def apply_inner_holdout(
+    folds: Sequence[NestedFold],
+    *,
+    seed: int,
+) -> List[NestedFold]:
+    """Replace every outer fold's inner splits with one 4:1 holdout.
+
+    Outer train and test indices are copied unchanged. Inner indices stored on
+    the input folds are ignored.
+    """
+    holdout_folds: List[NestedFold] = []
+    for outer in folds:
+        outer_index = int(outer["fold"])
+        outer_train = np.asarray(outer["train"], dtype=np.int64)
+        outer_test = np.asarray(outer["test"], dtype=np.int64)
+        holdout_folds.append(
+            {
+                "fold": outer_index,
+                "train": outer_train.copy(),
+                "test": outer_test.copy(),
+                "inner": [
+                    _inner_holdout_split(
+                        outer_train,
+                        seed=seed,
+                        outer_index=outer_index,
+                    )
+                ],
+            }
+        )
+    return holdout_folds
+
+
+def generate_outer_holdout_folds(
+    n_samples: int,
+    outer_folds: int = 10,
+    seed: int = 42,
+) -> List[NestedFold]:
+    """Outer K-fold plus one 4:1 inner holdout of each outer training set.
+
+    Outer test partitions match ``generate_nested_folds`` for the same sample
+    count, outer-fold count, and seed. The inner split is a single 4:1
+    train/validation holdout, not an inner K-fold.
+    """
+    placeholder = generate_nested_folds(
+        n_samples=n_samples,
+        outer_folds=outer_folds,
+        inner_folds=2,
+        seed=seed,
+    )
+    return apply_inner_holdout(placeholder, seed=seed)
+
+
+def generate_outer_holdout_folds_from_assignments(
+    outer_test_folds: Sequence[int] | np.ndarray,
+    outer_folds: int = 10,
+    seed: int = 42,
+) -> List[NestedFold]:
+    """Keep predefined outer tests and draw one 4:1 inner holdout on each train set."""
+    placeholder = generate_nested_folds_from_assignments(
+        outer_test_folds,
+        outer_folds=outer_folds,
+        inner_folds=2,
+        seed=seed,
+    )
+    return apply_inner_holdout(placeholder, seed=seed)
+
+
 def validate_outer_fold_observations(
     target_mask: np.ndarray,
     folds: Sequence[NestedFold],
@@ -184,6 +281,48 @@ def save_nested_folds(folds: Iterable[NestedFold], cv_directory: str | Path) -> 
             inner_path.mkdir(parents=True, exist_ok=True)
             np.save(inner_path / "train_idx.npy", inner["train"])
             np.save(inner_path / "valid_idx.npy", inner["valid"])
+
+
+def outer_evaluation_paths(
+    data_directory: str | Path,
+    outer_fold: int,
+    role: str,
+) -> tuple[Path, Path, Path]:
+    """Return the processed directory, index file, and VCF for one outer role.
+
+    Nested CV stores both outer-train and outer-test targets under ``final/``.
+    Outer holdout has no ``final/`` cache: training rows are the 4:1 inner
+    train split, and outer-test rows use ``inner_fold_0/Y_test_processed.pt``
+    from the inner-train preprocessor. A directory that still has
+    ``final/Y_test_processed.pt`` keeps the nested-CV paths.
+    """
+    if role not in {"train", "test"}:
+        raise ValueError(f"Outer evaluation role must be train or test, got {role!r}")
+    root = Path(data_directory)
+    outer_path = root / "cv" / f"outer_fold_{int(outer_fold)}"
+    raw_path = root / "raw_genotype" / f"outer_fold_{int(outer_fold)}"
+    final_dir = outer_path / "final"
+    inner_dir = outer_path / "inner_fold_0"
+    holdout = (inner_dir / "Y_test_processed.pt").is_file() and not (
+        final_dir / "Y_test_processed.pt"
+    ).is_file()
+    if not holdout:
+        return (
+            final_dir,
+            outer_path / f"{role}_idx.npy",
+            raw_path / f"{role}.vcf.gz",
+        )
+    if role == "train":
+        return (
+            inner_dir,
+            inner_dir / "train_idx.npy",
+            raw_path / "inner_fold_0" / "train.vcf.gz",
+        )
+    return (
+        inner_dir,
+        outer_path / "test_idx.npy",
+        raw_path / "test.vcf.gz",
+    )
 
 
 def load_fold_indices(

@@ -199,9 +199,9 @@ def _split_paths(
     if inner_fold is None:
         if role not in {"train", "test"}:
             raise ValueError(f"Invalid final split role: {role}")
-        split_path = outer_path / "final"
-        index_path = outer_path / f"{role}_idx.npy"
-        vcf_path = raw_path / f"{role}.vcf.gz"
+        from aquila.data.cv import outer_evaluation_paths
+
+        return outer_evaluation_paths(data_directory, outer_fold, role)
     else:
         if role not in {"train", "valid"}:
             raise ValueError(f"Invalid inner split role: {role}")
@@ -555,11 +555,10 @@ def run_outer_fold(
     normalized_metrics = _metric_payload(
         normalized_predictions, outer_test.targets, trait_name
     )
+    from aquila.data.cv import outer_evaluation_paths
+
     preprocessor = PerTraitPreprocessor.load_json(
-        data_directory
-        / "cv"
-        / f"outer_fold_{outer_fold}"
-        / "final"
+        outer_evaluation_paths(data_directory, outer_fold, "test")[0]
         / "preprocessing.json"
     )
     original_predictions = _inverse_trait(

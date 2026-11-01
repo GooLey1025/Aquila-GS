@@ -516,7 +516,16 @@ def _validate_cv_artifacts(
     inner_count = metadata.get("inner_folds")
     if not isinstance(outer_count, int) or outer_count < 2:
         raise ValueError("metadata outer_folds must be an integer of at least two")
-    if not isinstance(inner_count, int) or inner_count < 2:
+    if not isinstance(inner_count, int):
+        raise ValueError("metadata inner_folds must be an integer")
+    # outer_holdout keeps a single 4:1 inner split. Nested CV still needs
+    # at least two inner folds so candidate scores can be averaged.
+    if metadata.get("protocol") == "outer_holdout":
+        if inner_count != 1:
+            raise ValueError(
+                "outer_holdout prepared data must contain exactly one inner split"
+            )
+    elif inner_count < 2:
         raise ValueError("metadata inner_folds must be an integer of at least two")
 
     all_indices = set(range(sample_count))

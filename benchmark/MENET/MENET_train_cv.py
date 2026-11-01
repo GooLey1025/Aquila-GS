@@ -492,10 +492,12 @@ def load_split_data(
     if role not in valid_roles:
         raise ValueError(f"Invalid split role {role!r}")
     if inner_fold is None:
-        split_path = outer_path / "final"
-        index_path = outer_path / f"{role}_idx.npy"
+        from aquila.data.cv import outer_evaluation_paths
+
+        split_path, index_path, vcf_path = outer_evaluation_paths(
+            data_directory, outer_fold, role
+        )
         target_name = f"Y_{role}_processed.pt"
-        vcf_path = raw_path / f"{role}.vcf.gz"
     else:
         split_path = outer_path / f"inner_fold_{inner_fold}"
         index_path = split_path / f"{role}_idx.npy"
@@ -1465,11 +1467,10 @@ def run_outer_fold(
         device,
         trait_name,
     )
+    from aquila.data.cv import outer_evaluation_paths
+
     preprocessor = PerTraitPreprocessor.load_json(
-        data_directory
-        / "cv"
-        / f"outer_fold_{outer_fold}"
-        / "final"
+        outer_evaluation_paths(data_directory, outer_fold, "test")[0]
         / "preprocessing.json"
     )
     original_predictions = _inverse_trait(

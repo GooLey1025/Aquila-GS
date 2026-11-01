@@ -15,7 +15,7 @@ import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 RRBLUP_DIR = Path(__file__).resolve().parents[1]
-PREDICT_DIR = PROJECT_ROOT / "production_GS_model_train" / "120_lines_test-set"
+PREDICT_DIR = PROJECT_ROOT / "production_GS_model_train" / "300_lines_test-set"
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(RRBLUP_DIR))
 sys.path.insert(0, str(PREDICT_DIR))
@@ -140,7 +140,8 @@ def test_fold_models_train_only_on_fold_training_samples(tmp_path: Path) -> None
         base_seed=42,
         variants=("m0", "m1"),
     )
-    assert [call["train_rows"] for call in worker.calls] == [6, 4, 4]
+    assert [call["train_rows"] for call in worker.calls] == [4, 4]
+    assert not (tmp_path / "out" / "GYP_BLUP" / "full").exists()
     assert summary["n_folds"] == 2
     for fold_id in (0, 1):
         fold_dir = tmp_path / "out" / "GYP_BLUP" / "cv" / f"fold_{fold_id}"

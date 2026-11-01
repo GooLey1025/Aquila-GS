@@ -33,6 +33,7 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from aquila.data import resolve_outer_folds
+from aquila.data.cv import outer_evaluation_paths
 
 
 @dataclass(frozen=True)
@@ -132,9 +133,7 @@ def split_paths(
     outer_path = data_dir / "cv" / f"outer_fold_{outer_fold}"
     raw_path = data_dir / "raw_genotype" / f"outer_fold_{outer_fold}"
     if inner_fold is None:
-        split_path = outer_path / "final"
-        index_path = outer_path / f"{role}_idx.npy"
-        vcf_path = raw_path / f"{role}.vcf.gz"
+        return outer_evaluation_paths(data_dir, outer_fold, role)
     else:
         split_path = outer_path / f"inner_fold_{inner_fold}"
         index_path = split_path / f"{role}_idx.npy"
@@ -593,13 +592,9 @@ def run_outer_fold(
         derive_seed(base_seed, trait, outer_fold, int(best["candidate_id"]), 999),
     )
     normalized_metrics = regression_metrics(test.targets, prediction)
-    preprocessing_path = (
-        data_dir
-        / "cv"
-        / f"outer_fold_{outer_fold}"
-        / "final"
-        / "preprocessing.json"
-    )
+    preprocessing_path = outer_evaluation_paths(
+        data_dir, outer_fold, "test"
+    )[0] / "preprocessing.json"
     observed_original = inverse_trait(test.targets, preprocessing_path, trait_index)
     predicted_original = inverse_trait(prediction, preprocessing_path, trait_index)
     original_metrics = regression_metrics(observed_original, predicted_original)

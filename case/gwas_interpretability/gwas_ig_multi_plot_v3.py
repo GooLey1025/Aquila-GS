@@ -120,6 +120,11 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--no-qtn-labels",
+        action="store_true",
+        help="Keep the proxy table, but do not write QTN names on the figure.",
+    )
+    parser.add_argument(
         "--annot-threshold",
         type=float,
         default=0.1,
@@ -506,6 +511,7 @@ def create_comparison_plot(
     scatter_alpha_max=0.75,
     qtn_table=None,
     annot_tolerance_bp=100_000,
+    label_qtns=True,
     highlights=None,
 ):
     print("Creating comparison plot...")
@@ -678,12 +684,15 @@ def create_comparison_plot(
         proxy_path = Path(output_path).with_suffix(".qtn_proxies.tsv")
         proxies.to_csv(proxy_path, sep="\t", index=False)
         print(f"  Wrote QTN proxy table: {proxy_path}")
-        _annotate_qtn_proxies(
-            ax2,
-            importance_df,
-            proxies[proxies["in_top_k"]].copy(),
-            importance_col="importance_raw_for_scatter",
-        )
+        if label_qtns:
+            _annotate_qtn_proxies(
+                ax2,
+                importance_df,
+                proxies[proxies["in_top_k"]].copy(),
+                importance_col="importance_raw_for_scatter",
+            )
+        else:
+            print("  QTN names omitted from the figure")
 
     # =========================================================================
     # Row 3: Gaussian-smoothed importance trend
@@ -819,6 +828,7 @@ def main():
         scatter_alpha_max=args.scatter_alpha_max,
         qtn_table=qtn_table,
         annot_tolerance_bp=annot_tolerance_bp if annot_tolerance_bp is not None else 100_000,
+        label_qtns=not args.no_qtn_labels,
         highlights=args.highlight,
     )
 

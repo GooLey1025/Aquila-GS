@@ -13,9 +13,10 @@ import math
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Mapping, Sequence
 
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.model_selection import KFold
 
@@ -46,6 +47,7 @@ class DeploymentPreparationConfig:
     skew_threshold: float = 2.0
     preprocessing_epsilon: float = 1e-8
     overwrite: bool = False
+    cv_mapping: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,114 @@ def validate_deployment_folds(
         raise ValueError("Validation folds must partition every sample exactly once")
 
 
+def load_cv_mapping(path: str | Path) -> Dict[str, int]:
+    """Load SampleID -> validation-fold from aquila_cv JSON or fold_assignments.tsv."""
+    mapping_path = Path(path)
+    if not mapping_path.is_file():
+        raise FileNotFoundError(f"CV mapping not found: {mapping_path}")
+    if mapping_path.suffix.lower() == ".json":
+        with mapping_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise ValueError(f"CV mapping JSON must contain an object: {mapping_path}")
+        folds = payload.get("folds")
+        if not isinstance(folds, list) or not folds:
+            raise ValueError(
+                f"CV mapping JSON must contain a nonempty folds list: {mapping_path}"
+            )
+        assignments: Dict[str, int] = {}
+        for entry in folds:
+            if not isinstance(entry, Mapping):
+                raise ValueError("Each CV mapping fold entry must be an object")
+            fold_id = int(entry["fold"])
+            # aquila_cv outer folds use "test"; deployment TSV exports use valid.
+            members = entry.get("test", entry.get("valid"))
+            if members is None:
+                raise ValueError(
+                    f"Fold {fold_id} is missing a test/valid sample list"
+                )
+            for sample_id in members:
+                key = str(sample_id)
+                if key in assignments and assignments[key] != fold_id:
+                    raise ValueError(
+                        f"Sample {key!r} is assigned to multiple validation folds"
+                    )
+                assignments[key] = fold_id
+        if not assignments:
+            raise ValueError(f"CV mapping JSON assigned no samples: {mapping_path}")
+        return assignments
+
+    frame = pd.read_csv(mapping_path, sep="\t", dtype=str)
+    columns = {str(column).strip(): column for column in frame.columns}
+    sample_column = columns.get("SampleID")
+    fold_column = columns.get("ValidationFold")
+    if sample_column is None or fold_column is None:
+        raise ValueError(
+            "fold_assignments.tsv must contain SampleID and ValidationFold columns"
+        )
+    assignments = {}
+    for _, row in frame.iterrows():
+        sample_id = str(row[sample_column]).strip()
+        if not sample_id:
+            raise ValueError("fold_assignments.tsv contains an empty SampleID")
+        fold_id = int(row[fold_column])
+        if sample_id in assignments and assignments[sample_id] != fold_id:
+            raise ValueError(
+                f"Sample {sample_id!r} is assigned to multiple validation folds"
+            )
+        assignments[sample_id] = fold_id
+    if not assignments:
+        raise ValueError(f"fold_assignments.tsv assigned no samples: {mapping_path}")
+    return assignments
+
+
+def deployment_folds_from_mapping(
+    sample_ids: Sequence[str],
+    mapping: Mapping[str, int],
+) -> list[DeploymentFold]:
+    """Build index folds from a SampleID -> validation-fold map."""
+    if not sample_ids:
+        raise ValueError("At least one aligned sample is required")
+    missing = [sample_id for sample_id in sample_ids if sample_id not in mapping]
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise KeyError(
+            f"{len(missing)} aligned samples are absent from the CV mapping "
+            f"(for example: {preview})"
+        )
+    fold_ids = sorted({int(mapping[sample_id]) for sample_id in sample_ids})
+    if fold_ids != list(range(len(fold_ids))):
+        raise ValueError(
+            "Validation fold IDs must be a contiguous zero-based range after "
+            f"alignment; found {fold_ids}"
+        )
+    assignments = np.asarray(
+        [int(mapping[sample_id]) for sample_id in sample_ids],
+        dtype=np.int64,
+    )
+    all_indices = np.arange(len(sample_ids), dtype=np.int64)
+    folds = []
+    for fold_id in fold_ids:
+        valid = all_indices[assignments == fold_id]
+        train = all_indices[assignments != fold_id]
+        if not valid.size:
+            raise ValueError(
+                f"Validation fold {fold_id} has no aligned samples after filtering"
+            )
+        if not train.size:
+            raise ValueError(
+                f"Training split for fold {fold_id} is empty after filtering"
+            )
+        folds.append(
+            DeploymentFold(
+                fold=int(fold_id),
+                train=train.copy(),
+                valid=valid.copy(),
+            )
+        )
+    return folds
+
+
 class DeploymentDataPreparer(NestedCVDataPreparer):
     """Prepare fixed K-fold caches and a full-data cache for rapid training."""
 
@@ -155,11 +265,20 @@ class DeploymentDataPreparer(NestedCVDataPreparer):
         genotypes = self._normalize_genotypes(parsed)
         phenotype = self._read_phenotypes()
         aligned = self._align(genotypes, phenotype)
-        folds = generate_deployment_folds(
-            len(aligned["sample_ids"]),
-            fold_count=self.deployment_config.folds,
-            seed=self.deployment_config.seed,
-        )
+        if self.deployment_config.cv_mapping is not None:
+            mapping = load_cv_mapping(self.deployment_config.cv_mapping)
+            folds = deployment_folds_from_mapping(aligned["sample_ids"], mapping)
+            if len(folds) != int(self.deployment_config.folds):
+                raise ValueError(
+                    f"--folds {self.deployment_config.folds} does not match the "
+                    f"{len(folds)} folds present in --cv-mapping after alignment"
+                )
+        else:
+            folds = generate_deployment_folds(
+                len(aligned["sample_ids"]),
+                fold_count=self.deployment_config.folds,
+                seed=self.deployment_config.seed,
+            )
         validate_deployment_folds(folds, len(aligned["sample_ids"]))
         metadata = self._build_metadata(genotypes, phenotype, aligned)
         metadata.update(
@@ -167,6 +286,11 @@ class DeploymentDataPreparer(NestedCVDataPreparer):
                 "data_mode": "deployment",
                 "cv_folds": len(folds),
                 "cv_seed": self.deployment_config.seed,
+                "cv_mapping": (
+                    str(Path(self.deployment_config.cv_mapping).resolve())
+                    if self.deployment_config.cv_mapping is not None
+                    else None
+                ),
                 "normalize_heterozygous_order": (
                     self.deployment_config.normalize_heterozygous_order
                 ),
@@ -219,6 +343,8 @@ class DeploymentDataPreparer(NestedCVDataPreparer):
             raise ValueError("preprocessing_epsilon must be positive")
         if config.folds < 2:
             raise ValueError("folds must be at least two")
+        if config.cv_mapping is not None and not Path(config.cv_mapping).is_file():
+            raise FileNotFoundError(f"CV mapping not found: {config.cv_mapping}")
 
     def _prepare_deployment_output(self) -> None:
         output = self.deployment_config.output_directory
@@ -406,6 +532,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of persisted K-fold validation splits (default: 5).",
     )
     parser.add_argument(
+        "--cv-mapping",
+        type=str,
+        default=None,
+        help=(
+            "Shared SampleID validation-fold map from aquila_cv.py JSON or a "
+            "fold_assignments.tsv. When set, folds are rebuilt by SampleID "
+            "instead of reshuffling the filtered sample list."
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -450,6 +586,7 @@ def main() -> None:
         skew_threshold=args.skew_threshold,
         preprocessing_epsilon=args.preprocessing_epsilon,
         overwrite=args.overwrite,
+        cv_mapping=Path(args.cv_mapping) if args.cv_mapping else None,
     )
     metadata = DeploymentDataPreparer(config).prepare()
     print(

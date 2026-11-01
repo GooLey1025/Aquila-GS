@@ -14,6 +14,10 @@ COHORT=Rice1171_pheno_10folds
 PHENO_FILE=species_data/Rice1171/1171rice.pheno
 VCF_FILE=species_data/Rice1171/Rice1171.coding.ld.vcf.gz
 
+COHORT=Rice532
+PHENO_FILE=species_data/Rice532/532rice.pheno
+VCF_FILE=species_data/Rice532/Rice532.coding.ld.vcf.gz
+
 export PATH="$CONDA_PREFIX/bin:$PATH"
 
 conda activate aquila

@@ -98,15 +98,7 @@ class NestedCVDataPreparer:
         phenotype = self._read_phenotypes()
         aligned = self._align(genotypes, phenotype)
 
-        if self.config.fold_mapping is None:
-            folds = generate_nested_folds(
-                n_samples=len(aligned["sample_ids"]),
-                outer_folds=self.config.outer_folds,
-                inner_folds=self.config.inner_folds,
-                seed=self.config.seed,
-            )
-        else:
-            folds = self._load_fold_mapping(aligned["sample_ids"])
+        folds = self._build_folds(aligned["sample_ids"])
         self._validate_fold_specific_gwas(folds)
         observed_counts = validate_outer_fold_observations(
             aligned["target_mask"].numpy(),
@@ -150,10 +142,30 @@ class NestedCVDataPreparer:
                 },
                 "feature_shapes": metadata["feature_shapes"],
             }
+        self._annotate_protocol(metadata, folds)
         self._save_artifacts(aligned, metadata, folds)
         if self.config.save_raw_genotype:
             self._save_raw_genotype_subsets(aligned["sample_ids"], folds)
         return metadata
+
+    def _build_folds(self, sample_ids: Sequence[str]) -> List[Dict[str, object]]:
+        """Build nested outer/inner folds for this prepared dataset."""
+        if self.config.fold_mapping is None:
+            return generate_nested_folds(
+                n_samples=len(sample_ids),
+                outer_folds=self.config.outer_folds,
+                inner_folds=self.config.inner_folds,
+                seed=self.config.seed,
+            )
+        return self._load_fold_mapping(sample_ids)
+
+    def _annotate_protocol(
+        self,
+        metadata: Dict[str, Any],
+        folds: Sequence[Dict[str, object]],
+    ) -> None:
+        """Record a specialized CV protocol on metadata before artifacts are saved."""
+        del metadata, folds
 
     def _validate_inputs(self) -> None:
         if not self.config.genotype_file.is_file():

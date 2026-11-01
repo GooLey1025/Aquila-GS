@@ -4,11 +4,12 @@
 # Contact: goley04@foxmail.com
 # Migrated from: https://github.com/cran/rrBLUP
 
-"""Fit production rrBLUP models on all observed reference samples.
+"""Fit production rrBLUP models on deployment training splits.
 
 The prepared directory must come from aquila_data_cv_production.py. The
-configuration must define exactly one parameter combination. No validation or
-test split is used.
+configuration must define exactly one parameter combination. When that
+directory contains CV folds, each model is fit on that fold's training
+samples only. Validation samples are not used for training.
 """
 
 from __future__ import annotations
@@ -244,39 +245,45 @@ def run_trait(
     started = time.time()
     trait_dir = output_dir / trait
     trait_dir.mkdir(parents=True, exist_ok=True)
-    all_indices = np.arange(len(sample_ids), dtype=np.int64)
-    full_path = data_dir / "full"
-    full_targets = _load_tensor(full_path / "Y_processed.pt").numpy()
-    train = _observed_split(
-        dosage,
-        sample_ids,
-        all_indices,
-        full_targets,
-        mask,
-        trait_index,
-        variants,
-    )
-    full_dir = trait_dir / "full"
-    # The worker always scores predict_x. Reusing the training matrix only
-    # satisfies that interface; those rows stay in-sample and are not metrics.
-    _fit_split(
-        worker,
-        full_dir,
-        train,
-        parameters,
-        derive_seed(base_seed, trait, 0, 0, 999),
-    )
-    write_json(
-        full_dir / "fit.json",
-        {
-            "evaluation_set": "none",
-            "n_train_observed": len(train.sample_ids),
-            "parameters": dict(parameters),
-        },
-    )
-    shutil.copy2(full_path / "preprocessing.json", full_dir / "preprocessing.json")
+    folds = _deployment_folds(data_dir)
+    full_model = None
+    n_train_observed = None
+    if not folds:
+        all_indices = np.arange(len(sample_ids), dtype=np.int64)
+        full_path = data_dir / "full"
+        full_targets = _load_tensor(full_path / "Y_processed.pt").numpy()
+        train = _observed_split(
+            dosage,
+            sample_ids,
+            all_indices,
+            full_targets,
+            mask,
+            trait_index,
+            variants,
+        )
+        full_dir = trait_dir / "full"
+        # The worker always scores predict_x. Reusing the training matrix only
+        # satisfies that interface; those rows stay in-sample and are not metrics.
+        _fit_split(
+            worker,
+            full_dir,
+            train,
+            parameters,
+            derive_seed(base_seed, trait, 0, 0, 999),
+        )
+        write_json(
+            full_dir / "fit.json",
+            {
+                "evaluation_set": "none",
+                "n_train_observed": len(train.sample_ids),
+                "parameters": dict(parameters),
+            },
+        )
+        shutil.copy2(full_path / "preprocessing.json", full_dir / "preprocessing.json")
+        full_model = str((full_dir / "model.rds").resolve())
+        n_train_observed = len(train.sample_ids)
     fold_results = []
-    for fold_id, fold_path in _deployment_folds(data_dir):
+    for fold_id, fold_path in folds:
         indices = np.load(fold_path / "train_idx.npy", allow_pickle=False)
         processed = _load_tensor(fold_path / "Y_train_processed.pt").numpy()
         fold_train = _observed_split(
@@ -323,17 +330,19 @@ def run_trait(
     return {
         "trait": trait,
         "parameters": dict(parameters),
-        "n_train_observed": len(train.sample_ids),
+        "n_train_observed": n_train_observed,
         "n_folds": len(fold_results),
         "folds": fold_results,
-        "model": str((full_dir / "model.rds").resolve()),
+        "model": full_model,
         "elapsed_seconds": time.time() - started,
     }
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fit one rrBLUP model per trait on the full prepared dataset."
+        description=(
+            "Fit one rrBLUP model per trait on each deployment training split."
+        )
     )
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
