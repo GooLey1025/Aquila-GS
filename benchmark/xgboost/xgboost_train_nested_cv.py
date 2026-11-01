@@ -391,6 +391,8 @@ def train_inner_candidate(
             "all_missing_marker_indices": list(imputed.all_missing_markers),
             "marker_count": int(imputed.marker_means.size),
         },
+        "booster": booster,
+        "marker_means": imputed.marker_means,
     }
 
 
@@ -476,6 +478,7 @@ def run_outer_fold(
             }
         )
 
+    holdout_models: dict[int, Mapping[str, Any]] = {}
     for candidate_id, parameters in enumerate(candidate_parameters):
         config = {
             **base_config,
@@ -492,7 +495,14 @@ def run_outer_fold(
                 n_jobs,
                 trait_name,
             )
-            inner_results.append({"inner_fold": inner_fold, **result})
+            stored = {
+                key: value
+                for key, value in result.items()
+                if key not in {"booster", "marker_means"}
+            }
+            inner_results.append({"inner_fold": inner_fold, **stored})
+            if inner_count == 1:
+                holdout_models[candidate_id] = result
         objectives = np.asarray(
             [result["objective"] for result in inner_results], dtype=float
         )
@@ -537,21 +547,28 @@ def run_outer_fold(
     )
     validate_variant_schema(outer_train, outer_test)
     imputed = impute_from_training(outer_train.genotypes, outer_test.genotypes)
-    train_matrix = xgboost.DMatrix(imputed.train, label=outer_train.targets)
     test_matrix = xgboost.DMatrix(imputed.held_out)
-    final_params = {
-        **best_config["model"],
-        "seed": derive_seed(seed, outer_fold, int(best["candidate_id"]), 999),
-        "nthread": int(n_jobs),
-    }
-    booster = xgboost.train(
-        params=final_params,
-        dtrain=train_matrix,
-        num_boost_round=final_rounds,
-        evals=[],
-        verbose_eval=False,
-    )
-    normalized_predictions = _predict(booster, test_matrix)
+    if inner_count == 1:
+        saved = holdout_models[int(best["candidate_id"])]
+        booster = saved["booster"]
+        normalized_predictions = _predict(
+            booster, test_matrix, int(saved["best_iteration"])
+        )
+    else:
+        train_matrix = xgboost.DMatrix(imputed.train, label=outer_train.targets)
+        final_params = {
+            **best_config["model"],
+            "seed": derive_seed(seed, outer_fold, int(best["candidate_id"]), 999),
+            "nthread": int(n_jobs),
+        }
+        booster = xgboost.train(
+            params=final_params,
+            dtrain=train_matrix,
+            num_boost_round=final_rounds,
+            evals=[],
+            verbose_eval=False,
+        )
+        normalized_predictions = _predict(booster, test_matrix)
     normalized_metrics = _metric_payload(
         normalized_predictions, outer_test.targets, trait_name
     )

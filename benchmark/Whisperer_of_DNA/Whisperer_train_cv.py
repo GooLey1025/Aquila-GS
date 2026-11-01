@@ -539,6 +539,15 @@ def _run_inner_hpo_job(
             f"best_epoch={result.best_epoch} device={device}",
             flush=True,
         )
+        if len(context.inner_folds) == 1:
+            state_path = (
+                fold_path
+                / f"candidate_{job.candidate_id}"
+                / f"inner_{job.inner_fold}"
+                / "best_state.pt"
+            )
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(result.state_dict, state_path)
         return {
             "outer_fold": job.outer_fold,
             "candidate_id": job.candidate_id,
@@ -679,28 +688,40 @@ def _run_outer_refit_job(
             block_length=int(context.config["model"]["embedding"]["Block_length"]),
             expected_variants=expected_variants,
         )
-        final_result = train_model(
-            outer_train.genotypes,
-            outer_train.processed_targets,
-            None,
-            None,
-            final_config,
-            final_parameters,
-            device,
-            final_seed,
-            max_epochs=job.final_epoch,
-            patience=job.final_epoch,
-            fixed_epochs=job.final_epoch,
-            train_mask=outer_train.observed_mask,
-            trait_names=names,
-            metrics_log_path=(
-                fold_path / "outer_refit" / "metrics.jsonl"
-                if context.live_metrics_log
-                else None
-            ),
+        state_path = (
+            fold_path
+            / f"candidate_{job.best_candidate_id}"
+            / f"inner_{context.inner_folds[0]}"
+            / "best_state.pt"
         )
+        scored_history: list[dict[str, Any]] = []
+        if len(context.inner_folds) == 1 and state_path.is_file():
+            scored_state = torch.load(state_path, map_location="cpu")
+        else:
+            final_result = train_model(
+                outer_train.genotypes,
+                outer_train.processed_targets,
+                None,
+                None,
+                final_config,
+                final_parameters,
+                device,
+                final_seed,
+                max_epochs=job.final_epoch,
+                patience=job.final_epoch,
+                fixed_epochs=job.final_epoch,
+                train_mask=outer_train.observed_mask,
+                trait_names=names,
+                metrics_log_path=(
+                    fold_path / "outer_refit" / "metrics.jsonl"
+                    if context.live_metrics_log
+                    else None
+                ),
+            )
+            scored_state = final_result.state_dict
+            scored_history = list(final_result.history)
         predictions, observed, test_loss = predict_model(
-            final_result.state_dict,
+            scored_state,
             outer_test.genotypes,
             outer_test.processed_targets,
             final_config,
@@ -727,7 +748,7 @@ def _run_outer_refit_job(
             names,
         ).metrics
         checkpoint = {
-            "state_dict": final_result.state_dict,
+            "state_dict": scored_state,
             "config": final_config,
             "parameters": final_parameters,
             "traits": list(names),
@@ -776,7 +797,7 @@ def _run_outer_refit_job(
         write_json(fold_path / "metrics.json", metrics)
         write_json(
             fold_path / "training_history.json",
-            {**job.histories, "outer_refit": list(final_result.history)},
+            {**job.histories, "outer_refit": scored_history},
         )
         write_json(
             fold_path / "sample_audit.json",

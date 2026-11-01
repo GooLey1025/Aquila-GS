@@ -55,6 +55,7 @@ from bnn_data_benchmark import (
     PreparedPair,
     load_trait_split,
     prepare_pair,
+    transform_markers,
 )
 from bnn_model_benchmark import build_model, predict_bnn, train_bnn
 
@@ -482,6 +483,7 @@ def run_outer_fold(
         flush=True,
     )
     pair_cache: dict[tuple[int, float, int], PreparedPair] = {}
+    holdout_fits: dict[int, Any] = {}
     for candidate_id, parameters in enumerate(candidates):
         config = merge_config(base_config, parameters)
         alpha = float(config["data"]["lasso_alpha"])
@@ -519,6 +521,8 @@ def run_outer_fold(
                     fit.metrics,
                 )
             )
+            if inner_count == 1:
+                holdout_fits[candidate_id] = (fit, pair)
         candidate_values = np.asarray(
             [result.metric for result in inner_results[candidate_id]], dtype=float
         )
@@ -545,28 +549,50 @@ def run_outer_fold(
     best_config = merge_config(base_config, best.parameters)
     final_epoch = half_up_median_epoch(best.best_epochs)
     final_seed = derive_seed(seed, outer_fold, best.candidate_id, 999)
-    pair = _load_pair(
-        data_directory,
-        prepared,
-        raw_targets,
-        trait_index,
-        outer_fold,
-        None,
-        best_config,
-        final_seed,
-    )
-    final_fit = train_bnn(
-        pair.train_features,
-        pair.train.targets,
-        None,
-        None,
-        best_config,
-        device,
-        final_seed,
-        evaluate_regression,
-        trait_name,
-        fixed_epochs=final_epoch,
-    )
+    if inner_count == 1:
+        final_fit, inner_pair = holdout_fits[best.candidate_id]
+        final_epoch = int(final_fit.best_epoch)
+        test_split = load_trait_split(
+            data_directory,
+            prepared.metadata,
+            prepared.target_mask,
+            raw_targets,
+            trait_index,
+            outer_fold,
+            None,
+            "test",
+        )
+        test_features = transform_markers(test_split.genotypes, inner_pair.pipeline)
+        pair = PreparedPair(
+            inner_pair.train,
+            test_split,
+            inner_pair.train_features,
+            test_features,
+            inner_pair.pipeline,
+        )
+    else:
+        pair = _load_pair(
+            data_directory,
+            prepared,
+            raw_targets,
+            trait_index,
+            outer_fold,
+            None,
+            best_config,
+            final_seed,
+        )
+        final_fit = train_bnn(
+            pair.train_features,
+            pair.train.targets,
+            None,
+            None,
+            best_config,
+            device,
+            final_seed,
+            evaluate_regression,
+            trait_name,
+            fixed_epochs=final_epoch,
+        )
     model = build_model(pair.train_features.shape[1], best_config, device)
     model.load_state_dict(final_fit.state_dict)
     predictions, uncertainty = predict_bnn(

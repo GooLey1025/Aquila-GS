@@ -2,8 +2,8 @@ seed: 42
 model_config: ../training/config/model_config.json
 
 training:
-  max_epochs: 100
-  patience: 40
+  max_epochs: 30
+  patience: 5
   batch_size: 16
 
 hpo:

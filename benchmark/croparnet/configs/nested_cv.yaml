@@ -8,8 +8,8 @@ training:
   weight_decay: 0.1
   batch_size: 64
   grad_clip: 1.0
-  max_epochs: 120
-  patience: 40
+  max_epochs: 30
+  patience: 5
 hpo:
   grid:
     model.weights_units:

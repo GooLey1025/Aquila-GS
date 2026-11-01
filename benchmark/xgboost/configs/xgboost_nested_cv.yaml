@@ -14,8 +14,8 @@ model:
   reg_lambda: 1.0
 
 train:
-  max_rounds: 1000
-  early_stopping_rounds: 40
+  max_rounds: 30
+  early_stopping_rounds: 5
 
 hpo:
   method: grid

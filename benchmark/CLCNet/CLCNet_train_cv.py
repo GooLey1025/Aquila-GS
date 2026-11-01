@@ -815,6 +815,8 @@ def run_outer_fold(
     inner_results: dict[int, list[InnerFoldResult]] = {
         candidate_id: [] for candidate_id in range(len(candidates))
     }
+    holdout_states: dict[int, Mapping[str, torch.Tensor]] = {}
+    holdout_selection: FeatureSelectionResult | None = None
     inner_histories: dict[str, Any] = {}
     inner_audits = []
     feature_selection_seconds = 0.0
@@ -909,6 +911,9 @@ def run_outer_fold(
             inner_histories[f"candidate_{candidate_id}_inner_{inner_fold}"] = list(
                 result.history
             )
+            if len(inner_folds) == 1:
+                holdout_states[candidate_id] = result.state_dict
+                holdout_selection = selection
             if resume:
                 _write_completed_inner_result(cache_path, cache_context, result)
             del result
@@ -932,15 +937,23 @@ def run_outer_fold(
     outer_train, outer_test = benchmark.load_single_trait_fold(
         trait_name, outer_fold, None
     )
-    selector_start = time.perf_counter()
-    final_selection = fit_feature_selector(
-        outer_train.genotypes,
-        outer_train.processed_targets,
-        outer_train.variants,
-        best_config["feature_selection"],
-        derive_seed(seed, outer_fold, hpo.best.candidate_id, 999),
+    use_holdout_checkpoint = (
+        len(inner_folds) == 1
+        and holdout_selection is not None
+        and hpo.best.candidate_id in holdout_states
     )
-    feature_selection_seconds += time.perf_counter() - selector_start
+    if use_holdout_checkpoint:
+        final_selection = holdout_selection
+    else:
+        selector_start = time.perf_counter()
+        final_selection = fit_feature_selector(
+            outer_train.genotypes,
+            outer_train.processed_targets,
+            outer_train.variants,
+            best_config["feature_selection"],
+            derive_seed(seed, outer_fold, hpo.best.candidate_id, 999),
+        )
+        feature_selection_seconds += time.perf_counter() - selector_start
     outer_train_genotypes, outer_test_genotypes = _selected_matrices(
         outer_train, outer_test, final_selection, missing_value
     )
@@ -955,17 +968,26 @@ def run_outer_fold(
     )
 
     final_train_start = time.perf_counter()
-    final_result = train_clcnet(
-        outer_train_genotypes,
-        outer_train.processed_targets,
-        None,
-        None,
-        best_config,
-        device,
-        derive_seed(seed, outer_fold, hpo.best.candidate_id, 999),
-        fixed_epochs=hpo.best.final_epoch,
-    )
-    final_training_seconds = time.perf_counter() - final_train_start
+    if use_holdout_checkpoint:
+        final_result = TrainingResult(
+            state_dict=holdout_states[hpo.best.candidate_id],
+            best_epoch=int(hpo.best.final_epoch),
+            best_metrics={},
+            history=(),
+        )
+        final_training_seconds = 0.0
+    else:
+        final_result = train_clcnet(
+            outer_train_genotypes,
+            outer_train.processed_targets,
+            None,
+            None,
+            best_config,
+            device,
+            derive_seed(seed, outer_fold, hpo.best.candidate_id, 999),
+            fixed_epochs=hpo.best.final_epoch,
+        )
+        final_training_seconds = time.perf_counter() - final_train_start
     evaluation_start = time.perf_counter()
     processed_predictions = predict_clcnet(
         outer_test_genotypes,

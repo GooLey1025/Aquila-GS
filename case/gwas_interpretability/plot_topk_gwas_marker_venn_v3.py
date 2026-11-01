@@ -620,7 +620,7 @@ def plot_upset(
     if "intersections" in axes:
         axes["intersections"].set_ylabel(
             f"Percentage of total loci (%)\n({trait_name})",
-            fontsize=10,
+            fontsize=8,
             fontweight="bold"
         )
 

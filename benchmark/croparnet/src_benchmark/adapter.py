@@ -429,6 +429,7 @@ def _run_trait_fold(
         flush=True,
     )
     candidate_records = []
+    holdout_states: dict[int, dict[str, torch.Tensor]] = {}
     for candidate_id, candidate in enumerate(worker_context.candidates):
         config = copy.deepcopy(worker_context.base_config)
         config["model"].update(candidate.get("model", {}))
@@ -458,6 +459,8 @@ def _run_trait_fold(
                     "history": list(fit.history),
                 }
             )
+            if worker_context.inner_count == 1:
+                holdout_states[candidate_id] = fit.state_dict
         candidate_records.append(
             {
                 "candidate_id": candidate_id,
@@ -494,24 +497,32 @@ def _run_trait_fold(
         train.missing_mask,
         test.missing_mask,
     )
-    final_fit = train_model(
-        train_x,
-        train.targets,
-        None,
-        None,
-        selected,
-        device,
-        _seed(
-            worker_context.seed,
-            job.trait_index,
-            outer_fold,
-            best["candidate_id"],
-            999,
-        ),
-        fixed_epochs=best["final_epoch"],
-    )
+    if worker_context.inner_count == 1:
+        scored_state = holdout_states[int(best["candidate_id"])]
+        scored_history = list(best["inner_results"][0]["history"])
+        scored_epoch = int(best["inner_results"][0]["best_epoch"])
+    else:
+        final_fit = train_model(
+            train_x,
+            train.targets,
+            None,
+            None,
+            selected,
+            device,
+            _seed(
+                worker_context.seed,
+                job.trait_index,
+                outer_fold,
+                best["candidate_id"],
+                999,
+            ),
+            fixed_epochs=best["final_epoch"],
+        )
+        scored_state = final_fit.state_dict
+        scored_history = list(final_fit.history)
+        scored_epoch = int(best["final_epoch"])
     model = _model(train_x.shape[1], selected).to(device)
-    model.load_state_dict(final_fit.state_dict)
+    model.load_state_dict(scored_state)
     model.eval()
     with torch.no_grad():
         predictions = model(
@@ -522,11 +533,11 @@ def _run_trait_fold(
     fold_path.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "state_dict": final_fit.state_dict,
+            "state_dict": scored_state,
             "config": selected,
             "trait": trait,
             "outer_fold": outer_fold,
-            "epoch": best["final_epoch"],
+            "epoch": scored_epoch,
             "scaler": {
                 "min": scaler.min_.tolist(),
                 "scale": scaler.scale_.tolist(),
@@ -535,7 +546,7 @@ def _run_trait_fold(
         fold_path / "checkpoint.pt",
     )
     _json(fold_path / "hpo.json", {"candidates": candidate_records, "best": best})
-    _json(fold_path / "history.json", list(final_fit.history))
+    _json(fold_path / "history.json", scored_history)
     _json(fold_path / "metrics.json", metrics)
     _json(
         fold_path / "audit.json",
@@ -560,7 +571,7 @@ def _run_trait_fold(
         "trait": trait,
         "outer_fold": outer_fold,
         "candidate_id": best["candidate_id"],
-        "epoch": best["final_epoch"],
+        "epoch": scored_epoch,
         "device": device_name,
         "metrics": metrics,
     }
