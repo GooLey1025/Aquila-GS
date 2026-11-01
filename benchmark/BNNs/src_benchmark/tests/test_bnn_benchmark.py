@@ -59,6 +59,25 @@ def test_gpu_cli_default_selection_and_cpu() -> None:
     assert cpu.gpus == []
 
 
+def test_resume_cli_is_supported(tmp_path: Path) -> None:
+    arguments = RUNNER.parse_args(
+        ["--data-dir", "data", "-o", str(tmp_path), "--resume"]
+    )
+    assert arguments.resume is True
+    assert arguments.overwrite is False
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        RUNNER.main(
+            [
+                "--data-dir",
+                "data",
+                "-o",
+                str(tmp_path),
+                "--overwrite",
+                "--resume",
+            ]
+        )
+
+
 def test_gpu_slot_expansion_and_positive_job_count() -> None:
     assert RUNNER.expand_gpu_workers([0, 2], 3) == [0, 0, 0, 2, 2, 2]
     with pytest.raises(SystemExit):
@@ -206,6 +225,9 @@ def _write_completed_fold(root: Path, trait: str, outer_fold: int) -> None:
 
 def test_completed_trait_requires_every_outer_fold(tmp_path: Path) -> None:
     _write_completed_fold(tmp_path, "TraitA", 0)
+    finished = RUNNER._load_completed_trait_fold(tmp_path, "TraitA", 0)
+    assert finished is not None and finished["recovered"] is True
+    assert RUNNER._load_completed_trait_fold(tmp_path, "TraitA", 1) is None
     assert RUNNER._load_completed_trait(tmp_path, "TraitA", [0, 1]) is None
 
     _write_completed_fold(tmp_path, "TraitA", 1)

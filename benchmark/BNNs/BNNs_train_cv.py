@@ -138,8 +138,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help=(
-            "Delete the output directory before running. Without this flag, "
-            "traits with every requested outer fold fully completed are reused."
+            "Delete the output directory before running. Mutually exclusive "
+            "with --resume."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Reuse trait/fold outputs that already contain a complete result. "
+            "This is also the default when --overwrite is omitted."
         ),
     )
     parser.add_argument("--max-candidates", type=int, default=None)
@@ -724,12 +732,15 @@ def _run_trait_fold(
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.overwrite and args.resume:
+        raise ValueError("--overwrite and --resume are mutually exclusive")
+    resume = args.resume or not args.overwrite
     data_directory = Path(args.data_dir).resolve()
     output_directory = Path(args.output_dir).resolve()
     if output_directory.exists() and any(output_directory.iterdir()):
         if args.overwrite:
             shutil.rmtree(output_directory)
-        else:
+        elif resume:
             print(
                 f"[INFO] Resuming from existing results in {output_directory}",
                 flush=True,
@@ -773,20 +784,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     completed_results = []
     jobs = []
     for trait_position, trait_name in enumerate(traits):
-        completed_trait = (
-            _load_completed_trait(output_directory, trait_name, outer_folds)
-            if not args.overwrite
-            else None
-        )
-        if completed_trait is not None:
-            completed_results.extend(completed_trait)
-            print(
-                f"[INFO] BNN trait={trait_name} recovered completed trait "
-                f"({len(outer_folds)}/{len(outer_folds)} outer folds); skipping",
-                flush=True,
-            )
-            continue
         for fold_position, outer_fold in enumerate(outer_folds):
+            completed_fold = (
+                _load_completed_trait_fold(
+                    output_directory, trait_name, outer_fold
+                )
+                if resume
+                else None
+            )
+            if completed_fold is not None:
+                completed_results.append(completed_fold)
+                print(
+                    f"[INFO] BNN trait={trait_name} outer_fold={outer_fold} "
+                    "recovered completed fold; skipping",
+                    flush=True,
+                )
+                continue
             jobs.append(
                 TraitFoldJob(
                     job_id=trait_position * len(outer_folds) + fold_position,
