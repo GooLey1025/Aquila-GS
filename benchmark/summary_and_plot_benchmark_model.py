@@ -547,9 +547,9 @@ def load_model_result(
 def load_expected_traits(benchmark_dir: Path, cohort: str) -> list[str]:
     species = cohort_species(cohort)
     data_dirs = []
-    # Fold-count aliases normally reuse a reduced BLUP panel. Rice655, including
-    # Rice655_10folds, is summarized on every phenotype in the full CV panel.
-    if species != cohort and species != "Rice655":
+    # Fold-count aliases reuse a reduced BLUP panel. Rice655, including
+    # Rice655_10folds, is summarized on its BLUP phenotypes only.
+    if species != cohort or species == "Rice655":
         data_dirs.extend(
             [
                 f"{species}.current_fold_GWAS.cv.blup.data",
@@ -579,7 +579,12 @@ def load_expected_traits(benchmark_dir: Path, cohort: str) -> list[str]:
             continue
         traits = payload.get("trait_names")
         if isinstance(traits, Sequence) and not isinstance(traits, (str, bytes)):
-            return [str(trait) for trait in traits]
+            names = [str(trait) for trait in traits]
+            if species == "Rice655":
+                blup_names = [trait for trait in names if trait.endswith("_BLUP")]
+                if blup_names:
+                    return blup_names
+            return names
     return []
 
 

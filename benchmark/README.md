@@ -80,7 +80,7 @@ GWAS lead variants are selected independently from the training samples of each 
 for FOLD in {0..9}; do
   aquila_data_cv_holdout.py \
     --vcf "./species_data/Rice655.r2_0.035.SV_delins_r2_0.5.current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
-    --phenotype Rice655.pheno \
+    --phenotype Rice655.blup.pheno \
     --encoding-type diploid_onehot \
     --variant-type snp \
     --id-prefix "SNP-" \
