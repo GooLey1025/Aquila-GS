@@ -36,7 +36,7 @@ For Aquila, missing phenotypic observations are handled natively through a maske
 wget https://iagr.genomics.cn/static/gstool/data/GSTP008/population/GSTP008.pheno
 # However, the 705rice have a total of 50 low-depth duplicated samples, filtering required.
 
-aquila_cv.py --phenotype Rice655.pheno -o 655rice_nested_cv_10folds.json --outer-folds 10 --inner-folds 4 --seed 42
+aquila_cv_holdout.py --phenotype Rice655.pheno -o 655rice.holdout_cv.json --outer-folds 10 --seed 42 --min-observed 30
 ```
 
 The JSON mapping fixes both outer and inner folds and was used throughout the pipeline, including [GWAS lead-variant selection](https://github.com/GooLey1025/Multi_Source_Marker_Panel_generation), to avoid information leakage. Specifically, GWAS discovery and lead-variant selection were performed using only the training samples within each outer fold, while test samples were completely excluded from this process.
@@ -79,15 +79,15 @@ GWAS lead variants are selected independently from the training samples of each 
 
 ```sh
 for FOLD in {0..9}; do
-  aquila_data_cv.py \
-    --vcf "./species_data/Rice655-current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
+  aquila_data_cv_holdout.py \
+    --vcf "./species_data/Rice655.r2_0.035.SV_delins_r2_0.5.current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
     --phenotype Rice655.pheno \
     --encoding-type diploid_onehot \
     --variant-type snp \
     --id-prefix "SNP-" \
-    --fold-mapping 655rice_nested_cv_10folds.json \
+    --fold-mapping 655rice.holdout_cv.json \
     --fold-specific-gwas-fold "$FOLD" \
-    -o "Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    -o "Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --save-raw-genotype \
     --overwrite
 done
@@ -99,13 +99,13 @@ Aquila-Vars uses separate SNP, INDEL, and SV branches, so its prepared data are 
 
 ```sh
 for FOLD in {0..9}; do
-  aquila_data_cv.py \
-    --vcf "./species_data/Rice655-current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
+  aquila_data_cv_holdout.py \
+    --vcf "./species_data/Rice655.r2_0.035.SV_delins_r2_0.5.current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
     --phenotype Rice655.pheno \
     --encoding-type diploid_onehot \
-    --fold-mapping 655rice_nested_cv_10folds.json \
+    --fold-mapping 655rice.holdout_cv.json \
     --fold-specific-gwas-fold "$FOLD" \
-    -o "Rice655.current_fold_GWAS.vars.cv.data/fold_${FOLD}" \
+    -o "Rice655.current_fold_GWAS.vars.holdout.cv.data/fold_${FOLD}" \
     --save-raw-genotype \
     --overwrite
 done
@@ -119,9 +119,9 @@ Each output directory records its bound outer fold in `metadata.json`. Training 
 cd aquila-snp
 
 for FOLD in {0..9}; do
-  aquila_train_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
-    --config  32hpo_budgets.yaml \
+  aquila_train_cv_holdout.py \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --config aquila-snp.holdout.hpo.yaml \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --live-metrics-log \
     --use-deterministic \
@@ -137,9 +137,9 @@ cd ..
 cd aquila-vars
 
 for FOLD in {0..9}; do
-  aquila_train_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.vars.cv.data/fold_${FOLD}" \
-    --config 32hpo_budgets.aquila-vars.yaml \
+  aquila_train_cv_holdout.py \
+    --data-dir "../Rice655.current_fold_GWAS.vars.holdout.cv.data/fold_${FOLD}" \
+    --config aquila-vars.holdout.hpo.yaml \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --live-metrics-log \
     --use-deterministic \
@@ -158,7 +158,7 @@ cd croparnet
 
 for FOLD in {0..9}; do
   python src_benchmark/adapter.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -179,7 +179,7 @@ The upstream pipeline uses MIC-based SNP filtering and limits the selected set t
 cd cropformer
 for FOLD in {0..9}; do
   python src_benchmark/adapter.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -194,7 +194,7 @@ done
 cd xgboost
 for FOLD in {0..9}; do
   python xgboost_train_nested_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --config configs/xgboost_nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -211,7 +211,7 @@ BayesCpi uses the single fixed configuration in `bayescpi/configs/nested_cv.yaml
 cd bayescpi
 for FOLD in {0..9}; do
   python bayescpi_nested_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -227,7 +227,7 @@ rrBLUP uses the single fixed `REML` configuration in `rrBLUP/configs/nested_cv.y
 cd rrBLUP
 for FOLD in {0..9}; do
   python rrblup_nested_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -241,7 +241,7 @@ done
 cd Lasso
 for FOLD in {0..9}; do
   python lasso_nested_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -255,7 +255,7 @@ done
 cd ElasticNet
 for FOLD in {0..9}; do
   python elasticnet_nested_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -271,7 +271,7 @@ Some scripts from CLCNet were copied or adapted into our project repository. The
 cd CLCNet
 for FOLD in {0..9}; do
   python CLCNet_train_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --config configs/CLCNet_nested_cv.yaml \
     --outer-folds "$FOLD" \
     --jobs-per-gpu 2 \
@@ -288,7 +288,7 @@ Some scripts from MENET were copied or adapted into our project repository. The 
 cd MENET
 for FOLD in {0..9}; do
   python MENET_train_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --config configs/MeNet_nested_cv.yaml \
     --outer-folds "$FOLD" \
     --jobs-per-gpu 2 \
@@ -308,7 +308,7 @@ cd Whisperer_of_DNA
 conda activate aquila_dnawhisperer
 for FOLD in {0..9}; do
   python Whisperer_train_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --config configs/Whisperer_nested_cv.yaml \
     --outer-folds "$FOLD" \
     --output-dir "results/Rice655_10folds/fold_${FOLD}" \
@@ -327,7 +327,7 @@ BNNs retains its internal Lasso-based feature-selection module because it is tre
 cd BNNs
 for FOLD in {0..9}; do
   python BNNs_train_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
     --config configs/BNNs_nested_cv.yaml \
     --outer-folds "$FOLD" \
     --output-dir "results/Rice655_10folds/fold_${FOLD}" \
