@@ -196,9 +196,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
+        help="Delete the output directory before running.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
         help=(
-            "Delete the output directory before running. Without this flag, "
-            "completed folds and completed inner metrics logs are reused."
+            "Reuse completed outer folds and completed inner metrics logs "
+            "from an interrupted run. This is also the default when "
+            "--overwrite is not set."
         ),
     )
     parser.add_argument("--max-inner-folds", type=int, default=None)
@@ -856,9 +862,12 @@ def _run_outer_refit_job(
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.overwrite and args.resume:
+        raise ValueError("--overwrite and --resume are mutually exclusive")
     data_directory = Path(args.data_dir).resolve()
     config_path = Path(args.config).resolve()
     output_directory = Path(args.output_dir).resolve()
+    resume = args.resume or not args.overwrite
     if output_directory.exists() and any(output_directory.iterdir()):
         if args.overwrite:
             shutil.rmtree(output_directory)
@@ -911,7 +920,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     for outer_fold in outer_folds:
         completed = (
             _load_completed_outer_fold(output_directory, outer_fold, traits)
-            if not args.overwrite
+            if resume
             else None
         )
         if completed is None:
@@ -932,7 +941,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_epochs=max_epochs,
         budget=budget,
         live_metrics_log=args.live_metrics_log,
-        resume=not args.overwrite,
+        resume=resume,
     )
     inner_jobs = _build_inner_hpo_jobs(
         pending_outer_folds,

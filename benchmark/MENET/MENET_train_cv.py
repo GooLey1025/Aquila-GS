@@ -1206,7 +1206,6 @@ def run_outer_fold(
     encoder_epoch_by_candidate: dict[int, list[int]] = {
         index: [] for index in range(len(candidates))
     }
-    holdout_models: dict[int, tuple[EncoderResult, MeNetResult]] = {}
     split_audit = []
     candidate_configs = [
         merge_config(base_config, parameters) for parameters in candidates
@@ -1376,8 +1375,6 @@ def run_outer_fold(
                 )
             )
             encoder_epoch_by_candidate[candidate_id].append(encoder.best_epoch)
-            if inner_count == 1:
-                holdout_models[candidate_id] = (encoder, result)
 
     candidate_results = []
     for candidate_id, parameters in enumerate(candidates):
@@ -1425,25 +1422,19 @@ def run_outer_fold(
         missing_value,
     )
     validate_variant_schema(outer_train, outer_test)
-    if inner_count == 1 and best.candidate_id in holdout_models:
-        final_encoder, final_menet = holdout_models[best.candidate_id]
-        final_encoder_epoch = int(final_encoder.best_epoch)
-        final_menet_epoch = int(final_menet.best_epoch)
-    else:
-        final_encoder = train_encoder(
-            outer_train,
-            None,
-            best_config,
-            device,
-            derive_seed(seed, outer_fold, best.candidate_id, 999),
-            fixed_epochs=final_encoder_epoch,
-            metrics_log_path=(
-                fold_path / "outer_refit" / "encoder_metrics.jsonl"
-                if live_metrics_log
-                else None
-            ),
-        )
-        final_menet = None
+    final_encoder = train_encoder(
+        outer_train,
+        None,
+        best_config,
+        device,
+        derive_seed(seed, outer_fold, best.candidate_id, 999),
+        fixed_epochs=final_encoder_epoch,
+        metrics_log_path=(
+            fold_path / "outer_refit" / "encoder_metrics.jsonl"
+            if live_metrics_log
+            else None
+        ),
+    )
     train_rep, test_rep, relation_scale = build_relatedness(
         outer_train,
         outer_test,
@@ -1451,22 +1442,21 @@ def run_outer_fold(
         final_encoder.state_dict,
         device,
     )
-    if final_menet is None:
-        final_menet = train_menet(
-            outer_train,
-            None,
-            train_rep,
-            None,
-            best_config,
-            device,
-            derive_seed(seed + 1, outer_fold, best.candidate_id, 999),
-            fixed_epochs=final_menet_epoch,
-            metrics_log_path=(
-                fold_path / "outer_refit" / "menet_metrics.jsonl"
-                if live_metrics_log
-                else None
-            ),
-        )
+    final_menet = train_menet(
+        outer_train,
+        None,
+        train_rep,
+        None,
+        best_config,
+        device,
+        derive_seed(seed + 1, outer_fold, best.candidate_id, 999),
+        fixed_epochs=final_menet_epoch,
+        metrics_log_path=(
+            fold_path / "outer_refit" / "menet_metrics.jsonl"
+            if live_metrics_log
+            else None
+        ),
+    )
     normalized_metrics, normalized_predictions = evaluate_model(
         outer_train,
         outer_test,

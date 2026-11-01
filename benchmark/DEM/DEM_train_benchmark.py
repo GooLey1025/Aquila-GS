@@ -52,7 +52,6 @@ from data_ncv_benchmark import (
     ENCODING_NAMES,
     MODALITY_ORDER,
     SelectedSplits,
-    apply_selected_features,
     load_metadata,
     load_split,
     load_target_tensors,
@@ -401,8 +400,6 @@ def run_outer_fold(
     inner_results: dict[int, list[InnerFoldResult]] = {
         index: [] for index in range(len(context.candidates))
     }
-    holdout_fits: dict[int, Any] = {}
-    holdout_selected: SelectedSplits | None = None
     inner_audit = []
     for inner_fold in range(context.inner_count):
         selected = _load_pair(
@@ -453,9 +450,6 @@ def run_outer_fold(
                     inner_fold, fit.best_metric, fit.best_epoch, fit.metrics
                 )
             )
-            if context.inner_count == 1:
-                holdout_fits[candidate_id] = fit
-                holdout_selected = selected
     candidates = []
     for candidate_id, parameters in enumerate(context.candidates):
         results = tuple(inner_results[candidate_id])
@@ -467,51 +461,23 @@ def run_outer_fold(
     best = select_candidate(candidates)
     best_config = merge_config(context.base_config, best.parameters)
     final_epoch = half_up_median_epoch(best.best_epochs)
-    if context.inner_count == 1 and holdout_selected is not None:
-        final_fit = holdout_fits[best.candidate_id]
-        final_epoch = int(final_fit.best_epoch)
-        data_config = best_config["data"]
-        test_raw = load_split(
-            context.data_directory,
-            context.metadata,
-            context.target_mask,
-            context.raw_targets,
-            job.trait_index,
-            job.outer_fold,
-            None,
-            "test",
-            int(data_config["min_observed"]),
-            context.modalities,
-        )
-        transformed = test_raw
-        for branch_index, indices in enumerate(holdout_selected.selected_indices):
-            transformed = apply_selected_features(transformed, indices, branch_index)
-        selected = SelectedSplits(
-            holdout_selected.train,
-            transformed,
-            holdout_selected.selected_indices,
-            holdout_selected.selected_variants,
-            holdout_selected.importances,
-            holdout_selected.modality_names,
-        )
-    else:
-        selected = _load_pair(
-            context, job.trait_index, job.outer_fold, None, best_config
-        )
-        final_fit = train_dem(
-            selected.train.modalities,
-            selected.train.targets,
-            None,
-            None,
-            best_config,
-            device,
-            derive_seed(
-                context.seed, job.trait_index, job.outer_fold, best.candidate_id, 999
-            ),
-            evaluate_regression,
-            job.trait_name,
-            fixed_epochs=final_epoch,
-        )
+    selected = _load_pair(
+        context, job.trait_index, job.outer_fold, None, best_config
+    )
+    final_fit = train_dem(
+        selected.train.modalities,
+        selected.train.targets,
+        None,
+        None,
+        best_config,
+        device,
+        derive_seed(
+            context.seed, job.trait_index, job.outer_fold, best.candidate_id, 999
+        ),
+        evaluate_regression,
+        job.trait_name,
+        fixed_epochs=final_epoch,
+    )
     input_dims = [values.shape[1] for values in selected.train.modalities]
     model = _load_model(final_fit.state_dict, best_config, input_dims, device)
     predictions, test_loss = predict_dem(

@@ -1,84 +1,82 @@
-# Species outer-holdout benchmark
+# Species nested-CV benchmark
 
-This is the multi-species run of the outer-holdout protocol.
+This is the multi-species run of the nested cross-validation protocol.
 
 ## Protocol
 
-Each cohort is split once, and every model uses that split.
+Each cohort uses one fixed nested split, and every model uses that split.
 
-1. Outer 10-fold, test:train = 1:9. `aquila_cv_holdout.py` writes this split.
-2. Each outer-training set is split once more into inner train:valid = 4:1. That inner split is stored in the same mapping.
-3. Phenotype preprocessing is fit on inner train only and applied to inner valid and outer test.
-4. Training uses the inner-training samples. Inner valid is only for model selection. The selected model is scored on the outer test.
+1. Outer 10-fold, test:train = 1:9, with 4 inner folds inside each outer-training set. `aquila_cv.py` writes this split.
+2. Inner folds are used only to compare candidate configurations. The selected configuration is refit on the complete outer-training partition and scored on the outer test.
+3. Methods with one fixed configuration, currently rrBLUP and BayesCpi, skip inner-fold fitting and train directly on the complete outer-training partition.
+4. Phenotype preprocessing is fit on the training side of each split. For an inner fold it is fit on `inner_train` and applied to `inner_valid`. For final evaluation it is fit again on `outer_train` and applied to `outer_train` and `outer_test`.
 
 ## Cohorts
 
 Set one cohort, then run the commands below from `benchmark/`.
 
 ```sh
-COHORT=Maize1404_10folds_holdout
+COHORT=Maize1404_pheno_10folds
 PHENO_FILE=species_data/Maize1404/benchmark.pheno
 VCF_FILE=species_data/Maize1404/Maize1404.coding.ld.vcf.gz
 
-# COHORT=Soybean975_10folds_holdout
+# COHORT=Soybean975_blup_pheno_10folds
 # PHENO_FILE=species_data/Soybean975/benchmark.blup.pheno
 # VCF_FILE=species_data/Soybean975/Soybean975.coding.ld.vcf.gz
 
-# COHORT=wheat994_10folds_holdout
+# COHORT=wheat994_blup_pheno_10folds
 # PHENO_FILE=species_data/wheat994/benchmark.blup.pheno
 # VCF_FILE=species_data/wheat994/wheat994.coding.ld.vcf.gz
 
-# COHORT=Rice1171_10folds_holdout
+# COHORT=Rice1171_pheno_10folds
 # PHENO_FILE=species_data/Rice1171/1171rice.pheno
 # VCF_FILE=species_data/Rice1171/Rice1171.coding.ld.vcf.gz
 
-# COHORT=Rice532_10folds_holdout
+# COHORT=Rice532
 # PHENO_FILE=species_data/Rice532/532rice.pheno
 # VCF_FILE=species_data/Rice532/Rice532.coding.ld.vcf.gz
 ```
 
-Rice1171 keeps SNP IDs with the `SNP-` prefix and does not build an Aquila-Vars directory. The other cohorts prepare both `$COHORT.holdout.cv.data` and `$COHORT.vars.holdout.cv.data`.
+Rice1171 keeps SNP IDs with the `SNP-` prefix and does not build an Aquila-Vars directory. The other cohorts prepare both `$COHORT.cv.data` and `$COHORT.vars.cv.data`.
 
 ## Prepare the shared splits
 
-Run from `benchmark/` in the `aquila` environment. Install the holdout entry points first if this checkout has not been installed yet (`pip install -e .` from the repository root).
+Run from `benchmark/` in the `aquila` environment.
 
 ```sh
 export PATH="$CONDA_PREFIX/bin:$PATH"
 conda activate aquila
 
-aquila_cv_holdout.py --phenotype $PHENO_FILE \
-  -o $COHORT.holdout_cv.json \
-  --outer-folds 10 --seed 42 --min-observed 20
+aquila_cv.py --phenotype $PHENO_FILE \
+  -o $COHORT.nested_cv.json \
+  --outer-folds 10 --inner-folds 4 --seed 42 --min-observed 20
 
-aquila_data_cv_holdout.py \
+if [[ "$COHORT" == *Rice1171* ]]; then
+  SNP_PREFIX=(--id-prefix "SNP-")
+else
+  SNP_PREFIX=()
+fi
+aquila_data_cv.py \
   --vcf $VCF_FILE \
   --phenotype $PHENO_FILE \
   --encoding-type diploid_onehot \
   --variant-type snp \
-  --fold-mapping $COHORT.holdout_cv.json \
-  -o $COHORT.holdout.cv.data \
+  "${SNP_PREFIX[@]}" \
+  --fold-mapping $COHORT.nested_cv.json \
+  -o $COHORT.cv.data \
   --save-raw-genotype \
   --overwrite
-```
-
-Add `--id-prefix SNP-` for Rice1171. For every cohort except Rice1171, prepare Aquila-Vars the same way without `--variant-type snp` and without an ID prefix, writing `$COHORT.vars.holdout.cv.data`.
-
-```sh
-if [ "$COHORT" == "Rice1171_10folds_holdout" ]; then
-aquila_data_cv_holdout.py \
-  --vcf $VCF_FILE \
-  --phenotype $PHENO_FILE \
-  --encoding-type diploid_onehot \
-  --variant-type snp \
-  --id-prefix SNP- \
-  --fold-mapping $COHORT.holdout_cv.json \
-  -o $COHORT.holdout.cv.data \
-  --save-raw-genotype \
-  --overwrite
+if [[ "$COHORT" != *Rice1171* ]]; then
+  aquila_data_cv.py \
+    --vcf $VCF_FILE \
+    --phenotype $PHENO_FILE \
+    --encoding-type diploid_onehot \
+    --fold-mapping $COHORT.nested_cv.json \
+    -o $COHORT.vars.cv.data \
+    --save-raw-genotype \
+    --overwrite
 fi
 ```
-
 
 ## Comparison models
 
@@ -87,46 +85,46 @@ Each block below is run from `benchmark/` after the data step. Outputs land in t
 ```sh
 cd croparnet
 /usr/bin/time -v -o $COHORT.time.txt python src_benchmark/adapter.py \
-  --data-dir ../$COHORT.holdout.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
   -o results/$COHORT \
   --jobs-per-gpu 4 --overwrite
 
 cd ../cropformer
 /usr/bin/time -v -o $COHORT.time.txt python src_benchmark/adapter.py \
-  --data-dir ../$COHORT.holdout.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
   -o results/$COHORT \
   --jobs-per-gpu 4 --overwrite
 
 cd ../xgboost
 /usr/bin/time -v -o $COHORT.time.txt python xgboost_train_nested_cv.py \
-  --data-dir ../$COHORT.holdout.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/xgboost_nested_cv.yaml \
   -o results/$COHORT \
   --n-jobs 4 --overwrite
 
 cd ../bayescpi
 /usr/bin/time -v -o $COHORT.time.txt python bayescpi_nested_cv.py \
-  --data-dir ../$COHORT.holdout.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
   -o results/$COHORT --overwrite
 
 cd ../rrBLUP
 /usr/bin/time -v -o $COHORT.time.txt python rrblup_nested_cv.py \
-  --data-dir ../$COHORT.holdout.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
   -o results/$COHORT --overwrite
 
 cd ../Lasso
 python lasso_nested_cv.py \
-  --data-dir ../$COHORT.holdout.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
   -o results/$COHORT --overwrite
 
 cd ../ElasticNet
 python elasticnet_nested_cv.py \
-  --data-dir ../$COHORT.holdout.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/nested_cv.yaml \
   -o results/$COHORT --overwrite
 
@@ -134,7 +132,7 @@ cd ../CLCNet
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2 \
 /usr/bin/time -v -o "$COHORT.time.txt" \
 python CLCNet_train_cv.py \
-  --data-dir "../$COHORT.holdout.cv.data" \
+  --data-dir "../$COHORT.cv.data" \
   --config configs/CLCNet_nested_cv.yaml \
   --jobs-per-gpu 1 \
   -o "results/$COHORT" \
@@ -142,14 +140,14 @@ python CLCNet_train_cv.py \
 
 cd ../MENET
 /usr/bin/time -v -o $COHORT.time.txt python MENET_train_cv.py \
-  --data-dir ../$COHORT.holdout.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/MeNet_nested_cv.yaml \
   --jobs-per-gpu 2 \
   -o results/$COHORT --overwrite
 
 cd ../DEM
 /usr/bin/time -v -o $COHORT.DEM-SNP.time.txt python DEM_train_benchmark.py \
-  --data-dir ../$COHORT.holdout.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/DEM-SNP_nested_cv.yaml \
   --output-dir results/DEM-SNP/$COHORT \
   --jobs-per-gpu 2 --overwrite
@@ -157,7 +155,7 @@ cd ../DEM
 conda activate aquila_dnawhisperer
 cd ../Whisperer_of_DNA
 /usr/bin/time -v -o $COHORT.time.txt python Whisperer_train_cv.py \
-  --data-dir ../$COHORT.holdout.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/Whisperer_nested_cv.yaml \
   --output-dir results/$COHORT \
   --jobs-per-gpu 2 --overwrite
@@ -165,7 +163,7 @@ cd ../Whisperer_of_DNA
 conda activate aquila
 cd ../BNNs
 /usr/bin/time -v -o $COHORT.time.txt python BNNs_train_cv.py \
-  --data-dir ../$COHORT.holdout.cv.data \
+  --data-dir ../$COHORT.cv.data \
   --config configs/BNNs_nested_cv.yaml \
   --output-dir results/$COHORT \
   --jobs-per-gpu 2 --overwrite
@@ -177,40 +175,41 @@ Aquila-SNP multi-trait:
 
 ```sh
 cd ../aquila-snp
-aquila_train_cv_holdout.py --data-dir ../$COHORT.holdout.cv.data \
-  --config aquila-snp.holdout.hpo.yaml \
+aquila_train_cv.py --data-dir ../$COHORT.cv.data \
+  --config 32hpo_budgets.yaml \
   -o results/$COHORT --live-metrics-log --overwrite
 ```
 
-Aquila-Vars, when `$COHORT.vars.holdout.cv.data` exists:
+Aquila-Vars, when `$COHORT.vars.cv.data` exists:
 
 ```sh
 cd ../aquila-vars
-aquila_train_cv_holdout.py --data-dir ../$COHORT.vars.holdout.cv.data \
-  --config aquila-vars.holdout.hpo.yaml \
+aquila_train_cv.py --data-dir ../$COHORT.vars.cv.data \
+  --config 32hpo_budgets.aquila-vars.yaml \
   -o results/$COHORT --live-metrics-log --use-deterministic --overwrite
 ```
 
 ## (Discarded)
-Single-trait Aquila-SNP repeats the holdout preparation and training once per phenotype column:
+
+Single-trait Aquila-SNP repeats the nested-CV preparation and training once per phenotype column:
 
 ```sh
 cd ../aquila-snp
 IFS=$'\t' read -r -a PHENO_COLUMNS < "../$PHENO_FILE"
 for TRAIT in "${PHENO_COLUMNS[@]:1}"; do
-  aquila_data_cv_holdout.py \
+  aquila_data_cv.py \
     --vcf "../$VCF_FILE" \
     --phenotype "../$PHENO_FILE" \
     --traits "$TRAIT" \
     --encoding-type diploid_onehot \
     --variant-type snp \
     "${SNP_PREFIX[@]}" \
-    --fold-mapping "../$COHORT.holdout_cv.json" \
-    -o "../$COHORT.single_task.holdout.cv.data/$TRAIT" \
+    --fold-mapping "../$COHORT.nested_cv.json" \
+    -o "../$COHORT.single_task.cv.data/$TRAIT" \
     --overwrite
-  aquila_train_cv_holdout.py \
-    --data-dir "../$COHORT.single_task.holdout.cv.data/$TRAIT" \
-    --config aquila-snp.holdout.hpo.yaml \
+  aquila_train_cv.py \
+    --data-dir "../$COHORT.single_task.cv.data/$TRAIT" \
+    --config 32hpo_budgets.yaml \
     -o "results/$COHORT.single_task/$TRAIT" \
     --live-metrics-log \
     --overwrite

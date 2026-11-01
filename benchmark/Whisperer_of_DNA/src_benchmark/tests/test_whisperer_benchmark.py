@@ -72,6 +72,8 @@ def test_gpu_cli_default_selection_and_cpu() -> None:
     assert default.traits is None
     assert default.live_metrics_log is False
     assert parse_args([*base, "--live-metrics-log"]).live_metrics_log is True
+    assert parse_args([*base, "--resume"]).resume is True
+    assert default.resume is False
     assert selected.gpus == [1, 3]
     assert cpu.gpus == []
 

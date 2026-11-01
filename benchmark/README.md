@@ -25,7 +25,7 @@ $CONDA_PREFIX/bin/Rscript -e 'install.packages("hibayes", repos="https://cloud.r
 
 ## Data Prepare
 
-To ensure a fair comparison, every method uses the same outer-holdout split. The cohort is divided into 10 outer folds, test:train = 1:9. Each outer-training set is split once into inner train and inner valid at 4:1. Models that compare several configurations train on inner train and use inner valid only for selection. The selected model is scored on the outer test. The full outer-training set is not used for a second fit. Methods with one fixed configuration, currently rrBLUP and BayesCpi, also fit once on the inner-training samples and are scored on that same outer test.
+To ensure a fair comparison, we first generated a fixed nested cross-validation scheme and applied exactly the same outer-fold sample partitions to all methods. The outer folds are used for final model evaluation. Inner folds are used only by methods that compare multiple candidate configurations and therefore require hyperparameter optimization or model selection. Methods with one fixed configuration, currently rrBLUP and BayesCpi, skip inner-fold fitting and train directly on the complete outer-training partition. All models are evaluated on the same held-out outer-test samples.
 
 For Aquila, missing phenotypic observations are handled natively through a masked multi-task learning strategy. Specifically, missing trait values are excluded from the loss calculation while the remaining observed traits continue to contribute to model optimization, allowing the model to exploit correlations among multiple traits without requiring phenotype imputation. For other methods that do not support missing phenotypes, missing observations were handled according to their model assumptions. Single-trait models were trained using only individuals with available phenotypic records for the target trait. Importantly, these models still followed the same predefined cross-validation partitions as Aquila, ensuring that differences in performance reflect model behavior rather than differences in data splitting. This evaluation framework assesses genomic prediction performance under realistic incomplete phenotype conditions encountered in practical breeding programs.
 
@@ -36,23 +36,24 @@ For Aquila, missing phenotypic observations are handled natively through a maske
 wget https://iagr.genomics.cn/static/gstool/data/GSTP008/population/GSTP008.pheno
 # However, the 705rice have a total of 50 low-depth duplicated samples, filtering required.
 
-aquila_cv_holdout.py --phenotype Rice655.pheno -o 655rice.holdout_cv.json --outer-folds 10 --seed 42 --min-observed 30
+aquila_cv.py --phenotype Rice655.pheno -o 655rice_nested_cv_10folds.json --outer-folds 10 --inner-folds 4 --seed 42
 ```
 
-`655rice.holdout_cv.json` keeps the outer test and outer train sample sets from the previous 10-fold split of `Rice655.pheno` (`--outer-folds 10 --seed 42`). [GWAS lead-variant selection](https://github.com/GooLey1025/Multi_Source_Marker_Panel_generation) was run on each complete outer-training set, with outer-test samples excluded. The holdout file stores those same outer partitions and one new 4:1 inner split inside each outer-training set, so the fold-specific marker panels stay aligned with the samples used for GWAS.
+The JSON mapping fixes both outer and inner folds and was used throughout the pipeline, including [GWAS lead-variant selection](https://github.com/GooLey1025/Multi_Source_Marker_Panel_generation), to avoid information leakage. Specifically, GWAS discovery and lead-variant selection were performed using only the training samples within each outer fold, while test samples were completely excluded from this process.
 
-When `--save-raw-genotype` is enabled, sample-subset VCF files are written under each prepared directory's `raw_genotype/`. Every outer fold contains `train.vcf.gz` and `test.vcf.gz`. Its single inner holdout, `inner_fold_0`, contains `train.vcf.gz` and `valid.vcf.gz`. These files preserve the source variants and genotype fields, but include only the samples assigned to that split. These raw fold-specific VCFs allow benchmark models to apply their own genotype encodings while using exactly the same samples as Aquila.
+When `--save-raw-genotype` is enabled, sample-subset VCF files are written under each prepared directory's `raw_genotype/`. Every outer fold contains `train.vcf.gz` and `test.vcf.gz`; every nested inner fold contains `train.vcf.gz` and `valid.vcf.gz`. These files preserve the source variants and genotype fields, but include only the samples assigned to that split. These raw fold-specific VCFs allow benchmark models to apply their own genotype encodings while using exactly the same samples as Aquila.
 
 Phenotypes are preprocessed once during data preparation and the resulting fold-specific standardized targets are reused by all downstream benchmarks. This provides a consistent phenotype input and prevents each method from introducing differences through independent preprocessing.
 
-To avoid information leakage, preprocessing parameters are estimated from the inner-training samples only:
+To avoid information leakage, preprocessing parameters are always estimated from the corresponding training samples only:
 
-- Trait skewness is calculated using the observed phenotypes in inner train. A `log1p` transformation is applied when the absolute skewness exceeds the configured threshold, after which the trait is standardized using that training-set mean and standard deviation. The same fitted transformation is applied to inner valid and to the outer test.
+- For each inner fold, trait skewness is calculated using the observed phenotypes in `inner_train`. A `log1p` transformation is applied when the absolute skewness exceeds the configured threshold, after which the trait is standardized using the training-set mean and standard deviation. The same fitted transformation is then applied to `inner_valid`.
+- For final evaluation in each outer fold, preprocessing is fitted again using the complete `outer_train` partition. The fitted transformation is applied unchanged to both `outer_train` and `outer_test`.
 - Missing phenotype values are excluded when fitting preprocessing parameters and remain masked in the prepared targets.
 
-Each outer fold stores `Y_train_processed.pt`, `Y_valid_processed.pt`, `Y_test_processed.pt`, and `preprocessing.json` under `cv/outer_fold_k/inner_fold_0/`. `Y_test_processed.pt` contains the outer-test samples in test-index order. There is no `final/` cache and no second fit on the full outer-training set. Together with the holdout mapping and fold-specific VCF files, these artifacts are the common inputs for all benchmark models.
+Each inner-fold directory stores `Y_train_processed.pt`, `Y_valid_processed.pt`, and `preprocessing.json`. The `final` directory of each outer fold stores `Y_train_processed.pt`, `Y_test_processed.pt`, and its own `preprocessing.json`. Together with the predefined nested-CV mapping and fold-specific VCF files, these artifacts form the common data inputs used for all benchmark models.
 
-Single-trait benchmark models that do not natively support missing phenotypes, such as MENET, discard samples with an unobserved target separately within each training, validation, and test partition. The `-999` missing-value sentinel is never passed to their loss functions or evaluation metrics. The remaining samples retain the same predefined holdout assignments and fold-local phenotype transformations used by Aquila.
+Single-trait benchmark models that do not natively support missing phenotypes, such as MENET, discard samples with an unobserved target separately within each training, validation, and test partition. The `-999` missing-value sentinel is never passed to their loss functions or evaluation metrics. The remaining samples retain the same predefined nested-CV assignments and fold-local phenotype transformations used by Aquila.
 
 For regression benchmarks, both Aquila-GS and the integrated comparison models report Pearson r, R², MSE, RMSE, and MAE on the available test observations. Fold outputs include metrics on both the standardized phenotype scale and the inverse-transformed original scale. The comparison summary uses within-trait Pearson: for each phenotype, Pearson correlation is calculated across its held-out samples and then averaged across outer folds. This is distinct from Aquila's optional within-accession Pearson, which correlates traits within a sample and is undefined for independent single-trait models such as DEM-SNP and DEM-Vars.
 
@@ -66,7 +67,7 @@ See the [Benchmark Fairness Checklist](BENCHMARK_FAIRNESS.md) for the partitioni
 
 All models in the main benchmark use the same fold-specific SNP panels whenever their architectures permit, so differences in performance are not caused by independently selected input markers. Model-specific feature selection was disabled when it was an optional preprocessing step rather than an essential part of the method.
 
-Three exceptions require explicit treatment. BNNs retains its internal Lasso-based feature-selection module because it is a defining component of the proposed architecture; consequently, its effective SNP subset can differ from those used by other models, although its performance was not competitive in this benchmark. Cropformer originally applies mutual-information-coefficient (MIC) filtering with a default maximum of 10,000 SNPs; this optional filtering was disabled so that Cropformer receives the same SNP panel as the other models. DEM originally uses random-forest SNP selection. Removing this stage would expand each sample to approximately `number_of_SNPs × 10` genotype-class features, producing an impractically large model input and causing out-of-memory errors on the RTX 4090 benchmark server. DEM was therefore excluded from the main horizontal comparison and evaluated separately against Aquila-SNP using the same marker set selected by DEM, allowing the architectural capabilities of DEM and Aquila-SNP to be compared under matched markers.
+Three exceptions require explicit treatment. BNNs retains its internal Lasso-based feature-selection module because it is a defining component of the proposed architecture; consequently, its effective SNP subset can differ from those used by other models, although its nested-CV performance was not competitive in this benchmark. Cropformer originally applies mutual-information-coefficient (MIC) filtering with a default maximum of 10,000 SNPs; this optional filtering was disabled so that Cropformer receives the same SNP panel as the other models. DEM originally uses random-forest SNP selection. Removing this stage would expand each sample to approximately `number_of_SNPs × 10` genotype-class features, producing an impractically large model input and causing out-of-memory errors on the RTX 4090 benchmark server. DEM was therefore excluded from the main horizontal comparison and evaluated separately against Aquila-SNP using the same marker set selected by DEM, allowing the architectural capabilities of DEM and Aquila-SNP to be compared under matched markers.
 
 ## Reproduce of 655rice dataset
 
@@ -78,15 +79,15 @@ GWAS lead variants are selected independently from the training samples of each 
 
 ```sh
 for FOLD in {0..9}; do
-  aquila_data_cv_holdout.py \
-    --vcf "./species_data/Rice655.r2_0.035.SV_delins_r2_0.5.current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
-    --phenotype Rice655.blup.pheno \
+  aquila_data_cv.py \
+    --vcf "./species_data/Rice655-current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
+    --phenotype Rice655.pheno \
     --encoding-type diploid_onehot \
     --variant-type snp \
     --id-prefix "SNP-" \
-    --fold-mapping 655rice.holdout_cv.json \
+    --fold-mapping 655rice_nested_cv_10folds.json \
     --fold-specific-gwas-fold "$FOLD" \
-    -o "Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    -o "Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --save-raw-genotype \
     --overwrite
 done
@@ -98,13 +99,13 @@ Aquila-Vars uses separate SNP, INDEL, and SV branches, so its prepared data are 
 
 ```sh
 for FOLD in {0..9}; do
-  aquila_data_cv_holdout.py \
-    --vcf "./species_data/Rice655.r2_0.035.SV_delins_r2_0.5.current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
+  aquila_data_cv.py \
+    --vcf "./species_data/Rice655-current_10folds_GWAS/outer_fold_${FOLD}/final_panel/marker_panel.outer_fold_${FOLD}.final.imputed.panel.vcf.gz" \
     --phenotype Rice655.pheno \
     --encoding-type diploid_onehot \
-    --fold-mapping 655rice.holdout_cv.json \
+    --fold-mapping 655rice_nested_cv_10folds.json \
     --fold-specific-gwas-fold "$FOLD" \
-    -o "Rice655.current_fold_GWAS.vars.holdout.cv.data/fold_${FOLD}" \
+    -o "Rice655.current_fold_GWAS.vars.cv.data/fold_${FOLD}" \
     --save-raw-genotype \
     --overwrite
 done
@@ -118,9 +119,9 @@ Each output directory records its bound outer fold in `metadata.json`. Training 
 cd aquila-snp
 
 for FOLD in {0..9}; do
-  aquila_train_cv_holdout.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
-    --config aquila-snp.holdout.hpo.yaml \
+  aquila_train_cv.py \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
+    --config  32hpo_budgets.yaml \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --live-metrics-log \
     --use-deterministic \
@@ -136,9 +137,9 @@ cd ..
 cd aquila-vars
 
 for FOLD in {0..9}; do
-  aquila_train_cv_holdout.py \
-    --data-dir "../Rice655.current_fold_GWAS.vars.holdout.cv.data/fold_${FOLD}" \
-    --config aquila-vars.holdout.hpo.yaml \
+  aquila_train_cv.py \
+    --data-dir "../Rice655.current_fold_GWAS.vars.cv.data/fold_${FOLD}" \
+    --config 32hpo_budgets.aquila-vars.yaml \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --live-metrics-log \
     --use-deterministic \
@@ -157,7 +158,7 @@ cd croparnet
 
 for FOLD in {0..9}; do
   python src_benchmark/adapter.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -178,7 +179,7 @@ The upstream pipeline uses MIC-based SNP filtering and limits the selected set t
 cd cropformer
 for FOLD in {0..9}; do
   python src_benchmark/adapter.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -193,7 +194,7 @@ done
 cd xgboost
 for FOLD in {0..9}; do
   python xgboost_train_nested_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/xgboost_nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -204,13 +205,13 @@ done
 
 ### BayesCpi
 
-BayesCpi uses the single fixed configuration in `bayescpi/configs/nested_cv.yaml`, so the shared R benchmark runner does not search configurations. It fits once on the inner-training samples and is scored on the outer test. `niter`, `nburn`, and `thin` control MCMC sampling accuracy, convergence, and runtime; they are fixed before evaluation rather than selected using outer-test performance. Convergence should be checked through MCMC diagnostics when changing these values. The historical script name is retained for command-line compatibility.
+BayesCpi uses the single fixed configuration in `bayescpi/configs/nested_cv.yaml`, so the shared R benchmark runner automatically skips inner CV and fits once on the complete outer-training partition. `niter`, `nburn`, and `thin` control MCMC sampling accuracy, convergence, and runtime; they are fixed before evaluation rather than selected using outer-test performance. Convergence should be checked through MCMC diagnostics when changing these values. The historical script name is retained for command-line compatibility.
 
 ```sh
 cd bayescpi
 for FOLD in {0..9}; do
   python bayescpi_nested_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -220,13 +221,13 @@ done
 
 ### rrBLUP
 
-rrBLUP uses the single fixed `REML` configuration in `rrBLUP/configs/nested_cv.yaml`, so the shared R benchmark runner does not search configurations. It fits once on the inner-training samples and is scored on the outer test. Variance components and marker effects are estimated from those inner-training samples by `mixed.solve`; they are fitted model parameters rather than CV-selected hyperparameters. The historical script name is retained for command-line compatibility.
+rrBLUP uses the single fixed `REML` configuration in `rrBLUP/configs/nested_cv.yaml`, so the shared R benchmark runner automatically skips inner CV and fits once on the complete outer-training partition. Variance components and marker effects are estimated from that training partition by `mixed.solve`; they are fitted model parameters rather than CV-selected hyperparameters. The historical script name is retained for command-line compatibility.
 
 ```sh
 cd rrBLUP
 for FOLD in {0..9}; do
   python rrblup_nested_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -240,7 +241,7 @@ done
 cd Lasso
 for FOLD in {0..9}; do
   python lasso_nested_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -254,7 +255,7 @@ done
 cd ElasticNet
 for FOLD in {0..9}; do
   python elasticnet_nested_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/nested_cv.yaml \
     --outer-folds "$FOLD" \
     -o "results/Rice655_10folds/fold_${FOLD}" \
@@ -270,7 +271,7 @@ Some scripts from CLCNet were copied or adapted into our project repository. The
 cd CLCNet
 for FOLD in {0..9}; do
   python CLCNet_train_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/CLCNet_nested_cv.yaml \
     --outer-folds "$FOLD" \
     --jobs-per-gpu 2 \
@@ -287,7 +288,7 @@ Some scripts from MENET were copied or adapted into our project repository. The 
 cd MENET
 for FOLD in {0..9}; do
   python MENET_train_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/MeNet_nested_cv.yaml \
     --outer-folds "$FOLD" \
     --jobs-per-gpu 2 \
@@ -307,7 +308,7 @@ cd Whisperer_of_DNA
 conda activate aquila_dnawhisperer
 for FOLD in {0..9}; do
   python Whisperer_train_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/Whisperer_nested_cv.yaml \
     --outer-folds "$FOLD" \
     --output-dir "results/Rice655_10folds/fold_${FOLD}" \
@@ -326,7 +327,7 @@ BNNs retains its internal Lasso-based feature-selection module because it is tre
 cd BNNs
 for FOLD in {0..9}; do
   python BNNs_train_cv.py \
-    --data-dir "../Rice655.current_fold_GWAS.holdout.cv.data/fold_${FOLD}" \
+    --data-dir "../Rice655.current_fold_GWAS.cv.data/fold_${FOLD}" \
     --config configs/BNNs_nested_cv.yaml \
     --outer-folds "$FOLD" \
     --output-dir "results/Rice655_10folds/fold_${FOLD}" \
