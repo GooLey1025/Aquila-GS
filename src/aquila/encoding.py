@@ -51,6 +51,29 @@ def variant_id_matches_prefixes(
     return any(vid.startswith(prefix) for prefix in prefixes)
 
 
+def infer_variant_type(variant_id: str, ref: str, alt: str) -> str:
+    """Classify one VCF record as ``SNP``, ``INDEL``, or ``SV``.
+
+    An ID containing ``SNP``, ``INDEL``, or ``SV`` wins, in that order.
+    Otherwise symbolic ALT and ``*`` are SV, a single-base biallelic allele
+    pair is SNP, and every other record is INDEL.
+    """
+    vid = "" if variant_id is None else str(variant_id)
+    if "SNP" in vid:
+        return "SNP"
+    if "INDEL" in vid:
+        return "INDEL"
+    if "SV" in vid:
+        return "SV"
+    alt_s = "" if alt is None else str(alt)
+    if alt_s.startswith("<") or "[" in alt_s or "]" in alt_s or alt_s == "*":
+        return "SV"
+    ref_s = "" if ref is None else str(ref)
+    if len(ref_s) == 1 and len(alt_s) == 1 and "," not in alt_s:
+        return "SNP"
+    return "INDEL"
+
+
 _ACGT = frozenset("ACGT")
 
 
@@ -443,8 +466,8 @@ def parse_genotype_vcf(
 
     Args:
         vcf_path: Path to VCF file
-        variant_types: Variant types to retain after automatic classification.
-            If None, retain every automatically classified type.
+        variant_types: Variant types to retain after ID-then-allele classification.
+            If None, retain every classified type.
         assume_variant_type: Assign every VCF record to this type without
             inspecting the ID or alleles. Intended for explicitly typed inputs.
         id_prefixes: If set, keep only records whose VCF ID starts with one of
@@ -509,6 +532,7 @@ def parse_genotype_vcf(
         else (variant_types or [])
     )
     variants_by_type = {vtype: [] for vtype in initial_types}
+    skipped_types: dict[str, int] = {}
     sample_ids = None
 
     # Detect if file is gzipped
@@ -550,41 +574,16 @@ def parse_genotype_vcf(
                 continue
 
             # Explicitly typed inputs do not require an ID naming convention.
+            # Otherwise classify by ID, then by alleles, and optionally keep
+            # only the requested types.
             variant_type = assume_variant_type
-            if variant_type is not None:
-                pass
-            elif variant_types:
-                for vtype in variant_types:
-                    if vtype in variant_id:
-                        variant_type = vtype
-                        break
-                # Skip if not in requested types
-                if variant_type is None:
+            if variant_type is None:
+                variant_type = infer_variant_type(variant_id, ref, alt)
+                if variant_types is not None and variant_type not in variant_types:
+                    skipped_types[variant_type] = (
+                        skipped_types.get(variant_type, 0) + 1
+                    )
                     continue
-            else:
-                # Prefer the established ID convention, then infer from alleles.
-                if 'SNP' in variant_id:
-                    variant_type = 'SNP'
-                elif 'INDEL' in variant_id:
-                    variant_type = 'INDEL'
-                elif 'SV' in variant_id:
-                    variant_type = 'SV'
-                elif (
-                    alt.startswith("<")
-                    or "[" in alt
-                    or "]" in alt
-                    or alt == "*"
-                ):
-                    variant_type = 'SV'
-                elif (
-                    len(ref) == 1
-                    and len(alt) == 1
-                    and "," not in alt
-                ):
-                    variant_type = 'SNP'
-                else:
-                    variant_type = 'INDEL'
-
                 if variant_type not in variants_by_type:
                     variants_by_type[variant_type] = []
 
@@ -663,6 +662,16 @@ def parse_genotype_vcf(
     if sample_ids is None:
         raise ValueError(
             "No sample IDs found in VCF file. Make sure file has #CHROM header line.")
+
+    if skipped_types:
+        requested = ", ".join(variant_types or [])
+        detail = ", ".join(
+            f"{name}={count}" for name, count in sorted(skipped_types.items())
+        )
+        print(
+            f"Skipping {sum(skipped_types.values())} record(s) "
+            f"not classified as {requested}: {detail}"
+        )
 
     # Convert to matrices
     result = {}
@@ -857,10 +866,12 @@ def parse_genotype_snp_vcf_onehot(
             format_field = fields[8]
             genotypes = fields[9:]
 
-            variant_type = 'SNP'
-            if not assume_all_variants and 'SNP' not in variant_id:
-                continue
             if not variant_id_matches_prefixes(variant_id, id_prefixes):
+                continue
+            if (
+                not assume_all_variants
+                and infer_variant_type(variant_id, ref, alt) != "SNP"
+            ):
                 continue
 
             variant_encodings = []
@@ -869,7 +880,7 @@ def parse_genotype_snp_vcf_onehot(
                     _gt_to_classic_snp_onehot(gt_field, format_field, ref, alt)
                 )
 
-            variants_by_type[variant_type].append({
+            variants_by_type['SNP'].append({
                 'id': variant_id,
                 'chrom': chrom,
                 'pos': pos,
@@ -1064,9 +1075,12 @@ def parse_genotype_snp_vcf_10classed_onehot(
             alt = fields[4]
             format_field = fields[8]
             genotypes = fields[9:]
-            if not assume_all_variants and "SNP" not in variant_id:
-                continue
             if not variant_id_matches_prefixes(variant_id, id_prefixes):
+                continue
+            if (
+                not assume_all_variants
+                and infer_variant_type(variant_id, ref, alt) != "SNP"
+            ):
                 continue
 
             variant_encodings = [
@@ -1224,8 +1238,9 @@ def parse_genotype_file(
             - 'diploid_onehot': Returns (n_samples, n_snps, 8) with one-hot encoded diploid genotypes
             - 'onehot': Returns (n_samples, n_snps, 3) classic REF/HET/ALT one-hot from VCF (biallelic SNPs)
             - '10classed_onehot': Returns (n_samples, n_snps, 10) unordered diploid nucleotide classes
-        variant_type: How to encode VCF records (does not filter by ID)
-            - 'snp': Treat every kept record as SNP
+        variant_type: Which records to encode
+            - 'snp': Keep records classified as SNP. With ``id_prefix``, every
+              kept record is encoded as SNP and non-ACGT alleles are rejected.
             - 'indel': Treat every kept record as INDEL
             - 'sv': Treat every kept record as SV
             If None, variant types are detected automatically.
@@ -1289,32 +1304,35 @@ def parse_genotype_file(
         return parse_genotype_vcf(geno_path, id_prefixes=id_prefixes)
 
     if variant_type == 'snp':
+        # A prefix is an explicit keep-list, so those records must be valid
+        # SNPs. Without one, classify the VCF and keep only SNP records.
+        assume_all_variants = id_prefixes is not None
         if encoding_type == 'token':
             return parse_genotype_token(geno_path)
         if encoding_type == 'onehot':
             return ensure_snp_sites_are_acgt(parse_genotype_snp_vcf_onehot(
                 geno_path,
-                assume_all_variants=True,
+                assume_all_variants=assume_all_variants,
                 id_prefixes=id_prefixes,
             ))
         if encoding_type == '10classed_onehot':
             return ensure_snp_sites_are_acgt(parse_genotype_snp_vcf_10classed_onehot(
                 geno_path,
-                assume_all_variants=True,
+                assume_all_variants=assume_all_variants,
                 id_prefixes=id_prefixes,
             ))
         if encoding_type == 'dem_10classed_onehot':
             return ensure_snp_sites_are_acgt(
                 parse_genotype_snp_vcf_dem_10classed_onehot(
                     geno_path,
-                    assume_all_variants=True,
+                    assume_all_variants=assume_all_variants,
                     id_prefixes=id_prefixes,
                 )
             )
         # diploid_onehot
         return ensure_snp_sites_are_acgt(parse_genotype_snp_vcf(
             geno_path,
-            assume_all_variants=True,
+            assume_all_variants=assume_all_variants,
             id_prefixes=id_prefixes,
         ))
 

@@ -1079,9 +1079,10 @@ def parse_args() -> argparse.Namespace:
         choices=("snp", "indel", "sv"),
         default=None,
         help=(
-            "Optional explicit encoding type for kept records. Every retained "
-            "VCF record is encoded as SNP, INDEL, or SV. This does not filter "
-            "by ID; use --id-prefix for that. When omitted, variant types are "
+            "snp keeps records classified as SNP (ID token, otherwise "
+            "single-base alleles). indel and sv encode every kept record as "
+            "that type. With --id-prefix, snp encodes the kept records as SNP "
+            "and rejects non-ACGT alleles. When omitted, variant types are "
             "detected automatically."
         ),
     )

@@ -477,8 +477,8 @@ def parse_args() -> argparse.Namespace:
         choices=("snp", "indel", "sv"),
         default=None,
         help=(
-            "How to encode every kept VCF record: snp, indel, or sv. "
-            "This does not filter by ID. When omitted, types are detected "
+            "snp keeps records classified as SNP. indel and sv encode every "
+            "kept record as that type. When omitted, types are detected "
             "automatically and stored as separate branches."
         ),
     )

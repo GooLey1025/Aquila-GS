@@ -139,7 +139,7 @@ cd aquila-vars
 for FOLD in {0..9}; do
   aquila_train_cv.py \
     --data-dir "../Rice655.current_fold_GWAS.vars.cv.more_sv.data/fold_${FOLD}" \
-    --config 32hpo_budgets.aquila-vars.yaml \
+    --config aquila-vars.hpo.yaml \
     -o "results/Rice655_10folds/fold_${FOLD}" \
     --live-metrics-log \
     --use-deterministic \

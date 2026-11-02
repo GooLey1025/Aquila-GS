@@ -22,10 +22,28 @@ def _write_vcf(path: Path) -> None:
     )
 
 
-def test_explicit_snp_errors_on_non_acgt_sites(tmp_path: Path) -> None:
+def test_explicit_snp_keeps_classified_snps_from_a_mixed_vcf(tmp_path: Path) -> None:
     path = tmp_path / "input.vcf"
     _write_vcf(path)
 
+    parsed = parse_genotype_file(
+        str(path),
+        encoding_type="diploid_onehot",
+        variant_type="snp",
+    )
+    assert parsed["variant_ids"] == ["rs10", "marker30"]
+    assert parsed["matrix"].shape == (2, 2, 8)
+
+
+def test_snp_id_with_non_acgt_alleles_still_errors(tmp_path: Path) -> None:
+    path = tmp_path / "input.vcf"
+    path.write_text(
+        "##fileformat=VCFv4.2\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tA\tB\n"
+        "1\t10\tSNP-1-10-1\tA\tG\t.\tPASS\t.\tGT\t0/0\t0/1\n"
+        "1\t20\tSNP-1-20-1\tAT\tA\t.\tPASS\t.\tGT\t0/1\t1/1\n",
+        encoding="utf-8",
+    )
     try:
         parse_genotype_file(
             str(path),
@@ -36,9 +54,9 @@ def test_explicit_snp_errors_on_non_acgt_sites(tmp_path: Path) -> None:
         message = str(exc)
         assert "SNP mode" in message
         assert "non-ACGT" in message
-        assert "." in message
+        assert "SNP-1-20-1" in message
     else:
-        raise AssertionError("expected ValueError for non-ACGT indel record")
+        raise AssertionError("expected ValueError for a non-ACGT SNP id")
 
 
 def test_explicit_snp_keeps_all_acgt_sites_without_id_prefix(tmp_path: Path) -> None:
