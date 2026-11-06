@@ -32,17 +32,12 @@ VCF_FILE=species_data/Maize1404/Maize1404.coding.ld.vcf.gz
 # PHENO_FILE=species_data/Rice1171/1171rice.pheno
 # VCF_FILE=species_data/Rice1171/Rice1171.coding.ld.vcf.gz
 
-# COHORT=Rice532
-# PHENO_FILE=species_data/Rice532/532rice.pheno
-# VCF_FILE=species_data/Rice532/Rice532.coding.ld.vcf.gz
-
-COHORT=Rice655_Only_WG_LD
-PHENO_FILE=Rice655.blup.pheno
-VCF_FILE=species_data/Rice655.WG_0.035_LD/655rice.WG_0.035_LD.snp_indel_sv.vcf.gz
-
+COHORT=Rice532
+PHENO_FILE=species_data/Rice532/532rice.pheno
+VCF_FILE=species_data/Rice532/Rice532.coding.ld.vcf.gz
 ```
 
-`$COHORT.cv.data` is built with `--id-prefix SNP-` for every cohort except Rice1171. Rice1171 omits that prefix and does not build an Aquila-Vars directory. The other cohorts prepare both `$COHORT.cv.data` and `$COHORT.vars.cv.data`.
+Rice1171 keeps SNP IDs with the `SNP-` prefix and does not build an Aquila-Vars directory. The other cohorts prepare both `$COHORT.cv.data` and `$COHORT.vars.cv.data`.
 
 ## Prepare the shared splits
 
@@ -190,7 +185,7 @@ Aquila-Vars, when `$COHORT.vars.cv.data` exists:
 ```sh
 cd ../aquila-vars
 aquila_train_cv.py --data-dir ../$COHORT.vars.cv.data \
-  --config aquila-vars.hpo.yaml \
+  --config 32hpo_budgets.aquila-vars.yaml \
   -o results/$COHORT --live-metrics-log --use-deterministic --overwrite
 ```
 
@@ -221,7 +216,7 @@ for TRAIT in "${PHENO_COLUMNS[@]:1}"; do
 done
 ```
 
-`SNP_PREFIX` is `--id-prefix SNP-` by default, and empty for Rice1171.
+`SNP_PREFIX` is `--id-prefix SNP-` for Rice1171 and empty otherwise.
 
 ## Summary
 

@@ -354,8 +354,9 @@ def load_vcf_data(
     # Determine variant type from config
     variant_type = config.get('data', {}).get('variant_type')
     
-    # Check if multi-branch
-    is_multi_branch = encoding_type in ['snp_indel_vcf', 'snp_indel_sv_vcf'] or variant_type in ['snp_indel', 'snp_indel_sv']
+    # Check if multi-branch. Aquila-Vars keeps encoding_type=diploid_onehot and
+    # variant_type unset, and stores the SNP/INDEL/SV split under train.branches.
+    is_multi_branch = _is_multi_branch_config(encoding_type, variant_type, config)
     
     print(f"\nLoading VCF data: {vcf_path}")
     print(f"  Encoding type: {encoding_type}")
@@ -431,6 +432,18 @@ def load_vcf_data(
     if include_marker_ids:
         return variant_tensors, sample_ids, seq_length, marker_ids
     return variant_tensors, sample_ids, seq_length
+
+
+def _is_multi_branch_config(encoding_type: str, variant_type: Any, config: Dict[str, Any]) -> bool:
+    """True when the checkpoint scores SNP, INDEL, and SV as separate branches."""
+    if encoding_type in ['snp_indel_vcf', 'snp_indel_sv_vcf']:
+        return True
+    if variant_type in ['snp_indel', 'snp_indel_sv']:
+        return True
+    branches = config.get('train', {}).get('branches')
+    if not isinstance(branches, dict):
+        branches = config.get('model', {}).get('branches')
+    return isinstance(branches, dict) and len(branches) > 1
 
 
 def _metadata_value(metadata: Dict[str, Any], *names: str) -> Any:
@@ -1025,7 +1038,7 @@ def main():
         config = dict(config)
         config['data'] = dict(config.get('data', {}))
         config['data']['variant_type'] = variant_type
-    is_multi_branch = encoding_type in ['snp_indel_vcf', 'snp_indel_sv_vcf'] or variant_type in ['snp_indel', 'snp_indel_sv']
+    is_multi_branch = _is_multi_branch_config(encoding_type, variant_type, config)
 
     id_prefix = args.id_prefix
     if not id_prefix:
@@ -1063,8 +1076,10 @@ def main():
         if is_multi_branch:
             # Multi-branch: create dummy inputs for each branch type
             dummy_input = {}
-            for vtype, length in seq_length.items():
-                dummy_input[vtype] = torch.randn(1, length, 8, device=device)
+            for vtype, tensor in variant_data.items():
+                dummy_input[vtype] = torch.zeros(
+                    1, tensor.shape[1], tensor.shape[2], device=device
+                )
         else:
             # Single branch: seq_length is an integer
             length = seq_length if isinstance(seq_length, int) else seq_length.get('snp', seq_length)

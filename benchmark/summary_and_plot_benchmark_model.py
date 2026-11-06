@@ -919,6 +919,270 @@ def make_within_tables(
     )
 
 
+def _per_trait_pearson(bundle: Any) -> dict[str, float]:
+    """Pearson r for every trait stored under a metrics bundle."""
+    if not isinstance(bundle, Mapping):
+        return {}
+    scales: list[Mapping[str, Any]] = []
+    for scale_name in SCALE_NAMES:
+        scale = bundle.get(scale_name)
+        if isinstance(scale, Mapping):
+            scales.append(scale)
+    scales.append(bundle)
+    for scale in scales:
+        per_trait = scale.get("per_trait")
+        if not isinstance(per_trait, Mapping):
+            continue
+        values: dict[str, float] = {}
+        for trait, metrics in per_trait.items():
+            if not isinstance(metrics, Mapping):
+                continue
+            number = finite_float(metrics.get("pearson"))
+            if number is None:
+                number = mean_value(metrics.get("pearson"))
+            if number is not None:
+                values[str(trait)] = number
+        if values:
+            return values
+    return {}
+
+
+def _rows_from_fold_record(
+    item: Mapping[str, Any],
+    default_trait: str | None = None,
+) -> list[tuple[int, str, float]]:
+    """One completed outer-fold run, either single-trait or multi-trait."""
+    if "outer_fold" not in item:
+        return []
+    try:
+        outer_fold = int(item["outer_fold"])
+    except (TypeError, ValueError):
+        return []
+    for key in (
+        "metrics",
+        "test_metrics_standardized",
+        "test_metrics_normalized",
+        "test_metrics_processed",
+        "test_metrics_original",
+    ):
+        per_trait = _per_trait_pearson(item.get(key))
+        if per_trait:
+            return [
+                (outer_fold, trait, value) for trait, value in per_trait.items()
+            ]
+    trait = item.get("trait", default_trait)
+    if trait is None:
+        return []
+    number = finite_float(item.get("test_pearson"))
+    if number is None:
+        number = pearson_from_metric_bundle(item.get("metrics"), str(trait))
+    if number is None:
+        for key in (
+            "test_metrics_standardized",
+            "test_metrics_normalized",
+            "test_metrics_processed",
+            "test_metrics_original",
+        ):
+            number = pearson_from_metric_bundle(item.get(key), str(trait))
+            if number is not None:
+                break
+    if number is None:
+        return []
+    return [(outer_fold, str(trait), number)]
+
+
+def fold_trait_rows_from_payload(
+    payload: Mapping[str, Any],
+    fallback_fold: int | None = None,
+) -> list[tuple[int, str, float]]:
+    """Recover outer-fold Pearson values before they are averaged across folds."""
+    rows: list[tuple[int, str, float]] = []
+    results = payload.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, Mapping):
+                rows.extend(_rows_from_fold_record(item))
+    elif isinstance(results, Mapping):
+        for trait, block in results.items():
+            if not isinstance(block, Mapping):
+                continue
+            folds = block.get("folds")
+            if not isinstance(folds, list):
+                continue
+            for item in folds:
+                if isinstance(item, Mapping):
+                    rows.extend(_rows_from_fold_record(item, default_trait=str(trait)))
+    if not rows:
+        folds = payload.get("folds")
+        if isinstance(folds, list):
+            for item in folds:
+                if isinstance(item, Mapping):
+                    rows.extend(_rows_from_fold_record(item))
+    if rows or fallback_fold is None:
+        return rows
+    for trait, value in extract_summary_values(payload).items():
+        number = finite_float(value)
+        if number is not None:
+            rows.append((fallback_fold, trait, number))
+    return rows
+
+
+def fold_trait_rows_from_metrics_dir(directory: Path) -> list[tuple[int, str, float]]:
+    """Aquila writes one metrics.json per outer fold instead of a fold list."""
+    rows: list[tuple[int, str, float]] = []
+    if not directory.is_dir():
+        return rows
+    for metrics_file in sorted(directory.glob("fold_*/metrics.json")):
+        fold_name = metrics_file.parent.name.removeprefix("fold_")
+        try:
+            outer_fold = int(fold_name)
+        except ValueError:
+            continue
+        try:
+            payload = read_json(metrics_file)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        for trait, value in _per_trait_pearson(payload).items():
+            rows.append((outer_fold, trait, value))
+    return rows
+
+
+def _dedupe_fold_trait_rows(
+    rows: Sequence[tuple[int, str, float]],
+) -> list[tuple[int, str, float]]:
+    deduped: dict[tuple[int, str], float] = {}
+    for outer_fold, trait, value in rows:
+        deduped.setdefault((outer_fold, trait), value)
+    return [
+        (outer_fold, trait, value)
+        for (outer_fold, trait), value in deduped.items()
+    ]
+
+
+def collect_fold_trait_table(
+    benchmark_dir: Path,
+    cohort: str,
+    traits: Sequence[str],
+) -> pd.DataFrame:
+    """Pearson r for every model, outer fold, and phenotype."""
+    allowed = set(traits)
+    trait_order = {trait: index for index, trait in enumerate(traits)}
+    model_order_index = {
+        display_name: index for index, (display_name, _) in enumerate(MODEL_SPECS)
+    }
+    records: list[dict[str, Any]] = []
+    for display_name, model_dir in MODEL_SPECS:
+        candidates = summary_candidates(benchmark_dir, model_dir, cohort)
+        summary_file = next((path for path in candidates if path.is_file()), None)
+        rows: list[tuple[int, str, float]] = []
+        source = ""
+        if summary_file is not None:
+            try:
+                payload = read_json(summary_file)
+            except (OSError, ValueError, json.JSONDecodeError):
+                payload = None
+            if payload is not None:
+                has_data_dir = payload.get("data_dir") is not None
+                is_cohort_directory = summary_file.parent.name == cohort
+                cohort_ok = (
+                    cohort_matches(payload, cohort)
+                    if has_data_dir
+                    else is_cohort_directory
+                )
+                if cohort_ok:
+                    rows = fold_trait_rows_from_payload(payload)
+                    source = str(summary_file)
+            if (
+                not rows
+                and model_dir in {"aquila-snp", "aquila-vars"}
+                and summary_file.parent.name == cohort
+            ):
+                rows = fold_trait_rows_from_metrics_dir(summary_file.parent)
+                source = str(summary_file.parent)
+        if not rows:
+            shard_root = (
+                summary_file.parent if summary_file is not None else None
+            )
+            search_roots = [shard_root] if shard_root is not None else []
+            search_roots.extend(path.parent for path in candidates)
+            seen_shards: set[Path] = set()
+            for root in search_roots:
+                if root is None or not root.is_dir():
+                    continue
+                for shard in sorted(root.glob("fold_*/summary.json")):
+                    if shard in seen_shards:
+                        continue
+                    seen_shards.add(shard)
+                    fold_name = shard.parent.name.removeprefix("fold_")
+                    try:
+                        fallback_fold = int(fold_name)
+                        payload = read_json(shard)
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        continue
+                    part = fold_trait_rows_from_payload(
+                        payload, fallback_fold=fallback_fold
+                    )
+                    if part:
+                        rows.extend(part)
+                        source = source or str(root)
+        for outer_fold, trait, value in _dedupe_fold_trait_rows(rows):
+            if trait not in allowed:
+                continue
+            records.append(
+                {
+                    "model": display_name,
+                    "outer_fold": outer_fold,
+                    "phenotype": trait,
+                    "pearson_r": value,
+                    "metric": PRIMARY_TRAIT_PEARSON,
+                    "source_file": source,
+                }
+            )
+    frame = pd.DataFrame.from_records(records)
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "model",
+                "outer_fold",
+                "phenotype",
+                "pearson_r",
+                "metric",
+                "source_file",
+            ]
+        )
+    frame["_model_order"] = frame["model"].map(model_order_index)
+    frame["_trait_order"] = frame["phenotype"].map(trait_order)
+    frame = frame.sort_values(
+        ["_model_order", "outer_fold", "_trait_order"],
+        kind="mergesort",
+    )
+    return frame.drop(columns=["_model_order", "_trait_order"]).reset_index(drop=True)
+
+
+def summarize_fold_trait_table(fold_trait_df: pd.DataFrame) -> pd.DataFrame:
+    """Mean and sample standard deviation of Pearson r across outer folds."""
+    columns = [
+        "model",
+        "phenotype",
+        "n_folds",
+        "mean_pearson_r",
+        "std_pearson_r",
+    ]
+    if fold_trait_df.empty:
+        return pd.DataFrame(columns=columns)
+    grouped = fold_trait_df.groupby(["model", "phenotype"], sort=False)["pearson_r"]
+    summary = grouped.agg(
+        n_folds="count",
+        mean_pearson_r="mean",
+        std_pearson_r=lambda values: (
+            float(np.std(values.to_numpy(dtype=float), ddof=1))
+            if len(values) > 1
+            else np.nan
+        ),
+    ).reset_index()
+    return summary
+
+
 def collect_results(
     benchmark_dir: Path,
     cohort: str,
@@ -1666,6 +1930,8 @@ def write_tables(
     cohort: str,
     within_summary_df: pd.DataFrame,
     within_fold_df: pd.DataFrame,
+    fold_trait_df: pd.DataFrame,
+    fold_trait_summary_df: pd.DataFrame,
 ) -> None:
     long_df.to_csv(
         output_dir / f"{cohort}.pearson_by_model_and_trait.long.tsv",
@@ -1717,6 +1983,18 @@ def write_tables(
     )
     within_fold_df.to_csv(
         output_dir / f"{cohort}.within_accession_pearson_by_model_and_fold.tsv",
+        sep="\t",
+        index=False,
+        na_rep="",
+    )
+    fold_trait_df.to_csv(
+        output_dir / f"{cohort}.pearson_by_model_fold_and_trait.long.tsv",
+        sep="\t",
+        index=False,
+        na_rep="",
+    )
+    fold_trait_summary_df.to_csv(
+        output_dir / f"{cohort}.pearson_by_model_and_trait.fold_stats.tsv",
         sep="\t",
         index=False,
         na_rep="",
@@ -1778,6 +2056,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
 
     long_df = make_long_table(results, traits)
+    fold_trait_df = collect_fold_trait_table(benchmark_dir, args.cohort, traits)
+    fold_trait_summary_df = summarize_fold_trait_table(fold_trait_df)
     status_df = make_status_table(results, traits)
     within_results = collect_within_results(benchmark_dir, args.cohort, traits)
     within_summary_df, within_fold_df = make_within_tables(
@@ -1804,6 +2084,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.cohort,
         within_summary_df,
         within_fold_df,
+        fold_trait_df,
+        fold_trait_summary_df,
     )
 
     configure_style()
@@ -1837,6 +2119,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
     ]
     print_summary(status_df, within_summary_df, output_dir)
+    print(
+        f"Fold-by-trait Pearson rows: {len(fold_trait_df)} "
+        f"({fold_trait_df['model'].nunique() if not fold_trait_df.empty else 0} models)"
+    )
 
     if args.show:
         plt.show()
