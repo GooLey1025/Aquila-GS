@@ -919,89 +919,171 @@ def make_within_tables(
     )
 
 
-def _per_trait_pearson(bundle: Any) -> dict[str, float]:
-    """Pearson r for every trait stored under a metrics bundle."""
+TRAIT_METRIC_FIELDS = ("pearson", "r2", "mse", "rmse", "mae", "n")
+METRIC_BUNDLE_KEYS = (
+    "metrics",
+    "test_metrics_standardized",
+    "test_metrics_normalized",
+    "test_metrics_processed",
+    "test_metrics_original",
+)
+
+
+def _metric_numbers(metrics: Mapping[str, Any]) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for field in TRAIT_METRIC_FIELDS:
+        number = finite_float(metrics.get(field))
+        if number is None and field != "n":
+            number = mean_value(metrics.get(field))
+        if number is not None:
+            values[field] = number
+    return values
+
+
+def _metric_scales(bundle: Any) -> list[Mapping[str, Any]]:
     if not isinstance(bundle, Mapping):
-        return {}
-    scales: list[Mapping[str, Any]] = []
-    for scale_name in SCALE_NAMES:
-        scale = bundle.get(scale_name)
-        if isinstance(scale, Mapping):
-            scales.append(scale)
-    scales.append(bundle)
-    for scale in scales:
+        return []
+    scales = [
+        bundle[name]
+        for name in SCALE_NAMES
+        if isinstance(bundle.get(name), Mapping)
+    ]
+    if any(name in bundle for name in ("per_trait", "pearson", "avg_pearson", "r2")):
+        scales.append(bundle)
+    return scales
+
+
+def _per_trait_metrics(bundle: Any) -> dict[str, dict[str, float]]:
+    """Regression metrics for every trait on the training scale."""
+    for scale in _metric_scales(bundle):
         per_trait = scale.get("per_trait")
         if not isinstance(per_trait, Mapping):
             continue
-        values: dict[str, float] = {}
+        values: dict[str, dict[str, float]] = {}
         for trait, metrics in per_trait.items():
             if not isinstance(metrics, Mapping):
                 continue
-            number = finite_float(metrics.get("pearson"))
-            if number is None:
-                number = mean_value(metrics.get("pearson"))
-            if number is not None:
-                values[str(trait)] = number
+            record = _metric_numbers(metrics)
+            if "pearson" in record:
+                values[str(trait)] = record
         if values:
             return values
+    return {}
+
+
+def _scalar_metrics(bundle: Any) -> dict[str, float]:
+    """Metrics for a single-trait run that did not store a per_trait block."""
+    for scale in _metric_scales(bundle):
+        record = _metric_numbers(scale)
+        if "pearson" not in record:
+            alias = finite_float(scale.get("avg_pearson"))
+            if alias is not None:
+                record["pearson"] = alias
+            for field, alias_name in (
+                ("r2", "avg_r2"),
+                ("mse", "avg_mse"),
+                ("rmse", "avg_rmse"),
+                ("mae", "avg_mae"),
+            ):
+                if field not in record:
+                    number = finite_float(scale.get(alias_name))
+                    if number is not None:
+                        record[field] = number
+        if "pearson" in record:
+            return record
+    return {}
+
+
+def _within_accession_metric(bundle: Any) -> dict[str, float]:
+    """Fold-level within-accession Pearson on the normalized training scale."""
+    for scale in _metric_scales(bundle):
+        aggregate = scale.get("aggregate")
+        number = None
+        count = None
+        if isinstance(aggregate, Mapping):
+            number = finite_float(aggregate.get("within_accession_pearson"))
+            count = finite_float(aggregate.get("n_accessions_within_accession"))
+        if number is None:
+            number = finite_float(scale.get("avg_within_accession_pearson"))
+        if count is None:
+            count = finite_float(scale.get("n_accessions_within_accession"))
+        if number is None:
+            continue
+        record = {"within_accession_pearson_r": number}
+        if count is not None:
+            record["n_accessions"] = count
+        return record
     return {}
 
 
 def _rows_from_fold_record(
     item: Mapping[str, Any],
     default_trait: str | None = None,
-) -> list[tuple[int, str, float]]:
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
     """One completed outer-fold run, either single-trait or multi-trait."""
     if "outer_fold" not in item:
-        return []
+        return [], {}
     try:
         outer_fold = int(item["outer_fold"])
     except (TypeError, ValueError):
-        return []
-    for key in (
-        "metrics",
-        "test_metrics_standardized",
-        "test_metrics_normalized",
-        "test_metrics_processed",
-        "test_metrics_original",
-    ):
-        per_trait = _per_trait_pearson(item.get(key))
-        if per_trait:
-            return [
-                (outer_fold, trait, value) for trait, value in per_trait.items()
-            ]
-    trait = item.get("trait", default_trait)
-    if trait is None:
-        return []
-    number = finite_float(item.get("test_pearson"))
-    if number is None:
-        number = pearson_from_metric_bundle(item.get("metrics"), str(trait))
-    if number is None:
-        for key in (
-            "test_metrics_standardized",
-            "test_metrics_normalized",
-            "test_metrics_processed",
-            "test_metrics_original",
-        ):
-            number = pearson_from_metric_bundle(item.get(key), str(trait))
+        return [], {}
+    trait_metrics: dict[str, dict[str, float]] = {}
+    scalar: dict[str, float] = {}
+    within: dict[str, float] = {}
+    for key in METRIC_BUNDLE_KEYS:
+        bundle = item.get(key)
+        if not trait_metrics:
+            trait_metrics = _per_trait_metrics(bundle)
+        if not scalar:
+            scalar = _scalar_metrics(bundle)
+        if not within:
+            within = _within_accession_metric(bundle)
+        if trait_metrics or scalar:
+            break
+    rows: list[dict[str, Any]] = []
+    if trait_metrics:
+        for trait, metrics in trait_metrics.items():
+            rows.append({"outer_fold": outer_fold, "phenotype": trait, **metrics})
+    else:
+        trait = item.get("trait", default_trait)
+        if trait is not None and scalar:
+            rows.append(
+                {"outer_fold": outer_fold, "phenotype": str(trait), **scalar}
+            )
+        elif trait is not None:
+            number = finite_float(item.get("test_pearson"))
             if number is not None:
-                break
-    if number is None:
-        return []
-    return [(outer_fold, str(trait), number)]
+                rows.append(
+                    {
+                        "outer_fold": outer_fold,
+                        "phenotype": str(trait),
+                        "pearson": number,
+                    }
+                )
+    if within:
+        within = {"outer_fold": outer_fold, **within}
+    return rows, within
 
 
 def fold_trait_rows_from_payload(
     payload: Mapping[str, Any],
     fallback_fold: int | None = None,
-) -> list[tuple[int, str, float]]:
-    """Recover outer-fold Pearson values before they are averaged across folds."""
-    rows: list[tuple[int, str, float]] = []
+) -> tuple[list[dict[str, Any]], list[dict[str, float]]]:
+    """Recover outer-fold metrics before they are averaged across folds."""
+    rows: list[dict[str, Any]] = []
+    within_rows: list[dict[str, float]] = []
+
+    def consume(item: Mapping[str, Any], default_trait: str | None = None) -> None:
+        trait_rows, within = _rows_from_fold_record(item, default_trait=default_trait)
+        rows.extend(trait_rows)
+        if within:
+            within_rows.append(within)
+
     results = payload.get("results")
     if isinstance(results, list):
         for item in results:
             if isinstance(item, Mapping):
-                rows.extend(_rows_from_fold_record(item))
+                consume(item)
     elif isinstance(results, Mapping):
         for trait, block in results.items():
             if not isinstance(block, Mapping):
@@ -1011,71 +1093,130 @@ def fold_trait_rows_from_payload(
                 continue
             for item in folds:
                 if isinstance(item, Mapping):
-                    rows.extend(_rows_from_fold_record(item, default_trait=str(trait)))
+                    consume(item, default_trait=str(trait))
     if not rows:
         folds = payload.get("folds")
         if isinstance(folds, list):
             for item in folds:
                 if isinstance(item, Mapping):
-                    rows.extend(_rows_from_fold_record(item))
+                    consume(item)
     if rows or fallback_fold is None:
-        return rows
+        return rows, within_rows
     for trait, value in extract_summary_values(payload).items():
         number = finite_float(value)
         if number is not None:
-            rows.append((fallback_fold, trait, number))
-    return rows
+            rows.append(
+                {"outer_fold": fallback_fold, "phenotype": trait, "pearson": number}
+            )
+    return rows, within_rows
 
 
-def fold_trait_rows_from_metrics_dir(directory: Path) -> list[tuple[int, str, float]]:
-    """Aquila writes one metrics.json per outer fold instead of a fold list."""
-    rows: list[tuple[int, str, float]] = []
+def fold_trait_rows_from_metrics_dir(
+    directory: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, float]]]:
+    """Read metrics.json files that were not copied into summary.json."""
+    rows: list[dict[str, Any]] = []
+    within_rows: list[dict[str, float]] = []
     if not directory.is_dir():
-        return rows
-    for metrics_file in sorted(directory.glob("fold_*/metrics.json")):
+        return rows, within_rows
+    metric_files = sorted(directory.glob("fold_*/metrics.json"))
+    metric_files.extend(sorted(directory.glob("*/fold_*/metrics.json")))
+    for metrics_file in metric_files:
         fold_name = metrics_file.parent.name.removeprefix("fold_")
         try:
             outer_fold = int(fold_name)
-        except ValueError:
-            continue
-        try:
             payload = read_json(metrics_file)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        for trait, value in _per_trait_pearson(payload).items():
-            rows.append((outer_fold, trait, value))
-    return rows
+        default_trait = None
+        if metrics_file.parent.parent != directory:
+            default_trait = metrics_file.parent.parent.name
+        trait_rows, within = _rows_from_fold_record(
+            {"outer_fold": outer_fold, "trait": default_trait, "metrics": payload},
+            default_trait=default_trait,
+        )
+        rows.extend(trait_rows)
+        if within:
+            within_rows.append(within)
+    return rows, within_rows
 
 
-def _dedupe_fold_trait_rows(
-    rows: Sequence[tuple[int, str, float]],
-) -> list[tuple[int, str, float]]:
-    deduped: dict[tuple[int, str], float] = {}
-    for outer_fold, trait, value in rows:
-        deduped.setdefault((outer_fold, trait), value)
-    return [
-        (outer_fold, trait, value)
-        for (outer_fold, trait), value in deduped.items()
-    ]
+def _merge_metric_row(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(current)
+    for field in TRAIT_METRIC_FIELDS:
+        if field not in merged and field in incoming:
+            merged[field] = incoming[field]
+    return merged
+
+
+def _dedupe_fold_trait_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (int(row["outer_fold"]), str(row["phenotype"]))
+        current = deduped.get(key)
+        deduped[key] = row if current is None else _merge_metric_row(current, row)
+    return list(deduped.values())
+
+
+FOLD_TRAIT_COLUMNS = [
+    "model",
+    "outer_fold",
+    "phenotype",
+    "pearson_r",
+    "r2",
+    "mse",
+    "rmse",
+    "mae",
+    "n",
+    "source_file",
+]
+WITHIN_FOLD_COLUMNS = [
+    "model",
+    "outer_fold",
+    "within_accession_pearson_r",
+    "n_accessions",
+    "source_file",
+]
+
+
+def _sort_model_frame(
+    frame: pd.DataFrame,
+    trait_order: Mapping[str, int],
+    model_order_index: Mapping[str, int],
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    frame = frame.copy()
+    frame["_model_order"] = frame["model"].map(model_order_index)
+    sort_columns = ["_model_order", "outer_fold"]
+    if "phenotype" in frame.columns:
+        frame["_trait_order"] = frame["phenotype"].map(trait_order)
+        sort_columns.append("_trait_order")
+    frame = frame.sort_values(sort_columns, kind="mergesort")
+    drop = [column for column in ("_model_order", "_trait_order") if column in frame]
+    return frame.drop(columns=drop).reset_index(drop=True)
 
 
 def collect_fold_trait_table(
     benchmark_dir: Path,
     cohort: str,
     traits: Sequence[str],
-) -> pd.DataFrame:
-    """Pearson r for every model, outer fold, and phenotype."""
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Per-fold regression metrics and within-accession Pearson r."""
     allowed = set(traits)
     trait_order = {trait: index for index, trait in enumerate(traits)}
     model_order_index = {
         display_name: index for index, (display_name, _) in enumerate(MODEL_SPECS)
     }
     records: list[dict[str, Any]] = []
+    within_records: list[dict[str, Any]] = []
     for display_name, model_dir in MODEL_SPECS:
         candidates = summary_candidates(benchmark_dir, model_dir, cohort)
         summary_file = next((path for path in candidates if path.is_file()), None)
-        rows: list[tuple[int, str, float]] = []
+        rows: list[dict[str, Any]] = []
+        within_rows: list[dict[str, float]] = []
         source = ""
+        metrics_directory = summary_file.parent if summary_file is not None else None
         if summary_file is not None:
             try:
                 payload = read_json(summary_file)
@@ -1090,19 +1231,27 @@ def collect_fold_trait_table(
                     else is_cohort_directory
                 )
                 if cohort_ok:
-                    rows = fold_trait_rows_from_payload(payload)
+                    rows, within_rows = fold_trait_rows_from_payload(payload)
                     source = str(summary_file)
             if (
                 not rows
                 and model_dir in {"aquila-snp", "aquila-vars"}
                 and summary_file.parent.name == cohort
             ):
-                rows = fold_trait_rows_from_metrics_dir(summary_file.parent)
+                rows, within_rows = fold_trait_rows_from_metrics_dir(
+                    summary_file.parent
+                )
                 source = str(summary_file.parent)
-        if not rows:
-            shard_root = (
-                summary_file.parent if summary_file is not None else None
+        if metrics_directory is not None and metrics_directory.name == cohort:
+            extra_rows, extra_within = fold_trait_rows_from_metrics_dir(
+                metrics_directory
             )
+            if extra_rows:
+                rows = _dedupe_fold_trait_rows([*rows, *extra_rows])
+                source = source or str(metrics_directory)
+            within_rows = [*within_rows, *extra_within]
+        if not rows:
+            shard_root = metrics_directory
             search_roots = [shard_root] if shard_root is not None else []
             search_roots.extend(path.parent for path in candidates)
             seen_shards: set[Path] = set()
@@ -1119,68 +1268,177 @@ def collect_fold_trait_table(
                         payload = read_json(shard)
                     except (OSError, ValueError, json.JSONDecodeError):
                         continue
-                    part = fold_trait_rows_from_payload(
+                    part, part_within = fold_trait_rows_from_payload(
                         payload, fallback_fold=fallback_fold
                     )
                     if part:
                         rows.extend(part)
                         source = source or str(root)
-        for outer_fold, trait, value in _dedupe_fold_trait_rows(rows):
-            if trait not in allowed:
+                    within_rows.extend(part_within)
+        for row in _dedupe_fold_trait_rows(rows):
+            if row["phenotype"] not in allowed:
                 continue
             records.append(
                 {
                     "model": display_name,
-                    "outer_fold": outer_fold,
-                    "phenotype": trait,
-                    "pearson_r": value,
-                    "metric": PRIMARY_TRAIT_PEARSON,
+                    "outer_fold": int(row["outer_fold"]),
+                    "phenotype": row["phenotype"],
+                    "pearson_r": row.get("pearson", np.nan),
+                    "r2": row.get("r2", np.nan),
+                    "mse": row.get("mse", np.nan),
+                    "rmse": row.get("rmse", np.nan),
+                    "mae": row.get("mae", np.nan),
+                    "n": row.get("n", np.nan),
                     "source_file": source,
                 }
             )
-    frame = pd.DataFrame.from_records(records)
-    if frame.empty:
-        return pd.DataFrame(
-            columns=[
-                "model",
-                "outer_fold",
-                "phenotype",
-                "pearson_r",
-                "metric",
-                "source_file",
-            ]
-        )
-    frame["_model_order"] = frame["model"].map(model_order_index)
-    frame["_trait_order"] = frame["phenotype"].map(trait_order)
-    frame = frame.sort_values(
-        ["_model_order", "outer_fold", "_trait_order"],
-        kind="mergesort",
-    )
-    return frame.drop(columns=["_model_order", "_trait_order"]).reset_index(drop=True)
+        seen_folds: set[int] = set()
+        for row in within_rows:
+            outer_fold = int(row["outer_fold"])
+            if outer_fold in seen_folds:
+                continue
+            seen_folds.add(outer_fold)
+            within_records.append(
+                {
+                    "model": display_name,
+                    "outer_fold": outer_fold,
+                    "within_accession_pearson_r": row["within_accession_pearson_r"],
+                    "n_accessions": row.get("n_accessions", np.nan),
+                    "source_file": source,
+                }
+            )
+    trait_frame = pd.DataFrame.from_records(records)
+    within_frame = pd.DataFrame.from_records(within_records)
+    if trait_frame.empty:
+        trait_frame = pd.DataFrame(columns=FOLD_TRAIT_COLUMNS)
+    else:
+        trait_frame = _sort_model_frame(trait_frame, trait_order, model_order_index)
+    if within_frame.empty:
+        within_frame = pd.DataFrame(columns=WITHIN_FOLD_COLUMNS)
+    else:
+        within_frame = _sort_model_frame(within_frame, trait_order, model_order_index)
+    return trait_frame, within_frame
+
+
+def _mean_and_std(values: pd.Series) -> tuple[float, float]:
+    numbers = values.to_numpy(dtype=float)
+    numbers = numbers[np.isfinite(numbers)]
+    if numbers.size == 0:
+        return np.nan, np.nan
+    std = float(np.std(numbers, ddof=1)) if numbers.size > 1 else np.nan
+    return float(np.mean(numbers)), std
 
 
 def summarize_fold_trait_table(fold_trait_df: pd.DataFrame) -> pd.DataFrame:
-    """Mean and sample standard deviation of Pearson r across outer folds."""
-    columns = [
-        "model",
-        "phenotype",
-        "n_folds",
-        "mean_pearson_r",
-        "std_pearson_r",
-    ]
+    """Mean and sample standard deviation of each metric across outer folds."""
+    metric_columns = ("pearson_r", "r2", "mse", "rmse", "mae")
+    columns = ["model", "phenotype", "n_folds"]
+    for metric in metric_columns:
+        columns.extend([f"mean_{metric}", f"std_{metric}"])
     if fold_trait_df.empty:
         return pd.DataFrame(columns=columns)
-    grouped = fold_trait_df.groupby(["model", "phenotype"], sort=False)["pearson_r"]
-    summary = grouped.agg(
-        n_folds="count",
-        mean_pearson_r="mean",
-        std_pearson_r=lambda values: (
-            float(np.std(values.to_numpy(dtype=float), ddof=1))
-            if len(values) > 1
-            else np.nan
-        ),
-    ).reset_index()
-    return summary
+    records: list[dict[str, Any]] = []
+    grouped = fold_trait_df.groupby(["model", "phenotype"], sort=False)
+    for (model, phenotype), group in grouped:
+        record: dict[str, Any] = {
+            "model": model,
+            "phenotype": phenotype,
+            "n_folds": int(np.isfinite(group["pearson_r"].to_numpy(dtype=float)).sum()),
+        }
+        for metric in metric_columns:
+            mean, std = _mean_and_std(group[metric])
+            record[f"mean_{metric}"] = mean
+            record[f"std_{metric}"] = std
+        records.append(record)
+    return pd.DataFrame.from_records(records)
+
+
+def summarize_model_folds(
+    fold_trait_df: pd.DataFrame,
+    within_fold_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """One row per model and outer fold, including within-accession Pearson r."""
+    columns = [
+        "model",
+        "outer_fold",
+        "n_traits",
+        "mean_pearson_r",
+        "mean_r2",
+        "mean_mse",
+        "mean_rmse",
+        "mean_mae",
+        "within_accession_pearson_r",
+        "n_accessions",
+    ]
+    if fold_trait_df.empty and within_fold_df.empty:
+        return pd.DataFrame(columns=columns)
+    if fold_trait_df.empty:
+        summary = within_fold_df.copy()
+    else:
+        grouped = fold_trait_df.groupby(["model", "outer_fold"], sort=False)
+        records = []
+        for (model, outer_fold), group in grouped:
+            record = {
+                "model": model,
+                "outer_fold": int(outer_fold),
+                "n_traits": int(
+                    np.isfinite(group["pearson_r"].to_numpy(dtype=float)).sum()
+                ),
+            }
+            for metric in ("pearson_r", "r2", "mse", "rmse", "mae"):
+                mean, _std = _mean_and_std(group[metric])
+                record[f"mean_{metric}"] = mean
+            records.append(record)
+        summary = pd.DataFrame.from_records(records)
+    if not within_fold_df.empty:
+        within = within_fold_df[
+            ["model", "outer_fold", "within_accession_pearson_r", "n_accessions"]
+        ]
+        if summary.empty:
+            summary = within.copy()
+        else:
+            summary = summary.merge(within, on=["model", "outer_fold"], how="outer")
+    for column in columns:
+        if column not in summary.columns:
+            summary[column] = np.nan
+    return summary[columns]
+
+
+def _fill_within_folds(
+    saved_within_df: pd.DataFrame,
+    predicted_within_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Prefer within-accession r stored with the model metrics, then predictions."""
+    predicted = predicted_within_df.copy()
+    if "source_file" not in predicted.columns:
+        predicted["source_file"] = "outer-test predictions"
+    saved = saved_within_df.copy()
+    if not saved.empty:
+        saved["scale"] = "normalized"
+    if saved.empty:
+        return predicted
+    if predicted.empty:
+        missing = predicted
+    else:
+        annotated = predicted.merge(
+            saved[["model", "outer_fold"]],
+            on=["model", "outer_fold"],
+            how="left",
+            indicator=True,
+        )
+        missing = annotated.loc[annotated["_merge"] == "left_only"].drop(
+            columns="_merge"
+        )
+    combined = pd.concat([saved, missing], ignore_index=True, sort=False)
+    model_order_index = {
+        display_name: index for index, (display_name, _) in enumerate(MODEL_SPECS)
+    }
+    combined["_model_order"] = combined["model"].map(model_order_index)
+    combined = combined.sort_values(
+        ["_model_order", "outer_fold"],
+        kind="mergesort",
+    )
+    return combined.drop(columns="_model_order").reset_index(drop=True)
 
 
 def collect_results(
@@ -1932,6 +2190,7 @@ def write_tables(
     within_fold_df: pd.DataFrame,
     fold_trait_df: pd.DataFrame,
     fold_trait_summary_df: pd.DataFrame,
+    model_fold_df: pd.DataFrame,
 ) -> None:
     long_df.to_csv(
         output_dir / f"{cohort}.pearson_by_model_and_trait.long.tsv",
@@ -1999,6 +2258,12 @@ def write_tables(
         index=False,
         na_rep="",
     )
+    model_fold_df.to_csv(
+        output_dir / f"{cohort}.metrics_by_model_and_fold.tsv",
+        sep="\t",
+        index=False,
+        na_rep="",
+    )
 
 
 def print_summary(
@@ -2056,13 +2321,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
 
     long_df = make_long_table(results, traits)
-    fold_trait_df = collect_fold_trait_table(benchmark_dir, args.cohort, traits)
+    fold_trait_df, saved_within_df = collect_fold_trait_table(
+        benchmark_dir, args.cohort, traits
+    )
     fold_trait_summary_df = summarize_fold_trait_table(fold_trait_df)
     status_df = make_status_table(results, traits)
     within_results = collect_within_results(benchmark_dir, args.cohort, traits)
     within_summary_df, within_fold_df = make_within_tables(
         within_results, len(traits)
     )
+    within_fold_df = _fill_within_folds(saved_within_df, within_fold_df)
+    model_fold_df = summarize_model_folds(fold_trait_df, within_fold_df)
     order = model_order(status_df)
     tested_models = [
         model
@@ -2086,6 +2355,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         within_fold_df,
         fold_trait_df,
         fold_trait_summary_df,
+        model_fold_df,
     )
 
     configure_style()
