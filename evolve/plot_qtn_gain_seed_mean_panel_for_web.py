@@ -12,6 +12,22 @@ from matplotlib.patches import Rectangle
 from matplotlib.ticker import FormatStrFormatter
 from matplotlib.offsetbox import AnnotationBbox, TextArea, HPacker
 
+
+def format_mean_std(center, std):
+    """Show enough decimals for a non-zero SD to stay visible."""
+    for digits in range(3, 8):
+        std_text = f"{std:.{digits}f}"
+        if std == 0 or float(std_text) != 0:
+            return f"{center:.{digits}f} ± {std_text}"
+    return f"{center:.5f} ± {std:.5f}"
+
+
+def label_fontsize(text, base=11.0, max_chars=26, floor=7.0):
+    if len(text) <= max_chars:
+        return base
+    return max(floor, base * max_chars / len(text))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Publication-style RiceNavi QTN SI gain panel using mean gain and evolved major GT across seeds."
@@ -41,8 +57,8 @@ def parse_args():
         help="Number of top QTNs to plot. 0 means plot all matched QTNs."
     )
 
-    parser.add_argument("--gain-col", default="SI_gain",
-                        help="Column name for per-SNP SI gain.")
+    parser.add_argument("--gain-col", default="SI_evolved",
+                        help="Column name for the per-round marginal SI. SI_evolved is the change from the genome at the start of that round.")
     parser.add_argument("--skiprows", type=int, default=1)
 
     parser.add_argument("--fig-width", type=float, default=11)
@@ -676,7 +692,18 @@ def main():
         how="left",
     )
 
-    matched_all = matched_all.sort_values("gain_mean", ascending=False).reset_index(drop=True)
+    matched_all = matched_all.sort_values(
+        ["gain_mean", "evaluated_snp_id"],
+        ascending=[False, True],
+    )
+    before_qtn = len(matched_all)
+    matched_all = matched_all.drop_duplicates("GeneName", keep="first")
+    matched_all = matched_all.reset_index(drop=True)
+    matched_all["global_rank"] = matched_all.index + 1
+    print(
+        f"Unique QTGs: {len(matched_all)} "
+        f"(collapsed {before_qtn - len(matched_all)} lower-SI matches)"
+    )
 
     if args.top_n and args.top_n > 0:
         matched = matched_all.head(args.top_n).copy()
@@ -718,18 +745,19 @@ def main():
     )
 
     fig_width = args.fig_width + (4.6 if compare_hhz else 0.0)
-    fig = plt.figure(figsize=(fig_width, auto_height))
+    legend_height = 1.25 if compare_hhz else 0.0
+    fig = plt.figure(figsize=(fig_width, auto_height + legend_height))
 
     if compare_hhz:
         width_ratios = [0.75, 3.35, 5.0, 2.15, 3.7]
     else:
         width_ratios = [0.75, 3.35, 5.0, 2.65]
     gs = fig.add_gridspec(
-        nrows=2,
+        nrows=2 if compare_hhz else 1,
         ncols=len(width_ratios),
-        height_ratios=[18, 2.2],
+        height_ratios=[auto_height, legend_height] if compare_hhz else None,
         width_ratios=width_ratios,
-        hspace=0.005,
+        hspace=0.03,
         wspace=0.08,
     )
 
@@ -747,8 +775,8 @@ def main():
         if ax is not None:
             ax.set_ylim(-0.7, n - 0.3)
 
-    ax_rank.text(0.5, n + 0.35, "Rank", ha="center", va="bottom", fontsize=11, fontweight="bold")
-    ax_gene.text(0.0, n + 0.35, "Gene (SNP_ID)", ha="left", va="bottom", fontsize=11, fontweight="bold")
+    ax_rank.text(0.5, n + 0.35, "Rank", ha="center", va="bottom", fontsize=12, fontweight="bold")
+    ax_gene.text(0.0, n + 0.35, "Gene (SNP_ID)", ha="left", va="bottom", fontsize=12, fontweight="bold")
 
     if compare_hhz:
         pattern_colors = {
@@ -757,11 +785,11 @@ def main():
             "Novel-selected": "#7A3DD8",
             "Unknown": "#B8B8B8",
         }
-        ax_pattern.text(0.5, n + 0.35, "Evolutionary\npattern", ha="center", va="bottom", fontsize=11, fontweight="bold")
-        ax_gt.text(1.5, n + 0.7, "Genotype", ha="center", va="bottom", fontsize=11, fontweight="bold")
-        ax_gt.text(0, n - 0.05, "Teqing", ha="center", va="bottom", fontsize=10)
-        ax_gt.text(1.5, n - 0.05, "HHZ", ha="center", va="bottom", fontsize=10)
-        ax_gt.text(3.0, n - 0.05, "Evolved", ha="center", va="bottom", fontsize=10)
+        ax_pattern.text(0.5, n + 0.35, "Evolutionary\npattern", ha="center", va="bottom", fontsize=12, fontweight="bold")
+        ax_gt.text(1.5, n + 0.7, "Genotype", ha="center", va="bottom", fontsize=12, fontweight="bold")
+        ax_gt.text(0, n - 0.05, "Teqing", ha="center", va="bottom", fontsize=11)
+        ax_gt.text(1.5, n - 0.05, "HHZ", ha="center", va="bottom", fontsize=11)
+        ax_gt.text(3.0, n - 0.05, "Evolved", ha="center", va="bottom", fontsize=11)
     else:
         pattern_colors = {}
         ax_gt.text(0.75, n + 0.7, "Genotype", ha="center", va="bottom", fontsize=11, fontweight="bold")
@@ -771,15 +799,16 @@ def main():
     ax_rank.plot([0.05, 0.95], [n + 0.18, n + 0.18], color="0.35", lw=0.8, clip_on=False)
     ax_gene.plot([0.0, 1.0], [n + 0.18, n + 0.18], color="0.35", lw=0.8, clip_on=False)
 
-    gain_mean = matched["gain_mean"].fillna(0)
-    gain_std = matched["gain_std"].fillna(0)
+    gain_mean = matched["gain_mean"].fillna(0).to_numpy(dtype=float)
+    gain_std = matched["gain_std"].fillna(0).to_numpy(dtype=float)
     right_edge = gain_mean + gain_std
     left_edge = gain_mean - gain_std
-    max_gain = float(right_edge.max()) if len(right_edge) else 0.001
-    if pd.isna(max_gain) or max_gain <= 0:
-        max_gain = 0.001
-    x_min = min(0.0, float(left_edge.min()) * 1.08)
-    x_max = max_gain * 1.55
+    high_edge = float(np.nanmax(right_edge)) if len(right_edge) else 0.001
+    low_edge = float(np.nanmin(left_edge)) if len(left_edge) else 0.0
+    if not np.isfinite(high_edge) or high_edge <= 0:
+        high_edge = 0.001
+    x_min = 0.0 if low_edge >= -1e-12 else low_edge * 1.08
+    x_max = high_edge * 1.7
 
     ax_bar.set_xlim(x_min, x_max)
     ax_bar.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
@@ -795,7 +824,7 @@ def main():
     ax_bar.tick_params(axis="y", left=False, labelleft=False)
     ax_bar.xaxis.set_ticks_position("top")
     ax_bar.xaxis.set_label_position("top")
-    ax_bar.set_xlabel("Mean SI gain (ΔSI)", fontsize=11, fontweight="bold", labelpad=8)
+    ax_bar.set_xlabel("Mean SI evolved (ΔSI, mean ± SD)", fontsize=12, fontweight="bold", labelpad=8)
 
     ax_bar.tick_params(
         axis="x",
@@ -810,14 +839,15 @@ def main():
         labelsize=9,
     )
 
+    point_colors = [
+        category_colors.get(c, category_colors["Other"])
+        for c in matched["Trait_category"]
+    ]
     ax_bar.barh(
         y,
-        matched["gain_mean"],
-        xerr=matched["gain_std"].fillna(0),
-        color=[
-            category_colors.get(c, category_colors["Other"])
-            for c in matched["Trait_category"]
-        ],
+        gain_mean,
+        xerr=gain_std,
+        color=point_colors,
         edgecolor="black",
         linewidth=0.45,
         height=0.58,
@@ -842,13 +872,14 @@ def main():
             str(rank),
             ha="center",
             va="center",
-            fontsize=10,
+            fontsize=11,
             fontweight="bold"
         )
+        label_size = label_fontsize(f"{gene} ({snp_id_short})")
         gene_box = TextArea(
             gene,
             textprops=dict(
-                fontsize=10,
+                fontsize=label_size,
                 fontweight="bold",
                 fontstyle="italic",
                 family="Arial"
@@ -858,7 +889,7 @@ def main():
         snp_box = TextArea(
             f" ({snp_id_short})",
             textprops=dict(
-                fontsize=10,
+                fontsize=label_size,
                 family="Arial"
             )
         )
@@ -880,17 +911,17 @@ def main():
 
         ax_gene.add_artist(ab)
 
-        gain_mean = float(r["gain_mean"])
-        gain_std = float(r["gain_std"]) if pd.notna(r["gain_std"]) else 0.0
-        gain_label = f"{gain_mean:.3f} ± {gain_std:.3f}"
+        center = float(r["gain_mean"])
+        std = float(r["gain_std"]) if pd.notna(r["gain_std"]) else 0.0
+        gain_label = format_mean_std(center, std)
 
         ax_bar.text(
-            gain_mean + gain_std + max_gain * 0.02,
+            center + std + high_edge * 0.03,
             i,
             gain_label,
             ha="left",
             va="center",
-            fontsize=8.5,
+            fontsize=9.5,
         )
 
         if compare_hhz:
@@ -905,7 +936,7 @@ def main():
                 clip_on=False,
             )
             ax_pattern.add_patch(rect)
-            ax_pattern.text(0.5, i, pattern, ha="center", va="center", fontsize=7.2, color="white")
+            ax_pattern.text(0.5, i, pattern, ha="center", va="center", fontsize=8.2, color="white")
             draw_gt_box(ax_gt, 0, i, gt_display(r["Base_GT"]), "#DDEBF7")
             draw_gt_box(ax_gt, 1.5, i, gt_display(r["HHZ_GT"]), "#F9D9D3")
             draw_gt_box(ax_gt, 3.0, i, gt_display(r["Evolved_Major_GT"]), genotype_colors["Evolved"])
@@ -916,6 +947,79 @@ def main():
     ax_gt.set_xlim(-0.65, 3.65 if compare_hhz else 2.15)
     if compare_hhz:
         ax_pattern.set_xlim(0, 1)
+        ax_legend = fig.add_subplot(gs[1, :])
+        ax_legend.axis("off")
+        ax_legend.set_xlim(0, 1)
+        ax_legend.set_ylim(0, 1)
+        ax_legend.add_patch(
+            Rectangle(
+                (0.01, 0.04),
+                0.98,
+                0.92,
+                facecolor="white",
+                edgecolor="0.75",
+                linewidth=0.8,
+                transform=ax_legend.transAxes,
+            )
+        )
+        present_trait_categories = [
+            name
+            for name in category_colors
+            if name in set(matched["Trait_category"].dropna().astype(str))
+        ]
+        ax_legend.text(
+            0.025, 0.78, "Trait category",
+            fontsize=11, fontweight="bold", transform=ax_legend.transAxes,
+        )
+        for idx, name in enumerate(present_trait_categories):
+            col = idx % 3
+            row = idx // 3
+            xx = 0.025 + col * 0.165
+            yy = 0.42 - row * 0.34
+            ax_legend.add_patch(
+                Rectangle(
+                    (xx, yy), 0.016, 0.20,
+                    facecolor=category_colors[name],
+                    edgecolor="black",
+                    linewidth=0.4,
+                    transform=ax_legend.transAxes,
+                )
+            )
+            ax_legend.text(
+                xx + 0.022, yy + 0.10, name,
+                fontsize=9.5, va="center", transform=ax_legend.transAxes,
+            )
+        ax_legend.plot(
+            [0.54, 0.54], [0.12, 0.88],
+            color="0.75", linestyle=":", transform=ax_legend.transAxes,
+        )
+        ax_legend.text(
+            0.57, 0.78, "Evolutionary pattern",
+            fontsize=11, fontweight="bold", transform=ax_legend.transAxes,
+        )
+        pattern_desc = {
+            "HHZ-selected": "Evolved genotype identical to HHZ allele state",
+            "Novel-selected": "Evolved genotype distinct from both parental allele states",
+        }
+        for idx, name in enumerate(pattern_desc):
+            yy = 0.42 - idx * 0.34
+            ax_legend.add_patch(
+                Rectangle(
+                    (0.57, yy), 0.115, 0.22,
+                    facecolor=pattern_colors[name],
+                    edgecolor="none",
+                    transform=ax_legend.transAxes,
+                )
+            )
+            ax_legend.text(
+                0.627, yy + 0.11, name,
+                ha="center", va="center", fontsize=7.6, color="white",
+                fontweight="bold", transform=ax_legend.transAxes,
+            )
+            ax_legend.text(
+                0.70, yy + 0.11, pattern_desc[name],
+                ha="left", va="center", fontsize=7.2, transform=ax_legend.transAxes,
+            )
 
     handles = []
     labels = []
@@ -966,7 +1070,7 @@ def main():
     write_html_wrapper(
         svg_path=svg_path,
         html_path=html_path,
-        title="QTN SI gain contribution panel"
+        title="QTN SI evolved contribution panel"
     )
 
     print(f"Saved: {pdf_path}")

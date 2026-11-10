@@ -149,6 +149,11 @@ done
 cd ..
 ```
 
+##### Try new architecture
+```sh
+
+```
+
 ### [CropARNet](https://github.com/Zhoushuchang-lab/CropARNet)
 
 Some scripts from CropARNet were copied or adapted into our project repository. The upstream source code version referenced for this benchmark is commit `b9996564d0f021d2d24781935abb04a166c0342e`.

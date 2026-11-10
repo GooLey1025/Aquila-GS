@@ -135,16 +135,16 @@ aquila_train_cv_production.py \
 ## Rice3305
 
 - VCF: `Rice3305.vcf.gz` (13,282 SNP records)
-- Phenotype: `Rice3305.pheno.tsv` (3,305 samples, filtered from `3606rice_Phenotype.tsv`)
+- Phenotype: `Rice3305.pheno.with_BLUP.tsv` (3,305 samples, filtered from `3606rice_Phenotype.tsv`, with multi-environment BLUPs appended)
 - Aquila-SNP config: `aquila-snp.medium.hpo.yaml`
 
-This panel has no INDEL or SV records, so only Aquila-SNP is trained. Phenotype columns are environment-specific. The single-trait blocks are one example. Set `TRAIT` to any column in `Rice3305.pheno.tsv` and rerun the same commands on the shared fold map.
+This panel has no INDEL or SV records, so only Aquila-SNP is trained. The table keeps every environment-specific column from `Rice3305.pheno.tsv` and adds 16 BLUP columns fit on the full 3,605-line trial (`HeadingDate_BLUP`, `PlantHeight_BLUP`, `PanicleLength_BLUP`, `TillerNumber_BLUP`, `GrainPerPanicle_BLUP`, `SeedSetRate_BLUP`, `1000-GrainWeight_BLUP`, `GrainLength_BLUP`, `GrainWidth_BLUP`, `GrainLengthToWidthRatio_BLUP`, `YieldPerPlant_BLUP`, `ScaleOfLeafBlastResistance_BLUP`, `ScaleOfNeckBlastResistance_BLUP`, `SeedSetRateUnderColdStress_BLUP`, `SeedSetRateUnderHeighTemperatureStress_BLUP`, `SeedlingEmergenceRate_BLUP`). The single-trait blocks are one example. Set `TRAIT` to any column in `Rice3305.pheno.with_BLUP.tsv` and rerun the same commands on the shared fold map.
 
 ### Shared 10-fold map
 
 ```bash
 aquila_cv.py \
-  --phenotype Rice3305.pheno.tsv \
+  --phenotype Rice3305.pheno.with_BLUP.tsv \
   --outer-folds 10 \
   --seed 42 \
   --min-observed 10 \
@@ -156,7 +156,7 @@ aquila_cv.py \
 ```bash
 aquila_data_cv_production.py \
   --vcf Rice3305.vcf.gz \
-  --phenotype Rice3305.pheno.tsv \
+  --phenotype Rice3305.pheno.with_BLUP.tsv \
   --encoding-type diploid_onehot \
   --variant-type snp \
   --id-prefix SNP- \
@@ -180,11 +180,11 @@ aquila_train_cv_production.py \
 ### Per-fold Aquila-SNP: one trait
 
 ```bash
-TRAIT=Headingdate_2023
+TRAIT=HeadingDate_BLUP
 
 aquila_data_cv_production.py \
   --vcf Rice3305.vcf.gz \
-  --phenotype Rice3305.pheno.tsv \
+  --phenotype Rice3305.pheno.with_BLUP.tsv \
   --traits ${TRAIT} \
   --encoding-type diploid_onehot \
   --variant-type snp \

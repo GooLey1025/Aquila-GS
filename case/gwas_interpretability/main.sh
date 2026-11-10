@@ -3,7 +3,6 @@
 # attributed output is the mean of the inverse-transformed fold predictions.
 export MODEL_DIR=../../production_GS_model_train/655rice.production.more_sv_markers.final.imputed.panel.aquila-snp.multi_trait.per-fold.10folds.hpo
 export DATA_DIR=../../production_GS_model_train/655rice.production.more_sv_markers.final.imputed.panel.aquila-snp.multi_trait.per-fold.10folds.data
-export LOCKED_CONFIG=./production.multi_trait.one-sd.seed_refit.yaml
 export VCF=../../production_GS_model_train/655rice.production.more_sv_markers.final.imputed.panel.vcf.gz
 export PHENO=../../benchmark/Rice655.pheno
 if [[ ! -e ./Rice655.full_marker_panel_gwas_results ]]; then
@@ -18,15 +17,6 @@ export PREFIX=655rice.production.gwas_interpretability
 
 TRAITS=(HD_BLUP GW_BLUP PH_BLUP) #GYP_BLUP TGW_BLUP TNP_BLUP GL_BLUP PPNP_BLUP
 
-if [[ ! -f "${MODEL_DIR}/fold_0/best_model.pt" ]]; then
-  echo "[train-folds] ${MODEL_DIR} has no fold checkpoints; backfilling locked folds"
-  aquila_train_locked_folds.py \
-    --data-dir "$DATA_DIR" \
-    --config "$LOCKED_CONFIG" \
-    -o "$MODEL_DIR" \
-    --precision bf16 \
-    --use-deterministic
-fi
 
 for TRAIT in "${TRAITS[@]}"; do
   IG_DIR=${PREFIX}.${TRAIT}.ensemble.ig
@@ -115,3 +105,42 @@ python3 plot_topk_gwas_marker_venn_v3.py \
 #     --ig-top-k 500 \
 #     --qtn-annot Final_summary_347_QTNsites_geno_redefined.xlsx \
 #     --highlight 3:16733441
+
+
+
+# Leaf-blast BLUP on the Rice3305 multi-trait ensemble, attributed only on
+# the Rice300 panel (same 13,282 SNP- IDs, 300 samples).
+
+export MODEL_DIR=../../production_GS_model_train/Rice3305.aquila-snp.multi_trait.per-fold.10folds.hpo
+export VCF=../../production_GS_model_train/300_lines_yield_snbr_selection/Rice300.Rice3305_ref.snp.format.id.impute.biallelic.vcf.gz
+export PHENO=../../production_GS_model_train/Rice3305.pheno.with_BLUP.tsv
+export PREFIX=Rice300.leafblast.gwas_interpretability
+
+TRAITS=(
+  ScaleOfLeafBlastResistance_BLUP
+)
+
+for TRAIT in "${TRAITS[@]}"; do
+  IG_DIR=${PREFIX}.${TRAIT}.ensemble.ig
+  IMPORTANCE_DIR=${PREFIX}.${TRAIT}.ensemble.position_importance
+  IMPORTANCE=${IMPORTANCE_DIR}/importance_ranking_${TRAIT}.tsv
+
+  echo "[IG] ${TRAIT} 10-fold ensemble"
+  aquila_ig_ensemble.py \
+    --model-dir "$MODEL_DIR" \
+    --vcf "$VCF" \
+    --encoding-type diploid_onehot \
+    --variant-type snp \
+    --id-prefix SNP- \
+    --task "$TRAIT" \
+    --streaming \
+    -o "$IG_DIR"
+
+  echo "[rank] ${TRAIT}"
+  aquila_ig_interpretation.py \
+    -i "${IG_DIR}/ig_results.h5" \
+    -o "$IMPORTANCE_DIR" \
+    --tasks "$TRAIT" \
+    --variant-type snp
+
+done
