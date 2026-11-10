@@ -33,6 +33,102 @@ import pandas as pd
 from aquila.metrics import MetricsCalculator
 
 
+def _evaluate_regression_split(
+    trainer,
+    loader,
+    split_name: str,
+    output_dir: Path,
+    is_multi_branch: bool,
+    norm_stats: Optional[dict],
+) -> Optional[dict]:
+    """Score one split and save original-scale predictions plus named metrics."""
+    if loader is None:
+        return None
+
+    trainer.model.eval()
+    sample_ids = []
+    prediction_batches = []
+    target_batches = []
+    mask_batches = []
+    with torch.no_grad():
+        for batch in loader:
+            if is_multi_branch:
+                variant_inputs = {}
+                for key, value in batch.items():
+                    if key not in {
+                        'sample_id', 'regression_targets', 'regression_mask',
+                        'classification_targets', 'classification_mask',
+                    }:
+                        variant_inputs[key] = value.to(trainer.device)
+                model_input = variant_inputs
+            else:
+                model_input = batch['snp'].to(trainer.device)
+            sample_ids.extend(batch['sample_id'])
+            predictions = trainer.model(model_input)
+            if 'regression_targets' not in batch or 'regression' not in predictions:
+                continue
+            prediction_batches.append(predictions['regression'].cpu().numpy())
+            target_batches.append(batch['regression_targets'].numpy())
+            mask_batches.append(batch['regression_mask'].numpy())
+
+    if not prediction_batches:
+        return None
+
+    predictions = np.concatenate(prediction_batches, axis=0)
+    targets = np.concatenate(target_batches, axis=0)
+    masks = np.concatenate(mask_batches, axis=0)
+    task_names = [f'task_{i}' for i in range(predictions.shape[1])]
+    if norm_stats:
+        task_names = list(norm_stats.get('regression_tasks') or task_names)
+        means = norm_stats['regression_means']
+        stds = norm_stats['regression_stds']
+        log_tasks = set(norm_stats.get('log_transformed_tasks') or [])
+        for i in range(len(means)):
+            predictions[:, i] = predictions[:, i] * stds[i] + means[i]
+            targets[:, i] = targets[:, i] * stds[i] + means[i]
+        for i, task_name in enumerate(task_names):
+            if task_name in log_tasks:
+                predictions[:, i] = np.expm1(predictions[:, i])
+                targets[:, i] = np.expm1(targets[:, i])
+
+    raw_metrics = MetricsCalculator().compute_regression_metrics(
+        predictions, targets, masks
+    )
+    tasks = []
+    for i, task_name in enumerate(task_names):
+        pearson_key = f'task_{i}_pearson'
+        if pearson_key not in raw_metrics:
+            continue
+        tasks.append({
+            'name': task_name,
+            'pearson': float(raw_metrics[pearson_key]),
+            'mse': float(raw_metrics[f'task_{i}_mse']),
+            'rmse': float(raw_metrics[f'task_{i}_rmse']),
+            'mae': float(raw_metrics[f'task_{i}_mae']),
+            'r2': float(raw_metrics[f'task_{i}_r2']),
+            'n': int(masks[:, i].sum()),
+        })
+
+    pred_data = {'Sample_ID': sample_ids}
+    for i, task_name in enumerate(task_names):
+        observed = []
+        predicted = []
+        for row in range(len(sample_ids)):
+            if masks[row, i] == 0:
+                observed.append('Missing')
+            else:
+                observed.append(targets[row, i])
+            predicted.append(predictions[row, i])
+        pred_data[f'{task_name}_Target'] = observed
+        pred_data[f'{task_name}_Pred'] = predicted
+    pred_path = output_dir / f'{split_name}_predictions_original_scale.tsv'
+    pd.DataFrame(pred_data).to_csv(
+        pred_path, sep='\t', index=False, float_format='%.6f'
+    )
+    print(f"{split_name} predictions saved to: {pred_path}")
+    return {'split': split_name, 'tasks': tasks}
+
+
 def _loader_split_ids(loader) -> list:
     """Return every sample ID assigned to this loader's dataset.
 
@@ -1062,188 +1158,43 @@ def main():
         verbose=True
     )
 
-    # Evaluation on test set if available
-    if test_loader:
+    # Score the checkpoint selected on the validation set.
+    best_checkpoint = output_dir / 'checkpoints' / 'best_checkpoint.pt'
+    if best_checkpoint.exists():
+        trainer.load_checkpoint(str(best_checkpoint))
+        print("Loaded best checkpoint for split evaluation")
+
+    import json
+    split_report = {}
+    for split_name, split_loader in (
+        ("train", train_loader),
+        ("valid", val_loader),
+        ("test", test_loader),
+    ):
         print("\n" + "=" * 80)
-        print("Evaluating on Test Set")
+        print(f"Evaluating on {split_name} set")
         print("=" * 80)
-
-        # Load best model
-        best_checkpoint = output_dir / 'checkpoints' / 'best_checkpoint.pt'
-        if best_checkpoint.exists():
-            trainer.load_checkpoint(str(best_checkpoint))
-            print("Loaded best checkpoint")
-
-        # Collect predictions and targets from test set
-        trainer.model.eval()
-        all_sample_ids = []
-        all_predictions_reg = []
-        all_targets_reg = []
-        all_masks_reg = []
-
-        with torch.no_grad():
-            for batch in test_loader:
-                # Handle multi-branch or single-branch input
-                if is_multi_branch:
-                    # Multi-branch: create dict input
-                    variant_inputs = {}
-                    for key in batch.keys():
-                        if key not in ['sample_id', 'regression_targets', 'regression_mask',
-                                       'classification_targets', 'classification_mask']:
-                            variant_inputs[key] = batch[key].to(trainer.device)
-                    snp_data = variant_inputs
-                else:
-                    # Single-branch
-                    snp_data = batch['snp'].to(trainer.device)
-
-                all_sample_ids.extend(batch['sample_id'])
-
-                # Get predictions
-                predictions = trainer.model(snp_data)
-
-                if 'regression_targets' in batch and 'regression' in predictions:
-                    all_predictions_reg.append(
-                        predictions['regression'].cpu().numpy())
-                    all_targets_reg.append(batch['regression_targets'].numpy())
-                    all_masks_reg.append(batch['regression_mask'].numpy())
-
-        # Concatenate all batches
-        if all_predictions_reg:
-            predictions_normalized = np.concatenate(
-                all_predictions_reg, axis=0)
-            targets_normalized = np.concatenate(all_targets_reg, axis=0)
-            masks = np.concatenate(all_masks_reg, axis=0)
-
-            # Calculate metrics on normalized data
-            metrics_calc = MetricsCalculator()
-            test_metrics_normalized = metrics_calc.compute_regression_metrics(
-                predictions_normalized, targets_normalized, masks
-            )
-
-            # Load normalization statistics for denormalization
-            norm_stats_path = output_dir / 'normalization_stats.pkl'
-            if norm_stats_path.exists():
-                import pickle
-                with open(norm_stats_path, 'rb') as f:
-                    norm_stats = pickle.load(f)
-
-                regression_means = norm_stats['regression_means']
-                regression_stds = norm_stats['regression_stds']
-                regression_task_names = norm_stats['regression_tasks']
-                log_transformed_tasks = norm_stats.get(
-                    'log_transformed_tasks', [])
-
-                # Denormalize predictions and targets (reverse Z-score)
-                predictions_log_scale = predictions_normalized.copy()
-                targets_log_scale = targets_normalized.copy()
-
-                for i in range(len(regression_means)):
-                    # Apply inverse Z-score: log_scale = (normalized * std) + mean
-                    predictions_log_scale[:, i] = (
-                        predictions_normalized[:, i] * regression_stds[i]) + regression_means[i]
-                    targets_log_scale[:, i] = (
-                        targets_normalized[:, i] * regression_stds[i]) + regression_means[i]
-
-                # Calculate metrics on log-transformed scale (after reverse Z-score)
-                test_metrics_log_scale = metrics_calc.compute_regression_metrics(
-                    predictions_log_scale, targets_log_scale, masks
+        report = _evaluate_regression_split(
+            trainer,
+            split_loader,
+            split_name,
+            output_dir,
+            is_multi_branch,
+            normalization_stats,
+        )
+        if report:
+            split_report[split_name] = report["tasks"]
+            for task in report["tasks"]:
+                print(
+                    f"  {task['name']}: pearson={task['pearson']:.4f} "
+                    f"rmse={task['rmse']:.4f} n={task['n']}"
                 )
 
-                # Reverse log transformation to get original scale
-                predictions_original = predictions_log_scale.copy()
-                targets_original = targets_log_scale.copy()
-
-                for i, task_name in enumerate(regression_task_names):
-                    if task_name in log_transformed_tasks:
-                        # Reverse log(x+1) transformation: original = exp(log_value) - 1
-                        predictions_original[:, i] = np.expm1(
-                            predictions_log_scale[:, i])
-                        targets_original[:, i] = np.expm1(
-                            targets_log_scale[:, i])
-
-                # Calculate metrics on original scale
-                test_metrics_original = metrics_calc.compute_regression_metrics(
-                    predictions_original, targets_original, masks
-                )
-
-                # Print both sets of metrics
-                if log_transformed_tasks:
-                    print("\n" + "=" * 80)
-                    print("Test Set Results (Log-Transformed Scale):")
-                    print("=" * 80)
-                    for key, value in test_metrics_log_scale.items():
-                        if isinstance(value, float):
-                            print(f"  {key}: {value:.4f}")
-
-                print("\n" + "=" * 80)
-                print("Test Set Results (Original Scale):")
-                print("=" * 80)
-                for key, value in test_metrics_original.items():
-                    if isinstance(value, float):
-                        print(f"  {key}: {value:.4f}")
-
-                # Save predictions on both scales
-                import json
-
-                # Original scale predictions (primary)
-                pred_data_original = {'Sample_ID': all_sample_ids}
-                for i, task_name in enumerate(regression_task_names):
-                    target_col = []
-                    pred_col = []
-                    for j in range(len(all_sample_ids)):
-                        if masks[j, i] == 0:
-                            target_col.append("Missing")
-                        else:
-                            target_col.append(targets_original[j, i])
-                        pred_col.append(predictions_original[j, i])
-
-                    pred_data_original[f'{task_name}_Target'] = target_col
-                    pred_data_original[f'{task_name}_Pred'] = pred_col
-
-                df_original = pd.DataFrame(pred_data_original)
-                pred_path_original = output_dir / 'test_predictions_original_scale.tsv'
-                df_original.to_csv(pred_path_original, sep='\t',
-                                   index=False, float_format='%.6f')
-                print(
-                    f"\nPredictions (original scale) saved to: {pred_path_original}")
-
-                # Log scale predictions (if any log transformations were applied)
-                if log_transformed_tasks:
-                    pred_data_log = {'Sample_ID': all_sample_ids}
-                    for i, task_name in enumerate(regression_task_names):
-                        target_col = []
-                        pred_col = []
-                        for j in range(len(all_sample_ids)):
-                            if masks[j, i] == 0:
-                                target_col.append("Missing")
-                            else:
-                                target_col.append(targets_log_scale[j, i])
-                            pred_col.append(predictions_log_scale[j, i])
-
-                        pred_data_log[f'{task_name}_Target'] = target_col
-                        pred_data_log[f'{task_name}_Pred'] = pred_col
-
-                    df_log = pd.DataFrame(pred_data_log)
-                    pred_path_log = output_dir / 'test_predictions_log_scale.tsv'
-                    df_log.to_csv(pred_path_log, sep='\t',
-                                  index=False, float_format='%.6f')
-                    print(f"Predictions (log scale) saved to: {pred_path_log}")
-
-                # Save metrics as JSON
-                metrics_path_original = output_dir / 'test_metrics_original_scale.json'
-                with open(metrics_path_original, 'w') as f:
-                    json.dump(test_metrics_original, f, indent=2)
-                print(
-                    f"Metrics (original scale) saved to: {metrics_path_original}")
-
-                if log_transformed_tasks:
-                    metrics_path_log = output_dir / 'test_metrics_log_scale.json'
-                    with open(metrics_path_log, 'w') as f:
-                        json.dump(test_metrics_log_scale, f, indent=2)
-                    print(f"Metrics (log scale) saved to: {metrics_path_log}")
-            else:
-                print(
-                    "\nWarning: Normalization statistics not found. Predictions saved in normalized scale.")
+    if rank == 0 and split_report:
+        report_path = output_dir / "split_metrics.json"
+        with open(report_path, "w") as handle:
+            json.dump({"splits": split_report}, handle, indent=2)
+        print(f"Split metrics saved to: {report_path}")
 
     print_rank0("\n" + "=" * 80)
     print_rank0("Training Complete!")

@@ -1627,20 +1627,32 @@ def compact_letter_display(
     models: Sequence[str],
     pairwise_df: pd.DataFrame,
     alpha: float = 0.05,
+    pvalue_column: str = "p_holm",
 ) -> dict[str, str]:
     """Letter groups for models; shared letters mean no significant difference."""
     names = list(models)
     if not names:
         return {}
+    if pvalue_column not in pairwise_df.columns:
+        for candidate in ("p_holm", "p_tukey", "p_raw"):
+            if candidate in pairwise_df.columns:
+                pvalue_column = candidate
+                break
     count = len(names)
     index = {name: position for position, name in enumerate(names)}
     different = np.zeros((count, count), dtype=bool)
     for row in pairwise_df.itertuples(index=False):
-        if row.model_a not in index or row.model_b not in index:
+        mapping = row._asdict()
+        model_a = mapping.get("model_a")
+        model_b = mapping.get("model_b")
+        if model_a not in index or model_b not in index:
             continue
-        if float(row.p_holm) < alpha:
-            left = index[str(row.model_a)]
-            right = index[str(row.model_b)]
+        p_adj = mapping.get(pvalue_column)
+        if p_adj is None or not math.isfinite(float(p_adj)):
+            continue
+        if float(p_adj) < alpha:
+            left = index[str(model_a)]
+            right = index[str(model_b)]
             different[left, right] = True
             different[right, left] = True
 

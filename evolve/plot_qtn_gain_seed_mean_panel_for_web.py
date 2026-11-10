@@ -27,6 +27,11 @@ def parse_args():
 
     parser.add_argument("--ricenavi-file", required=True)
     parser.add_argument("--base-vcf", required=True, help="VCF before evolution, e.g. Teqing baseline VCF.")
+    parser.add_argument(
+        "--hhz-vcf",
+        default=None,
+        help="Huanghuazhan VCF. When set, the genotype panel shows Teqing, Huanghuazhan, and the evolved genotype."
+    )
 
     parser.add_argument("--out-prefix", default="QTN_gain_contribution_seed_mean")
     parser.add_argument(
@@ -99,6 +104,98 @@ def gt_display(gt):
     return gt if gt != ".|." else "NA"
 
 
+def alt_dosage(gt):
+    gt = normalize_gt(gt)
+    if gt == ".|.":
+        return None
+    try:
+        return sum(int(allele) for allele in gt.split("|"))
+    except ValueError:
+        return None
+
+
+def classify_hhz_selection(teqing_gt, hhz_gt, evolved_major_gt):
+    teqing_gt = normalize_gt(teqing_gt)
+    hhz_gt = normalize_gt(hhz_gt)
+    evolved_gt = normalize_gt(evolved_major_gt)
+
+    if teqing_gt == ".|." or hhz_gt == ".|." or evolved_gt == ".|.":
+        return "Unknown"
+    if evolved_gt == teqing_gt:
+        return "Unknown"
+    if evolved_gt == hhz_gt and hhz_gt != teqing_gt:
+        return "HHZ-selected"
+    if hhz_gt == teqing_gt and evolved_gt != teqing_gt:
+        return "Novel-selected"
+
+    t_dosage = alt_dosage(teqing_gt)
+    h_dosage = alt_dosage(hhz_gt)
+    e_dosage = alt_dosage(evolved_gt)
+    if t_dosage is None or h_dosage is None or e_dosage is None:
+        return "Novel-selected"
+    if t_dosage < h_dosage and t_dosage < e_dosage < h_dosage:
+        return "Partial-HHZ"
+    if t_dosage > h_dosage and h_dosage < e_dosage < t_dosage:
+        return "Partial-HHZ"
+    return "Novel-selected"
+
+
+def annotate_source_qtns(gain_summary, ricenavi):
+    """Attach RiceNavi gene and trait labels through source QTN IDs."""
+    lookup = ricenavi.drop_duplicates("SNP_ID").set_index("SNP_ID")
+    gene_labels = []
+    trait_labels = []
+    for source_text in gain_summary["source_qtn_ids"]:
+        genes = []
+        traits = []
+        for source_id in str(source_text).split(","):
+            source_id = source_id.strip()
+            if source_id not in lookup.index:
+                continue
+            row = lookup.loc[source_id]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            genes.append(str(row["GeneName"]))
+            traits.append(row["Trait"])
+        gene_labels.append(";".join(dict.fromkeys(genes)) if genes else np.nan)
+        trait_labels.append(traits[0] if traits else np.nan)
+    annotated = gain_summary.copy()
+    annotated["GeneName"] = gene_labels
+    annotated["Trait"] = trait_labels
+    return annotated
+
+
+def annotate_by_coordinate(gain_summary, ricenavi):
+    """Match evaluated VCF IDs to RiceNavi by chromosome and position."""
+    grouped = {}
+    for _, row in ricenavi.iterrows():
+        key = (str(row["Chr_clean"]), int(row["Pos_clean"]))
+        bucket = grouped.setdefault(key, {"genes": [], "traits": []})
+        gene = str(row["GeneName"])
+        trait = str(row["Trait"])
+        if gene not in bucket["genes"]:
+            bucket["genes"].append(gene)
+        if trait not in bucket["traits"]:
+            bucket["traits"].append(trait)
+    genes = []
+    traits = []
+    for snp_id in gain_summary["evaluated_snp_id"]:
+        parsed = parse_snp_id(snp_id)
+        chrom, pos = parsed.iloc[0], parsed.iloc[1]
+        bucket = None
+        if pd.notna(chrom) and pd.notna(pos):
+            chrom = str(chrom)
+            if chrom.lower().startswith("chr"):
+                chrom = chrom[3:]
+            bucket = grouped.get((chrom, int(pos)))
+        genes.append(";".join(bucket["genes"]) if bucket else np.nan)
+        traits.append(bucket["traits"][0] if bucket else np.nan)
+    annotated = gain_summary.copy()
+    annotated["GeneName"] = genes
+    annotated["Trait"] = traits
+    return annotated
+
+
 def trait_category_en(trait):
     mapping = {
         "产量组成相关": "Yield component",
@@ -143,35 +240,50 @@ def find_seed_dirs(evolve_dir):
         key=seed_sort_key
     )
 
-    if not seed_dirs:
-        raise FileNotFoundError(f"No seed_* directories found under: {evolve_dir}")
+    if seed_dirs:
+        return seed_dirs
+    if os.path.isfile(os.path.join(evolve_dir, "screening_si_per_round.tsv")):
+        return [evolve_dir]
 
-    return seed_dirs
+    raise FileNotFoundError(
+        f"No seed_* directories or screening_si_per_round.tsv found under: {evolve_dir}"
+    )
 
 
 def load_screening_one_file(path, skiprows, gain_col):
-    screening_cols = [
-        "round",
-        "evaluated_snp",
-        "evaluated_snp_id",
-        "SI_baseline",
-        "SI_evolved",
-        "SI_gain",
-        "score_baseline",
-        "score_evolved",
-        "gain",
-        "accepted",
-    ]
-
-    df = pd.read_csv(
-        path,
-        sep="\t",
-        skiprows=skiprows,
-        header=None,
-        names=screening_cols,
-    )
+    with open(path, encoding="utf-8") as handle:
+        header = handle.readline().lstrip("#").strip().split("\t")
+    if "Evaluated_SNP_ID" in header:
+        df = pd.read_csv(path, sep="\t", comment=None)
+        df.columns = [str(column).lstrip("#") for column in df.columns]
+        df = df.rename(columns={
+            "Evaluated_SNP_ID": "evaluated_snp_id",
+            "Source_QTN_IDs": "source_qtn_ids",
+        })
+    else:
+        screening_cols = [
+            "round",
+            "evaluated_snp",
+            "evaluated_snp_id",
+            "SI_baseline",
+            "SI_evolved",
+            "SI_gain",
+            "score_baseline",
+            "score_evolved",
+            "gain",
+            "accepted",
+        ]
+        df = pd.read_csv(
+            path,
+            sep="\t",
+            skiprows=skiprows,
+            header=None,
+            names=screening_cols,
+        )
 
     df["evaluated_snp_id"] = df["evaluated_snp_id"].astype(str).str.strip()
+    if "source_qtn_ids" in df.columns:
+        df["source_qtn_ids"] = df["source_qtn_ids"].fillna("").astype(str).str.strip()
 
     if gain_col not in df.columns:
         raise ValueError(
@@ -180,8 +292,10 @@ def load_screening_one_file(path, skiprows, gain_col):
         )
 
     df["gain_plot"] = pd.to_numeric(df[gain_col], errors="coerce")
-
-    return df[["evaluated_snp_id", "gain_plot"]].copy()
+    columns = ["evaluated_snp_id", "gain_plot"]
+    if "source_qtn_ids" in df.columns:
+        columns.append("source_qtn_ids")
+    return df[columns].copy()
 
 
 def load_seed_mean_gain(seed_dirs, screening_name, skiprows, gain_col):
@@ -214,14 +328,17 @@ def load_seed_mean_gain(seed_dirs, screening_name, skiprows, gain_col):
 
     all_gain = pd.concat(all_records, ignore_index=True)
 
+    aggregations = {
+        "gain_mean": ("gain_plot", "mean"),
+        "gain_std": ("gain_plot", "std"),
+        "gain_n_seed": ("gain_plot", "count"),
+    }
+    if "source_qtn_ids" in all_gain.columns:
+        aggregations["source_qtn_ids"] = ("source_qtn_ids", "first")
     gain_summary = (
         all_gain
         .groupby("evaluated_snp_id", as_index=False)
-        .agg(
-            gain_mean=("gain_plot", "mean"),
-            gain_std=("gain_plot", "std"),
-            gain_n_seed=("gain_plot", "count"),
-        )
+        .agg(**aggregations)
     )
 
     gain_summary["gain_std"] = gain_summary["gain_std"].fillna(0)
@@ -478,13 +595,25 @@ def main():
         + "-1"
     )
 
-    merged = gain_summary.merge(
-        ricenavi,
-        left_on="evaluated_snp_id",
-        right_on="SNP_ID",
-        how="left",
-        suffixes=("", "_ricenavi"),
+    has_sources = (
+        "source_qtn_ids" in gain_summary.columns
+        and gain_summary["source_qtn_ids"].astype(str).str.strip().replace("nan", "").ne("").any()
     )
+    if has_sources:
+        merged = annotate_source_qtns(gain_summary, ricenavi)
+    else:
+        merged = gain_summary.merge(
+            ricenavi,
+            left_on="evaluated_snp_id",
+            right_on="SNP_ID",
+            how="left",
+            suffixes=("", "_ricenavi"),
+        )
+        missing = merged["GeneName"].isna()
+        if missing.any():
+            by_coordinate = annotate_by_coordinate(gain_summary, ricenavi)
+            merged.loc[missing, "GeneName"] = by_coordinate.loc[missing, "GeneName"].to_numpy()
+            merged.loc[missing, "Trait"] = by_coordinate.loc[missing, "Trait"].to_numpy()
 
     matched_all = merged[merged["GeneName"].notna()].copy()
 
@@ -507,6 +636,16 @@ def main():
 
     merged["Base_GT"] = merged["evaluated_snp_id"].map(base_gt)
     merged["Evolved_Major_GT"] = merged["evaluated_snp_id"].map(evolved_major_gt)
+    compare_hhz = bool(args.hhz_vcf)
+    if compare_hhz:
+        hhz_gt = load_single_sample_gt(args.hhz_vcf, site_ids, "Huanghuazhan")
+        merged["HHZ_GT"] = merged["evaluated_snp_id"].map(hhz_gt)
+        merged["Evolutionary_pattern"] = [
+            classify_hhz_selection(base, hhz, evolved)
+            for base, hhz, evolved in zip(
+                merged["Base_GT"], merged["HHZ_GT"], merged["Evolved_Major_GT"]
+            )
+        ]
     merged["Evolved_Major_GT_Freq"] = merged["evaluated_snp_id"].map(evolved_major_freq)
 
     for col in ["N_valid", "N_0|0", "N_0|1", "N_1|0", "N_1|1", "N_missing"]:
@@ -578,13 +717,18 @@ def main():
         min(args.max_fig_height, n * args.row_height + 2.8)
     )
 
-    fig = plt.figure(figsize=(args.fig_width, auto_height))
+    fig_width = args.fig_width + (4.6 if compare_hhz else 0.0)
+    fig = plt.figure(figsize=(fig_width, auto_height))
 
+    if compare_hhz:
+        width_ratios = [0.75, 3.35, 5.0, 2.15, 3.7]
+    else:
+        width_ratios = [0.75, 3.35, 5.0, 2.65]
     gs = fig.add_gridspec(
         nrows=2,
-        ncols=4,
+        ncols=len(width_ratios),
         height_ratios=[18, 2.2],
-        width_ratios=[0.75, 3.35, 5.0, 2.65],
+        width_ratios=width_ratios,
         hspace=0.005,
         wspace=0.08,
     )
@@ -592,31 +736,52 @@ def main():
     ax_rank = fig.add_subplot(gs[0, 0])
     ax_gene = fig.add_subplot(gs[0, 1], sharey=ax_rank)
     ax_bar = fig.add_subplot(gs[0, 2], sharey=ax_rank)
-    ax_gt = fig.add_subplot(gs[0, 3], sharey=ax_rank)
+    ax_pattern = fig.add_subplot(gs[0, 3], sharey=ax_rank) if compare_hhz else None
+    ax_gt = fig.add_subplot(gs[0, 3 if not compare_hhz else 4], sharey=ax_rank)
 
-    for ax in [ax_rank, ax_gene, ax_gt]:
-        ax.axis("off")
+    for ax in [ax_rank, ax_gene, ax_gt, ax_pattern]:
+        if ax is not None:
+            ax.axis("off")
 
-    for ax in [ax_rank, ax_gene, ax_bar, ax_gt]:
-        ax.set_ylim(-0.7, n - 0.3)
+    for ax in [ax_rank, ax_gene, ax_bar, ax_gt, ax_pattern]:
+        if ax is not None:
+            ax.set_ylim(-0.7, n - 0.3)
 
     ax_rank.text(0.5, n + 0.35, "Rank", ha="center", va="bottom", fontsize=11, fontweight="bold")
     ax_gene.text(0.0, n + 0.35, "Gene (SNP_ID)", ha="left", va="bottom", fontsize=11, fontweight="bold")
 
-    ax_gt.text(0.75, n + 0.7, "Genotype", ha="center", va="bottom", fontsize=11, fontweight="bold")
-    ax_gt.text(0, n - 0.05, args.base_label, ha="center", va="bottom", fontsize=10)
-    ax_gt.text(1.5, n - 0.05, args.evolved_label, ha="center", va="bottom", fontsize=10)
+    if compare_hhz:
+        pattern_colors = {
+            "HHZ-selected": "#009E9A",
+            "Partial-HHZ": "#E84A5F",
+            "Novel-selected": "#7A3DD8",
+            "Unknown": "#B8B8B8",
+        }
+        ax_pattern.text(0.5, n + 0.35, "Evolutionary\npattern", ha="center", va="bottom", fontsize=11, fontweight="bold")
+        ax_gt.text(1.5, n + 0.7, "Genotype", ha="center", va="bottom", fontsize=11, fontweight="bold")
+        ax_gt.text(0, n - 0.05, "Teqing", ha="center", va="bottom", fontsize=10)
+        ax_gt.text(1.5, n - 0.05, "HHZ", ha="center", va="bottom", fontsize=10)
+        ax_gt.text(3.0, n - 0.05, "Evolved", ha="center", va="bottom", fontsize=10)
+    else:
+        pattern_colors = {}
+        ax_gt.text(0.75, n + 0.7, "Genotype", ha="center", va="bottom", fontsize=11, fontweight="bold")
+        ax_gt.text(0, n - 0.05, args.base_label, ha="center", va="bottom", fontsize=10)
+        ax_gt.text(1.5, n - 0.05, args.evolved_label, ha="center", va="bottom", fontsize=10)
 
     ax_rank.plot([0.05, 0.95], [n + 0.18, n + 0.18], color="0.35", lw=0.8, clip_on=False)
     ax_gene.plot([0.0, 1.0], [n + 0.18, n + 0.18], color="0.35", lw=0.8, clip_on=False)
 
-    max_gain = (matched["gain_mean"] + matched["gain_std"]).max()
+    gain_mean = matched["gain_mean"].fillna(0)
+    gain_std = matched["gain_std"].fillna(0)
+    right_edge = gain_mean + gain_std
+    left_edge = gain_mean - gain_std
+    max_gain = float(right_edge.max()) if len(right_edge) else 0.001
     if pd.isna(max_gain) or max_gain <= 0:
         max_gain = 0.001
+    x_min = min(0.0, float(left_edge.min()) * 1.08)
+    x_max = max_gain * 1.55
 
-    x_max = max_gain * 1.35
-
-    ax_bar.set_xlim(0, x_max)
+    ax_bar.set_xlim(x_min, x_max)
     ax_bar.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
     ax_bar.grid(axis="x", linestyle="--", alpha=0.25)
 
@@ -630,7 +795,7 @@ def main():
     ax_bar.tick_params(axis="y", left=False, labelleft=False)
     ax_bar.xaxis.set_ticks_position("top")
     ax_bar.xaxis.set_label_position("top")
-    ax_bar.set_xlabel("Mean SI gain across seeds (ΔSI)", fontsize=11, fontweight="bold", labelpad=8)
+    ax_bar.set_xlabel("Mean SI gain (ΔSI)", fontsize=11, fontweight="bold", labelpad=8)
 
     ax_bar.tick_params(
         axis="x",
@@ -648,13 +813,7 @@ def main():
     ax_bar.barh(
         y,
         matched["gain_mean"],
-        xerr=matched["gain_std"],
-        error_kw=dict(
-            ecolor="black",
-            elinewidth=0.8,
-            capsize=2.5,
-            capthick=0.8,
-        ),
+        xerr=matched["gain_std"].fillna(0),
         color=[
             category_colors.get(c, category_colors["Other"])
             for c in matched["Trait_category"]
@@ -662,6 +821,7 @@ def main():
         edgecolor="black",
         linewidth=0.45,
         height=0.58,
+        error_kw={"ecolor": "black", "elinewidth": 0.7, "capsize": 2, "capthick": 0.7},
     )
 
     for i, (_, r) in enumerate(matched.iterrows()):
@@ -721,21 +881,41 @@ def main():
         ax_gene.add_artist(ab)
 
         gain_mean = float(r["gain_mean"])
-        gain_std = float(r["gain_std"])
+        gain_std = float(r["gain_std"]) if pd.notna(r["gain_std"]) else 0.0
+        gain_label = f"{gain_mean:.3f} ± {gain_std:.3f}"
 
         ax_bar.text(
-            gain_mean + gain_std + max_gain * 0.025,
+            gain_mean + gain_std + max_gain * 0.02,
             i,
-            f"{gain_mean:.3f}±{gain_std:.3f}",
+            gain_label,
             ha="left",
             va="center",
             fontsize=8.5,
         )
 
-        draw_gt_box(ax_gt, 0, i, gt_display(r["Base_GT"]), genotype_colors["Base"])
-        draw_gt_box(ax_gt, 1.5, i, gt_display(r["Evolved_Major_GT"]), genotype_colors["Evolved"])
+        if compare_hhz:
+            pattern = str(r["Evolutionary_pattern"])
+            rect = Rectangle(
+                (0.04, i - 0.29),
+                0.92,
+                0.58,
+                linewidth=0,
+                facecolor=pattern_colors.get(pattern, "#B8B8B8"),
+                alpha=0.9,
+                clip_on=False,
+            )
+            ax_pattern.add_patch(rect)
+            ax_pattern.text(0.5, i, pattern, ha="center", va="center", fontsize=7.2, color="white")
+            draw_gt_box(ax_gt, 0, i, gt_display(r["Base_GT"]), "#DDEBF7")
+            draw_gt_box(ax_gt, 1.5, i, gt_display(r["HHZ_GT"]), "#F9D9D3")
+            draw_gt_box(ax_gt, 3.0, i, gt_display(r["Evolved_Major_GT"]), genotype_colors["Evolved"])
+        else:
+            draw_gt_box(ax_gt, 0, i, gt_display(r["Base_GT"]), genotype_colors["Base"])
+            draw_gt_box(ax_gt, 1.5, i, gt_display(r["Evolved_Major_GT"]), genotype_colors["Evolved"])
 
-    ax_gt.set_xlim(-0.65, 2.15)
+    ax_gt.set_xlim(-0.65, 3.65 if compare_hhz else 2.15)
+    if compare_hhz:
+        ax_pattern.set_xlim(0, 1)
 
     handles = []
     labels = []

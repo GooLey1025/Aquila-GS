@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import gzip
+import hashlib
 import json
 import time
 from math import isnan
@@ -47,7 +48,11 @@ from aquila.evolve import (
 )
 
 # Encoding-level utilities still needed here
-from aquila.encoding import parse_genotype_file, write_evolved_vcf
+from aquila.encoding import (
+    parse_genotype_file,
+    variant_ids_for_encodings,
+    write_evolved_vcf,
+)
 from aquila.utils import load_config
 
 
@@ -197,6 +202,12 @@ def parse_args():
         help='Path to a list file (one SNP ID per line, matching VCF ID column). '
              'Only these sites will be considered for directed evolution. '
              'All other sites are locked. Default: all sites'
+    )
+    parser.add_argument(
+        '--qtn-proxy-map', type=str, default=None,
+        help='QTN-to-proxy JSON written by aquila_qtn_proxy_map.py. '
+             'Only mapped proxy sites are evolved, and each proxy is constrained '
+             'to the homozygous target genotype recorded in the map.'
     )
     parser.add_argument(
         '--ref-vcf', type=str, default=None,
@@ -600,6 +611,7 @@ def write_screening_si_log(out_dir: str, round_results: List[RoundResult],
 
     # Header matches user's expected format
     si_header = ["#Round", "Evaluated_SNP", "Evaluated_SNP_ID",
+                 "Source_QTN_IDs",
                  "SI_baseline", "SI_evolved", "SI_gain",
                  "SI_original_contribution",
                  "score_baseline", "score_evolved", "accepted"]
@@ -613,6 +625,7 @@ def write_screening_si_log(out_dir: str, round_results: List[RoundResult],
             if rr.evaluated_snp_id else str(rr.evaluated_snp_idx)
         si_lines.append(
             f"{rr.round_num}\t{snp_display}\t{rr.evaluated_snp_id}\t"
+            f"{rr.source_qtn_ids}\t"
             f"{rr.si_baseline:.3f}\t{rr.si_evolved:.3f}\t{rr.si_gain:+.3f}\t"
             f"{rr.si_original_contribution:+.3f}\t"
             f"{rr.score_baseline:.2f}\t{rr.score_evolved:.2f}\t"
@@ -793,6 +806,7 @@ def write_pareto_outputs(
     args, result, baseline_tensors, sample_id: str,
     regression_tasks: List[str], direction: DirectionModes,
     norm_stats, log_tasks: List[str], is_multi_branch: bool,
+    variant_info: dict,
 ) -> None:
     """Write the Pareto archive, trace, representative VCFs, and primary result."""
     out_dir = Path(args.output_dir) if args.output_dir else Path(args.vcf).parent
@@ -854,6 +868,7 @@ def write_pareto_outputs(
             evolved_sample_name=f"{sample_id}_pareto_{rep_index:03d}",
             phased=args.phased,
             verbose=False,
+            variant_ids=variant_ids_for_encodings(variant_info, evolved_genotypes),
         )
 
     if not result.representatives:
@@ -879,6 +894,7 @@ def write_pareto_outputs(
         evolved_sample_name=f"{sample_id}_evolve",
         phased=args.phased,
         verbose=True,
+        variant_ids=variant_ids_for_encodings(variant_info, evolved_genotypes),
     )
     output_pred = args.output_pred or str(
         out_dir / f"{Path(output_vcf).stem}_predictions.tsv"
@@ -898,7 +914,7 @@ def write_pareto_outputs(
 # Main evolution orchestrator
 ###############################################################################
 
-def run_evolution(args):
+def run_evolution(args, model_backend=None):
     """Run the directed evolution loop."""
     from aquila.evolve import (
         apply_multi_snp_mutations,
@@ -906,6 +922,12 @@ def run_evolution(args):
         compute_snp_priority_order,
         load_direction_file,
         load_panel_genotypes,
+    )
+    from aquila.qtn_proxy import (
+        decode_homozygous_gt,
+        evolution_edit,
+        homozygous_encoding,
+        load_proxy_map,
     )
 
     print("=" * 80)
@@ -916,7 +938,14 @@ def run_evolution(args):
     print(f"  Min improve: {args.min_improve}")
     print(f"  Top-K:      {args.top_k}")
     print(f"  Homozygous: {args.homozygous}")
-    if args.iterations is not None:
+    screens_every_site = (
+        args.strategy == 'screening'
+        and args.target_vcf is None
+        and args.iterations is None
+    )
+    if screens_every_site:
+        print("  Rounds:     one per candidate site")
+    elif args.iterations is not None:
         print(f"  Iterations: {args.iterations} (fixed-round mode)")
     else:
         print(f"  Patience:   {args.patience} (patience mode, max {args.max_iterations})")
@@ -936,8 +965,22 @@ def run_evolution(args):
     summary_filename = "evolve_summary.tsv"
     print(f"  Output dir:  {out_dir}")
 
+    # A backend may supply a single model or an ensemble while preserving the
+    # prediction interface used by every evolution strategy.
+    load_model_spec = (
+        model_backend.load_model_and_config
+        if model_backend is not None else load_model_and_config
+    )
+    create_predictor = (
+        model_backend.create_model if model_backend is not None else create_model
+    )
+    load_predictor_checkpoint = (
+        model_backend.load_checkpoint
+        if model_backend is not None else load_checkpoint
+    )
+
     # --- Load model ---
-    config, checkpoint_path, norm_stats = load_model_and_config(args.model_dir)
+    config, checkpoint_path, norm_stats = load_model_spec(args.model_dir)
     print(f"\n[Model] Directory: {args.model_dir}")
     print(f"[Model] Checkpoint: {checkpoint_path}")
 
@@ -955,8 +998,123 @@ def run_evolution(args):
               f"Only the first sample will be evolved.")
 
     # --- Evolvable indices ---
+    if args.qtn_proxy_map is not None and args.sites_to_evolve is not None:
+        raise ValueError(
+            "--qtn-proxy-map and --sites-to-evolve are mutually exclusive"
+        )
+    if args.qtn_proxy_map is not None and args.strategy != 'screening':
+        raise ValueError("--qtn-proxy-map currently requires --strategy screening")
+    if args.qtn_proxy_map is not None and args.direction_file is None:
+        raise ValueError("--qtn-proxy-map requires the original --direction-file")
+
     evolvable_indices: Optional[List[int]] = None
-    if args.sites_to_evolve is not None:
+    forced_genotypes: Optional[Dict[int, torch.Tensor]] = None
+    proxy_sources_by_idx: Dict[int, str] = {}
+    encoding_dim = get_encoding_dim(variant_tensors)
+    if args.qtn_proxy_map is not None:
+        metadata, mappings = load_proxy_map(args.qtn_proxy_map)
+        if model_backend is None or not hasattr(model_backend, "metadata"):
+            raise ValueError(
+                "--qtn-proxy-map must be used with aquila_evolve_ensemble.py"
+            )
+        expected_model = metadata.get("model", {})
+        expected_checkpoints = expected_model.get("model_checkpoints", [])
+        actual_checkpoints = model_backend.metadata().get(
+            "model_checkpoints", []
+        )
+        if expected_checkpoints and [
+            str(Path(path).resolve()) for path in expected_checkpoints
+        ] != [str(Path(path).resolve()) for path in actual_checkpoints]:
+            raise ValueError(
+                "Ensemble checkpoints do not match those used to build the "
+                "QTN-to-proxy map"
+            )
+        expected_direction_hash = metadata.get("direction_sha256")
+        if expected_direction_hash:
+            direction_digest = hashlib.sha256(
+                Path(args.direction_file).read_bytes()
+            ).hexdigest()
+            if direction_digest != expected_direction_hash:
+                raise ValueError(
+                    "Direction file does not match the one used to build the "
+                    "QTN-to-proxy map"
+                )
+        expected_parent = metadata.get("parent_sample")
+        if expected_parent and sample_ids[0] != expected_parent:
+            raise ValueError(
+                f"Proxy map parent is {expected_parent!r}, but VCF sample is "
+                f"{sample_ids[0]!r}"
+            )
+
+        all_ids = variant_info.get('snp', {}).get('ids', [])
+        id_to_index = {str(snp_id): i for i, snp_id in enumerate(all_ids)}
+        refs = variant_info.get('snp', {}).get('refs', [])
+        alts = variant_info.get('snp', {}).get('alts', [])
+        snp_tensor = (
+            variant_tensors['snp'] if is_multi_branch else variant_tensors
+        )
+        forced_genotypes = {}
+        sources: Dict[int, List[str]] = {}
+        n_external = 0
+        n_self = 0
+        for qtn_id, mapping in mappings.items():
+            edit = evolution_edit(mapping)
+            if edit is None:
+                continue
+            if edit["self_proxy"]:
+                n_self += 1
+            else:
+                n_external += 1
+            proxy_id = edit["site_id"]
+            target_gt = edit["target_gt"]
+            expected_current_gt = edit["current_gt"]
+            if proxy_id not in id_to_index:
+                raise ValueError(
+                    f"Mapped proxy {proxy_id!r} for QTN {qtn_id!r} is absent "
+                    "from the input VCF"
+                )
+            proxy_index = id_to_index[proxy_id]
+            current_gt = decode_homozygous_gt(
+                snp_tensor[0, proxy_index],
+                encoding_dim,
+                refs[proxy_index],
+                alts[proxy_index],
+            )
+            if current_gt != expected_current_gt:
+                raise ValueError(
+                    f"Mapped proxy {proxy_id!r} expected parent GT "
+                    f"{expected_current_gt}, found {current_gt}"
+                )
+            target_encoding = homozygous_encoding(
+                target_gt,
+                encoding_dim,
+                refs[proxy_index],
+                alts[proxy_index],
+            )
+            existing = forced_genotypes.get(proxy_index)
+            if existing is not None and not torch.equal(existing, target_encoding):
+                raise ValueError(
+                    f"Conflicting target genotypes for proxy {proxy_id!r}"
+                )
+            forced_genotypes[proxy_index] = target_encoding
+            sources.setdefault(proxy_index, []).append(
+                edit["source_qtn_id"] or str(qtn_id)
+            )
+        if not forced_genotypes:
+            raise ValueError(
+                f"No mapped proxy sites found in {args.qtn_proxy_map}"
+            )
+        evolvable_indices = sorted(forced_genotypes)
+        proxy_sources_by_idx = {
+            index: ",".join(sorted(qtn_ids))
+            for index, qtn_ids in sources.items()
+        }
+        print(
+            f"\n[Proxy map] {len(mappings)} QTN entries -> "
+            f"{n_external} external proxies, {n_self} self QTNs, "
+            f"{len(evolvable_indices)} unique evolution sites"
+        )
+    elif args.sites_to_evolve is not None:
         allowed_ids = set()
         with open(args.sites_to_evolve) as f:
             for line in f:
@@ -978,7 +1136,7 @@ def run_evolution(args):
 
     # --- Create model ---
     device = args.device
-    model = create_model(config, seq_length, device, norm_stats)
+    model = create_predictor(config, seq_length, device, norm_stats)
     print("\n[Model] Initializing with dummy forward pass...")
     model.eval()
     with torch.no_grad():
@@ -993,7 +1151,7 @@ def run_evolution(args):
                 dummy = torch.zeros(1, t.shape[1], dtype=torch.long, device=device)
         _ = model(dummy)
 
-    model, _ = load_checkpoint(model, checkpoint_path, device)
+    model, _ = load_predictor_checkpoint(model, checkpoint_path, device)
 
     # --- Regression tasks ---
     regression_tasks = (
@@ -1122,7 +1280,6 @@ def run_evolution(args):
             )
             print(f"\n[Target] Direction: all traits maximize (default)")
 
-    encoding_dim = get_encoding_dim(variant_tensors)
     print(f"[Encoding] Dimension: {encoding_dim}")
 
     if use_selection_index:
@@ -1194,7 +1351,7 @@ def run_evolution(args):
         write_pareto_outputs(
             args, result, current_tensors, sample_ids[0],
             regression_tasks, direction, norm_stats, log_tasks,
-            is_multi_branch,
+            is_multi_branch, variant_info,
         )
         print(f"\n[Pareto-beam] Evaluated genotypes: {result.evaluated_count}")
         print(f"  Final archive: {len(result.archive)}")
@@ -1228,7 +1385,10 @@ def run_evolution(args):
     else:
         patience_mode = args.iterations is None
         max_rounds = args.iterations if args.iterations else args.max_iterations
-    print(f"\n[Evolution] Starting {'patience' if patience_mode else 'fixed-round'} mode...")
+    if is_pure_screening:
+        print("\n[Evolution] Evaluating every candidate site once")
+    else:
+        print(f"\n[Evolution] Starting {'patience' if patience_mode else 'fixed-round'} mode...")
     print(f"  Max rounds: {max_rounds}")
 
     is_priority_screening = (
@@ -1292,7 +1452,7 @@ def run_evolution(args):
                 encoding_dim, device, is_multi_branch, pheno_idx,
                 args.mode, args.top_k or 8, args.min_improve, args.verbose,
                 regression_tasks, norm_stats,
-                current_preds=init_preds, current_preds_norm=init_preds_norm,
+                current_preds=init_preds, current_preds_norm=current_preds_norm,
                 use_selection_index=use_selection_index,
                 direction=direction,
                 panel_genotypes=panel_genotypes,
@@ -1303,6 +1463,7 @@ def run_evolution(args):
                 apply_all_positive_gain=args.top_k is None,
                 homozygous_only=args.homozygous,
                 seed=args.seed,
+                forced_genotypes=forced_genotypes,
             )
             if log_dict:
                 eval_results = log_dict.get('eval_results', {})
@@ -1318,7 +1479,7 @@ def run_evolution(args):
                 encoding_dim, device, is_multi_branch, pheno_idx,
                 args.mode, args.top_k or 8, args.min_improve, args.seed + round_num - 1,
                 args.verbose, regression_tasks, norm_stats,
-                current_preds=init_preds, current_preds_norm=init_preds_norm,
+                current_preds=init_preds, current_preds_norm=current_preds_norm,
                 use_selection_index=use_selection_index,
                 direction=direction,
                 panel_genotypes=panel_genotypes,
@@ -1360,6 +1521,7 @@ def run_evolution(args):
                 evolved_genotypes=evolved_genotypes,
                 evolved_sample_name=f"{sample_ids[0]}_round{round_num}",
                 phased=args.phased,
+                variant_ids=variant_ids_for_encodings(variant_info, evolved_genotypes),
             )
 
         # Record combo results
@@ -1399,6 +1561,7 @@ def run_evolution(args):
                        if per_snp_gains is not None else {}),
             evaluated_snp_idx=evaluated_snp_idx,
             evaluated_snp_id=evaluated_snp_id,
+            source_qtn_ids=proxy_sources_by_idx.get(evaluated_snp_idx, ""),
             score_baseline=score_baseline,
             score_evolved=score_evolved,
             si_original_contribution=si_contrib,
@@ -1534,6 +1697,7 @@ def run_evolution(args):
         evolved_sample_name=f"{sample_ids[0]}_evolve",
         phased=args.phased,
         verbose=True,
+        variant_ids=variant_ids_for_encodings(variant_info, evolved_genotypes),
     )
 
     # --- Write prediction TSV ---

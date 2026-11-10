@@ -18,7 +18,8 @@ import os
 import gzip
 import subprocess
 import tempfile
-from typing import Tuple, List, Sequence
+from collections import defaultdict, deque
+from typing import Mapping, Optional, Sequence, Tuple, List
 
 
 def parse_id_prefix_spec(spec: str | None) -> tuple[str, ...] | None:
@@ -1526,6 +1527,21 @@ def parse_vcf_variant_rows(vcf_path: str) -> Tuple[List[dict], List[str]]:
     return variant_rows, header_lines
 
 
+def variant_ids_for_encodings(variant_info: Mapping, evolved_genotypes: Mapping) -> dict:
+    """Return variant IDs aligned with each evolved genotype matrix."""
+    aligned = {}
+    for vtype, arr in evolved_genotypes.items():
+        id_list = list(variant_info.get(vtype, {}).get("ids", []))
+        n_rows = int(arr.shape[0])
+        if len(id_list) != n_rows:
+            raise ValueError(
+                f"{vtype} genotype matrix has {n_rows} rows, "
+                f"but variant_info has {len(id_list)} IDs"
+            )
+        aligned[vtype] = id_list
+    return aligned
+
+
 def write_evolved_vcf(
     original_vcf_path: str,
     output_vcf_path: str,
@@ -1533,12 +1549,15 @@ def write_evolved_vcf(
     evolved_sample_name: str,
     phased: bool = True,
     verbose: bool = False,
+    variant_ids: Optional[Mapping[str, Sequence[str]]] = None,
 ) -> None:
     """
     Write an evolved VCF file by replacing the genotype of the original sample.
 
-    This reverses the VCF parsing: takes the evolved genotype matrices and writes them
-    back to VCF format with a new sample name.
+    Encodings are written onto the VCF record with the same variant ID. Records
+    that were not in the evolved genotype matrix keep their original genotype.
+    Without ``variant_ids``, a branch is applied only to records whose ID
+    contains that branch name, in file order.
 
     Args:
         original_vcf_path: Path to the original input VCF file.
@@ -1550,21 +1569,28 @@ def write_evolved_vcf(
             Keys should be lowercase ('snp', 'indel', 'sv').
         evolved_sample_name: New sample name (e.g. "Teqing__SAMN04505840__evolve").
         phased: If True, use '|' (phased, default); if False, use '/' (unphased).
+        variant_ids: Variant IDs in the same row order as ``evolved_genotypes``.
     """
     variant_rows, header_lines = parse_vcf_variant_rows(original_vcf_path)
 
-    # Build lookup dict: vid -> (vtype, encoding_row)
-    # Flatten all variant type arrays into a single lookup by variant ID
-    vid_to_info = {}  # vid -> {'vtype': str, 'encoding': array, 'idx': int}
-
-    for vtype, arr in evolved_genotypes.items():
-        for idx in range(arr.shape[0]):
-            # Try to get variant ID from the VCF rows by matching position/chrom if available
-            # Since we don't have a direct VID->encoding mapping, we use row-by-row lookup
-            pass  # Will do per-row lookup below
-
     # Determine GT separator
     sep = '|' if phased else '/'
+
+    # ID queues preserve file order when one ID occurs more than once.
+    id_queues = None
+    if variant_ids is not None:
+        id_queues = {}
+        for vtype, arr in evolved_genotypes.items():
+            ids = list(variant_ids.get(vtype, []))
+            if len(ids) != arr.shape[0]:
+                raise ValueError(
+                    f"{vtype} genotype matrix has {arr.shape[0]} rows, "
+                    f"but {len(ids)} variant IDs were provided"
+                )
+            queues = defaultdict(deque)
+            for idx, vid in enumerate(ids):
+                queues[str(vid)].append(idx)
+            id_queues[vtype] = queues
 
     # Build variant-type -> index tracker (for sequential matching)
     vtype_idx = {vtype: 0 for vtype in evolved_genotypes}
@@ -1606,53 +1632,64 @@ def write_evolved_vcf(
             orig_genotypes = row['genotypes']
             original_sample_gt = orig_genotypes[0] if orig_genotypes else '.'
 
-            # Determine variant type from ID (case-insensitive check)
-            vtype = None
-            for key in evolved_genotypes:
-                if key.upper() in vid.upper():
-                    vtype = key
-                    break
-            if vtype is None:
-                # Default to 'snp' for unknown types
-                vtype = 'snp'
+            # Match the evolved encoding to this VCF record by variant ID.
+            # Records outside the genotype matrix keep their original genotype.
+            gt_str = original_sample_gt
+            encoding = None
+            dim = None
+            if id_queues is not None:
+                matches = [
+                    vtype for vtype, queues in id_queues.items()
+                    if queues.get(str(vid))
+                ]
+                if len(matches) > 1:
+                    raise ValueError(
+                        f"Variant ID {vid!r} matches multiple genotype branches: {matches}"
+                    )
+                if len(matches) == 1:
+                    vtype = matches[0]
+                    idx = id_queues[vtype][str(vid)].popleft()
+                    encoding = evolved_genotypes[vtype][idx]
+                    dim = vtype_dims.get(vtype, 1)
+            else:
+                vtype = None
+                for key in evolved_genotypes:
+                    if key.upper() in vid.upper():
+                        vtype = key
+                        break
+                if vtype is not None:
+                    arr = evolved_genotypes[vtype]
+                    idx = vtype_idx[vtype]
+                    if idx < arr.shape[0]:
+                        encoding = arr[idx]
+                        dim = vtype_dims.get(vtype, 1)
+                        vtype_idx[vtype] += 1
 
-            # Get evolved genotype using sequential index for this vtype
-            gt_str = original_sample_gt  # Default to original
-
-            if vtype in evolved_genotypes:
-                arr = evolved_genotypes[vtype]
-                dim = vtype_dims.get(vtype, 1)
-
-                # Check if we have this variant in our evolved genotypes
-                idx = vtype_idx[vtype]
-                if idx < arr.shape[0]:
-                    encoding = arr[idx]
-                    vtype_idx[vtype] += 1  # Advance index
-
-                    if dim == 1:
-                        token = int(encoding)
-                        allele1, allele2 = token_to_gt(token)
-                    elif dim == 8:
-                        allele1, allele2 = onehot_to_gt_diploid(encoding, row['ref'], row['alt'])
-                    elif dim == 4:
-                        allele1, allele2 = onehot_to_gt_genotype_class(encoding)
-                    elif dim == 3:
-                        cls = onehot_to_classic_3way(encoding)
-                        if cls == -1:
-                            allele1, allele2 = -1, -1
-                        elif cls == 0:
-                            allele1, allele2 = 0, 0
-                        elif cls == 1:
-                            allele1, allele2 = 0, 1
-                        else:
-                            allele1, allele2 = 1, 1
-                    else:
+            if encoding is not None:
+                if dim == 1:
+                    token = int(encoding)
+                    allele1, allele2 = token_to_gt(token)
+                elif dim == 8:
+                    allele1, allele2 = onehot_to_gt_diploid(encoding, row['ref'], row['alt'])
+                elif dim == 4:
+                    allele1, allele2 = onehot_to_gt_genotype_class(encoding)
+                elif dim == 3:
+                    cls = onehot_to_classic_3way(encoding)
+                    if cls == -1:
                         allele1, allele2 = -1, -1
-
-                    if allele1 == -1 or allele2 == -1:
-                        gt_str = '.'
+                    elif cls == 0:
+                        allele1, allele2 = 0, 0
+                    elif cls == 1:
+                        allele1, allele2 = 0, 1
                     else:
-                        gt_str = f'{allele1}{sep}{allele2}'
+                        allele1, allele2 = 1, 1
+                else:
+                    allele1, allele2 = -1, -1
+
+                if allele1 == -1 or allele2 == -1:
+                    gt_str = '.'
+                else:
+                    gt_str = f'{allele1}{sep}{allele2}'
 
             # Write the row with evolved genotype
             new_genotypes = [gt_str] + list(orig_genotypes[1:])

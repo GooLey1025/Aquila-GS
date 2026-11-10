@@ -69,6 +69,28 @@ def maintain_color(change_percent, threshold_pct=5.0):
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def find_prediction_files(evolve_dir):
+    files = sorted(
+        glob.glob(os.path.join(evolve_dir, "seed_*", "round_predictions.tsv")),
+        key=lambda x: int(os.path.basename(os.path.dirname(x)).replace("seed_", ""))
+    )
+    direct = os.path.join(evolve_dir, "round_predictions.tsv")
+    if not files and os.path.isfile(direct):
+        files = [direct]
+    return files
+
+
+def traits_from_prediction_file(path):
+    columns = pd.read_csv(path, sep=r"\s+", engine="python", nrows=0).columns
+    traits = []
+    for column in columns:
+        if column.endswith("_pred") and not column.endswith("_pred_norm"):
+            trait = column[: -len("_pred")]
+            if f"{trait}_baseline" in columns:
+                traits.append(trait)
+    return traits
+
+
 def short_trait_name(trait):
     mapping = {
         "Heading_date": "Heading date",
@@ -95,6 +117,13 @@ def short_trait_name(trait):
 def main():
     args = parse_args()
 
+    files = find_prediction_files(args.evolve_dir)
+    if not files:
+        raise FileNotFoundError(
+            f"No round_predictions.tsv found in {args.evolve_dir} "
+            "or its seed_* directories"
+        )
+
     # Load task mapping to get all regression traits
     if args.task_mapping:
         task_map = pd.read_csv(args.task_mapping, sep="\t")
@@ -115,10 +144,12 @@ def main():
         dir_df["direction"] = dir_df["direction"].astype(str).str.strip().str.lower()
         direction = dict(zip(dir_df["task_name"], dir_df["direction"]))
         if all_traits is None:
-            all_traits = list(direction.keys())
+            all_traits = traits_from_prediction_file(files[0]) or list(direction.keys())
     else:
         direction = {}
         if all_traits is None:
+            all_traits = traits_from_prediction_file(files[0])
+        if not all_traits:
             raise ValueError("Must provide either --direction or --task-mapping")
 
     # Build full direction table with neutral defaults
@@ -127,14 +158,6 @@ def main():
         direc = direction.get(trait, "neutral")
         records.append({"task_name": trait, "direction": direc})
     direction_df = pd.DataFrame(records)
-
-    files = sorted(
-        glob.glob(os.path.join(args.evolve_dir, "seed_*", "round_predictions.tsv")),
-        key=lambda x: int(os.path.basename(os.path.dirname(x)).replace("seed_", ""))
-    )
-
-    if not files:
-        raise FileNotFoundError(f"No round_predictions.tsv found in {args.evolve_dir}/seed_*")
 
     records = []
 
@@ -186,7 +209,7 @@ def main():
             "trait_label": short_trait_name(trait),
             "direction": direc,
             "mean_change_percent": np.nanmean(ratios),
-            "sd_change_percent": np.nanstd(ratios),
+            "sd_change_percent": np.nanstd(ratios, ddof=1) if np.sum(~np.isnan(ratios)) > 1 else np.nan,
             "n_seed": np.sum(~np.isnan(ratios)),
             "mean_baseline": np.nanmean(baselines),
             "mean_final": np.nanmean(finals),
@@ -203,8 +226,9 @@ def main():
     result.to_csv(f"{args.out}.tsv", sep="\t", index=False)
 
     n_traits = len(result)
+    show_sd = bool((result["n_seed"] > 1).any())
 
-    fig_width = args.fig_width_per_col * 30  # ~30 "units" of character width budget
+    fig_width = args.fig_width_per_col * (38 if show_sd else 30)
     fig_height = args.fig_height_per_row * (n_traits + 2)  # +2 for header rows
 
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
@@ -213,8 +237,13 @@ def main():
     ax.axis("off")
 
     x_trait = 0.02
-    x_direction = 0.58
-    x_change = 0.88
+    x_direction = 0.52 if show_sd else 0.58
+    x_change = 0.82 if show_sd else 0.88
+    change_header = (
+        "Mean ± SD change ratio\n(relative to parent)"
+        if show_sd
+        else "Mean change ratio\n(relative to parent)"
+    )
 
     ax.text(
         x_trait,
@@ -239,7 +268,7 @@ def main():
     ax.text(
         x_change,
         -0.2,
-        "Mean change ratio\n(relative to Teqing)",
+        change_header,
         fontsize=14,
         fontweight="bold",
         ha="center",
@@ -273,11 +302,15 @@ def main():
             va="center"
         )
 
+        change_sd = row["sd_change_percent"]
         if np.isnan(change):
             change_text = "NA"
             change_color = "gray"
         else:
-            change_text = f"{change:+.1f}%"
+            if show_sd and pd.notna(change_sd):
+                change_text = f"{change:+.1f}% ± {change_sd:.1f}"
+            else:
+                change_text = f"{change:+.1f}%"
             if direc == "maintain":
                 change_color = maintain_color(change)
             elif direc == "neutral":

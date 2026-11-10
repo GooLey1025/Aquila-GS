@@ -346,28 +346,47 @@ All benchmark runners in this section enforce the same prepared-data fold bindin
 
 Some scripts from DEM were copied or adapted into our project repository. The upstream source code version referenced for this benchmark is commit `86de718f950d0ecc5554ff1916e2d59f51a33ce8`.
 
-DEM's random-forest (RF) marker selection is retained because removing it produces approximately `number_of_SNPs × 10` genotype-class features per sample and exceeded the available memory on the RTX 4090 benchmark server. DEM is not included in the main horizontal comparison. Instead, `GYP_BLUP`, `HD_BLUP`, and `PH_BLUP` are evaluated as independent single-trait tasks. DEM-SNP and Aquila-SNP share the 1,000 SNP markers selected by the DEM-SNP RF, while DEM-Vars and Aquila-Vars share up to 1,000 markers independently selected for each SNP, INDEL, and SV branch by the DEM-Vars RF.
+DEM's random-forest (RF) selection is retained because removing it leaves the full one-hot panel as the Transformer width and exceeded the available memory on the RTX 4090 benchmark server. Upstream DEM one-hot encodes markers first, then keeps 1,000 columns per modality (`NUM_FEAT2SAVE`); that column count is `d_model`. DEM is not included in the main horizontal comparison. Instead, `GYP_BLUP`, `HD_BLUP`, and `PH_BLUP` are evaluated as independent single-trait tasks. Aquila-Vars uses the distinct parent markers of the columns selected on each SNP, INDEL, and SV branch.
 
-Marker selection remains nested-CV local: each inner-fold RF is fitted only on that inner-training split, and the final RF is refitted using the complete outer-training split before outer-test evaluation. Aquila uses the same selected marker identities but retains its own genotype encodings. The complete two-stage workflow is provided in `DEM/run_dem_rf_matched_comparison.sh`.
+Marker selection remains nested-CV local: each inner-fold RF is fitted only on that inner-training split, and the final RF is refitted using the complete outer-training split before outer-test evaluation. Aquila uses the same selected marker identities but retains its own genotype encodings.
 
-```sh
-cd DEM
-python DEM_train_benchmark.py \
-  --data-dir ../Maize1404.snp.cv.data \
-  --config configs/DEM-SNP_nested_cv.yaml \
-  --output-dir results/DEM-SNP/Maize1404
-
-python DEM_train_benchmark.py \
-  --data-dir ../Maize1404.vars.cv.data \
-  --config configs/DEM-Vars_nested_cv.yaml \
-  --output-dir results/DEM-Vars/Maize1404
-```
-
-For the matched-marker comparison on Rice655:
+Pass all three traits in one process. Each trait is one GPU job, so three devices each train a different trait for that fold. `rf_n_jobs: -1` then means each forest gets an equal share of the CPUs. A separate process per trait leaves the other GPUs idle, because that process has only one job. `--resume` skips a trait fold only after `metrics.json` and `predictions_original_scale.csv` exist, and an incomplete fold directory is removed before that trait is trained again. The same command continues after an interrupt. `--overwrite` deletes the output and cannot be combined with `--resume`.
 
 ```sh
 cd DEM
-bash run_dem_rf_matched_comparison.sh
+set -e
+for FOLD in {0..9}; do
+  python DEM_train_benchmark.py \
+    --data-dir "../Rice655.current_fold_GWAS.vars.cv.more_sv.data/fold_${FOLD}" \
+    --config configs/DEM-Vars_nested_cv.yaml \
+    --traits GYP_BLUP HD_BLUP PH_BLUP \
+    --outer-folds "$FOLD" \
+    -o "results/Rice655_10folds/DEM-Vars/fold_${FOLD}" \
+    --resume
+
+  for TRAIT in GYP_BLUP HD_BLUP PH_BLUP; do
+    python export_dem_rf_aquila_data.py \
+      --data-dir "../Rice655.current_fold_GWAS.vars.cv.more_sv.data/fold_${FOLD}" \
+      --dem-output-dir "results/Rice655_10folds/DEM-Vars/fold_${FOLD}" \
+      --trait "$TRAIT" \
+      --outer-fold "$FOLD" \
+      -o "../Rice655.DEM-RF.Aquila-Vars.data/${TRAIT}/fold_${FOLD}" \
+      --resume
+  done
+done
+
+cd ../aquila-vars
+for TRAIT in GYP_BLUP HD_BLUP PH_BLUP; do
+  for FOLD in {0..9}; do
+    aquila_train_cv.py \
+      --data-dir "../Rice655.DEM-RF.Aquila-Vars.data/${TRAIT}/fold_${FOLD}" \
+      --config "configs/dem_rf_matched.${TRAIT}.yaml" \
+      -o "results/Rice655-rf-matched/${TRAIT}/fold_${FOLD}" \
+      --resume
+  done
+done
 ```
 
-DEM-SNP and DEM-Vars train independent single-output models for each selected trait and outer fold. Missing phenotypes are removed only within the assigned train, validation, or test split, so predefined fold membership is unchanged, and training uses ordinary MSE. DEM-SNP uses the original ten-channel DEM SNP encoding. DEM-Vars uses ordered SNP, INDEL, and SV branches, with ten channels for SNPs and Aquila-Vars four-class channels for INDELs and SVs. Random-forest marker selection is fitted separately per branch using retained training samples only. The original batch-dependent Transformer behavior is preserved. See the [detailed DEM benchmark adaptation](docs/DEM_benchmark_adaptation.md).
+DEM-Vars trains an independent single-output model for each selected trait and outer fold. Missing phenotypes are removed only within the assigned train, validation, or test split, so predefined fold membership is unchanged, and training uses ordinary MSE. DEM-Vars uses ordered SNP, INDEL, and SV branches, with ten channels for SNPs and Aquila-Vars four-class channels for INDELs and SVs. Random-forest marker selection is fitted separately per branch using retained training samples only. The original batch-dependent Transformer behavior is preserved. See the [detailed DEM benchmark adaptation](docs/DEM_benchmark_adaptation.md).
+
+

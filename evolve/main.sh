@@ -31,6 +31,24 @@ python plot_qtn_gain_seed_mean_panel.py \
 ## Case2: HHZ-base
 DIRECTION_FILE=hhz_base_705rice.directions.tsv
 LABEL=maximize-minimize
+
+# Two-stage 10-fold proxy workflow (set ENSEMBLE_MODEL_DIR first):
+# aquila_qtn_proxy_map.py \
+#   --model-dir "$ENSEMBLE_MODEL_DIR" \
+#   --vcf huanghuazhan.705rice.snp.vcf.gz \
+#   --qtn-list ricenavi_gatk3_gatk4_snp_indel_id.exclude_sterility.list \
+#   --direction-file "$DIRECTION_FILE" \
+#   --window-kb 500 --min-cosine 0.8 \
+#   -o 705rice_HHZ_QTN_proxy_map
+# aquila_evolve_ensemble.py \
+#   --model-dir "$ENSEMBLE_MODEL_DIR" \
+#   --vcf huanghuazhan.705rice.snp.vcf.gz \
+#   --direction-file "$DIRECTION_FILE" \
+#   --qtn-proxy-map 705rice_HHZ_QTN_proxy_map/qtn_proxy_map.json \
+#   --seed 42 \
+#   --output-dir 705rice_HHZ_proxy_SI_screening_evolve \
+#   --strategy screening --save-all-rounds --homozygous
+
 aquila_evolve.py --model-dir 705rice_conv_mha.aquila-snp.best_model \
   --vcf huanghuazhan.705rice.snp.vcf.gz  \
   --direction-file $DIRECTION_FILE  \

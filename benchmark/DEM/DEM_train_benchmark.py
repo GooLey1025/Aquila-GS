@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import shutil
 import sys
 import time
@@ -127,13 +128,69 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--jobs-per-gpu", type=positive_int, default=1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete the output directory before running. Mutually exclusive with --resume.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Keep the output directory and skip a trait fold only when its "
+            "final metrics and predictions already exist."
+        ),
+    )
     parser.add_argument("--max-candidates", type=positive_int, default=None)
     parser.add_argument("--max-inner-folds", type=positive_int, default=None)
     return parser.parse_args(argv)
 
 
+def _read_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _load_completed_fold(
+    output_directory: Path,
+    trait_name: str,
+    trait_index: int,
+    outer_fold: int,
+) -> dict[str, Any] | None:
+    """Recover a fold only after its final metrics and predictions exist."""
+    fold_path = output_directory / _safe_name(trait_name) / f"fold_{outer_fold}"
+    required = (
+        fold_path / "best_model.pt",
+        fold_path / "hpo_results.json",
+        fold_path / "metrics.json",
+        fold_path / "predictions_original_scale.csv",
+    )
+    if not all(path.is_file() and path.stat().st_size > 0 for path in required):
+        return None
+    try:
+        hpo = _read_json(fold_path / "hpo_results.json")
+        metrics = _read_json(fold_path / "metrics.json")
+    except (OSError, json.JSONDecodeError, TypeError, KeyError):
+        return None
+    if not isinstance(hpo, dict) or not isinstance(metrics, dict):
+        return None
+    if "normalized" not in metrics or "original" not in metrics:
+        return None
+    return {
+        "trait": trait_name,
+        "trait_index": trait_index,
+        "outer_fold": outer_fold,
+        "best_candidate_id": hpo["best_candidate_id"],
+        "best_parameters": dict(hpo["best_parameters"]),
+        "best_valid_pearson_mean": hpo["best_valid_pearson_mean"],
+        "final_epoch": hpo["final_epoch"],
+        "metrics": metrics,
+        "elapsed_seconds": None,
+    }
+
+
 def _write_json(path: Path, values: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(values, handle, indent=2, allow_nan=True)
         handle.write("\n")
@@ -225,6 +282,7 @@ def _selected_variant_payload(
     payload: dict[str, list[dict[str, Any]]] = {}
     for branch_index, name in enumerate(selected.modality_names):
         rows = []
+        channels = CHANNELS_PER_MODALITY[name]
         for rank, (index, variant, importance) in enumerate(
             zip(
                 selected.selected_indices[branch_index],
@@ -233,11 +291,14 @@ def _selected_variant_payload(
             ),
             start=1,
         ):
+            column = int(index)
             chrom, position, identifier, reference, alternate = variant
             rows.append(
                 {
                     "rank": rank,
-                    "original_index": int(index),
+                    "original_index": column,
+                    "marker_index": column // channels,
+                    "channel": column % channels,
                     "chrom": chrom,
                     "position": position,
                     "id": identifier,
@@ -272,11 +333,14 @@ def _selection_metadata(
     branches = {}
     variants = _selected_variant_payload(selected)
     for index, name in enumerate(selected.modality_names):
+        columns = selected.selected_indices[index]
+        channels = CHANNELS_PER_MODALITY[name]
         branches[name] = {
             "encoding": ENCODING_NAMES[name],
-            "channels_per_marker": CHANNELS_PER_MODALITY[name],
-            "selection_unit": f"{name.upper()}_marker",
-            "marker_count": len(selected.selected_indices[index]),
+            "channels_per_marker": channels,
+            "selection_unit": "onehot_column",
+            "feature_count": len(columns),
+            "marker_count": len({int(column) // channels for column in columns}),
             "input_dim": selected.train.modalities[index].shape[1],
             "variants": variants[name],
         }
@@ -402,6 +466,12 @@ def run_outer_fold(
     }
     inner_audit = []
     for inner_fold in range(context.inner_count):
+        print(
+            f"[INFO] DEM trait={job.trait_name} outer_fold={job.outer_fold} "
+            f"inner_fold={inner_fold}/{context.inner_count} "
+            "fitting random-forest marker selection",
+            flush=True,
+        )
         selected = _load_pair(
             context, job.trait_index, job.outer_fold, inner_fold, context.base_config
         )
@@ -461,6 +531,11 @@ def run_outer_fold(
     best = select_candidate(candidates)
     best_config = merge_config(context.base_config, best.parameters)
     final_epoch = half_up_median_epoch(best.best_epochs)
+    print(
+        f"[INFO] DEM trait={job.trait_name} outer_fold={job.outer_fold} "
+        "fitting final random-forest marker selection",
+        flush=True,
+    )
     selected = _load_pair(
         context, job.trait_index, job.outer_fold, None, best_config
     )
@@ -593,6 +668,18 @@ def run_outer_fold(
     }
 
 
+def _rf_workers(configured: int, concurrent_jobs: int) -> int:
+    """Share the machine when several trait jobs run at once.
+
+    ``-1`` means every CPU for a single job. Concurrent jobs each receive an
+    equal share so three forests do not each spawn one process per core.
+    """
+    if configured >= 0 or concurrent_jobs <= 1:
+        return configured
+    total = os.cpu_count() or 1
+    return max(1, total // concurrent_jobs)
+
+
 def _run_outer_fold_job(
     job: OuterFoldJob,
     device_name: str,
@@ -608,14 +695,22 @@ def _run_outer_fold_job(
 
 def main() -> None:
     args = parse_args()
+    if args.overwrite and args.resume:
+        raise ValueError("--overwrite and --resume are mutually exclusive")
     from aquila.training.distributed import detect_gpu_ids, execute_gpu_jobs
 
     data_directory = Path(args.data_dir).resolve()
     output_directory = Path(args.output_dir).resolve()
     if output_directory.exists() and any(output_directory.iterdir()):
-        if not args.overwrite:
-            raise FileExistsError(f"Output directory is not empty: {output_directory}")
-        shutil.rmtree(output_directory)
+        if args.overwrite:
+            shutil.rmtree(output_directory)
+        elif not args.resume:
+            raise FileExistsError(
+                f"Output directory is not empty: {output_directory}; "
+                "use --resume to continue or --overwrite to replace it"
+            )
+        else:
+            print(f"[INFO] Resuming from existing results in {output_directory}", flush=True)
     output_directory.mkdir(parents=True, exist_ok=True)
     config_path = Path(args.config).resolve()
     with config_path.open("r", encoding="utf-8") as handle:
@@ -635,14 +730,31 @@ def main() -> None:
         raise ValueError("DEM configuration generated no HPO candidates")
     gpu_ids = [] if args.gpus == [] else detect_gpu_ids(args.gpus)
     worker_gpu_ids = expand_gpu_workers(gpu_ids, args.jobs_per_gpu)
-    jobs = [
-        OuterFoldJob(position, trait_index, trait_name, outer_fold)
-        for position, (trait_index, trait_name, outer_fold) in enumerate(
-            (trait_index, trait_name, outer_fold)
-            for trait_index, trait_name in traits
-            for outer_fold in outer_folds
+    completed_results = []
+    jobs = []
+    for position, (trait_index, trait_name, outer_fold) in enumerate(
+        (trait_index, trait_name, outer_fold)
+        for trait_index, trait_name in traits
+        for outer_fold in outer_folds
+    ):
+        completed = (
+            _load_completed_fold(output_directory, trait_name, trait_index, outer_fold)
+            if args.resume
+            else None
         )
-    ]
+        if completed is not None:
+            completed_results.append(completed)
+            print(
+                f"[INFO] DEM trait={trait_name} outer_fold={outer_fold} "
+                "already complete; skipping",
+                flush=True,
+            )
+            continue
+        if args.resume:
+            fold_path = output_directory / _safe_name(trait_name) / f"fold_{outer_fold}"
+            if fold_path.exists():
+                shutil.rmtree(fold_path)
+        jobs.append(OuterFoldJob(position, trait_index, trait_name, outer_fold))
     context = WorkerContext(
         str(data_directory),
         str(output_directory),
@@ -661,9 +773,14 @@ def main() -> None:
         if worker_gpu_ids
         else ["cpu"]
     )
+    concurrent = min(len(jobs), len(devices)) if jobs else 0
+    if jobs:
+        configured_jobs = int(config["data"].get("rf_n_jobs", 1))
+        config["data"]["rf_n_jobs"] = _rf_workers(configured_jobs, concurrent)
     print(
         f"[INFO] {model_name}: {len(jobs)} trait-by-fold jobs across {devices}; "
-        f"{args.jobs_per_gpu} concurrent job(s) per GPU"
+        f"{concurrent} running at once, "
+        f"{config['data'].get('rf_n_jobs', 1)} CPU workers per random forest"
     )
     work_results = execute_gpu_jobs(
         jobs,
@@ -672,7 +789,7 @@ def main() -> None:
         worker_args=(context,),
         raise_on_error=True,
     )
-    results = [result.value for result in work_results]
+    results = completed_results + [result.value for result in work_results]
     trait_results = {}
     for _, trait_name in traits:
         fold_results = [

@@ -7,6 +7,7 @@ benchmark:
 data:
   modalities: [snp]
   rf_enabled: true
+  # Upstream NUM_FEAT2SAVE: one-hot columns retained after encoding.
   selected_markers:
     snp: 1000
   rf_estimators: 500

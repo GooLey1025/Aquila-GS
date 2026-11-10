@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -44,7 +45,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trait", required=True)
     parser.add_argument("--outer-fold", required=True, type=int)
     parser.add_argument("-o", "--output-dir", required=True)
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing output directory. Mutually exclusive with --resume.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Keep an output directory that already contains metadata and the selection summary.",
+    )
     return parser.parse_args(argv)
 
 
@@ -118,10 +128,28 @@ def _variant_tuple(row: Mapping[str, Any]) -> Variant:
     )
 
 
-def _source_schemas(
-    metadata: Mapping[str, Any],
-    features: torch.Tensor | Mapping[str, torch.Tensor],
-) -> tuple[dict[str, tuple[Variant, ...]], dict[str, str]]:
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _recorded_genotype_sha256(metadata: Mapping[str, Any]) -> str | None:
+    checksums = metadata.get("source_checksums", {})
+    recorded = checksums.get("genotype_sha256") if isinstance(checksums, dict) else None
+    if not recorded:
+        gwas = metadata.get("fold_specific_gwas", {})
+        if isinstance(gwas, dict):
+            recorded = gwas.get("source_vcf_sha256")
+    if not recorded:
+        return None
+    return str(recorded)
+
+
+def _resolve_genotype_path(metadata: Mapping[str, Any]) -> Path:
+    """Return the panel VCF, including after the results directory was moved."""
     genotype_path = Path(str(metadata["genotype_file"]))
     if not genotype_path.is_absolute():
         source_directory = metadata.get("_source_data_directory")
@@ -136,8 +164,36 @@ def _source_schemas(
                 (candidate for candidate in candidates if candidate.is_file()),
                 candidates[0],
             )
-    if not genotype_path.is_file():
-        raise FileNotFoundError(f"Source genotype VCF not found: {genotype_path}")
+    if genotype_path.is_file():
+        return genotype_path
+    parts = genotype_path.parts
+    tail = None
+    for index, part in enumerate(parts):
+        if part.startswith("outer_fold_"):
+            tail = Path(*parts[index:])
+            break
+    source_directory = metadata.get("_source_data_directory")
+    search_root = (
+        Path(str(source_directory)).parents[1] / "species_data"
+        if source_directory is not None
+        else SCRIPT_DIRECTORY.parent / "species_data"
+    )
+    matches = sorted(search_root.glob(f"**/{tail}")) if tail is not None and search_root.is_dir() else []
+    matches = [match for match in matches if match.is_file()]
+    expected_sha = _recorded_genotype_sha256(metadata)
+    if expected_sha:
+        matches = [match for match in matches if _file_sha256(match) == expected_sha]
+    if len(matches) == 1:
+        print(f"[INFO] Using relocated genotype VCF {matches[0]}", flush=True)
+        return matches[0]
+    raise FileNotFoundError(f"Source genotype VCF not found: {genotype_path}")
+
+
+def _source_schemas(
+    metadata: Mapping[str, Any],
+    features: torch.Tensor | Mapping[str, torch.Tensor],
+) -> tuple[dict[str, tuple[Variant, ...]], dict[str, str]]:
+    genotype_path = _resolve_genotype_path(metadata)
     if isinstance(features, torch.Tensor):
         modalities = ("snp",)
         feature_keys = {"snp": "main"}
@@ -185,7 +241,17 @@ def _map_selection(
     for modality, schema in schemas.items():
         positions = {variant: index for index, variant in enumerate(schema)}
         rows = branches[modality].get("variants", [])
-        variants = [_variant_tuple(row) for row in rows]
+        variants = []
+        unique_rows = []
+        seen = set()
+        for row in rows:
+            variant = _variant_tuple(row)
+            if variant in seen:
+                continue
+            seen.add(variant)
+            variants.append(variant)
+            unique_rows.append(row)
+        rows = unique_rows
         missing = [variant for variant in variants if variant not in positions]
         if missing:
             raise ValueError(
@@ -265,6 +331,11 @@ def _prepare_single_trait_targets(
             )
 
 
+def _export_is_complete(output: Path) -> bool:
+    required = (output / "metadata.json", output / "split_local_selection.json")
+    return all(path.is_file() and path.stat().st_size > 0 for path in required)
+
+
 def export_data(
     source: Path,
     dem_output: Path,
@@ -272,11 +343,21 @@ def export_data(
     outer_fold: int,
     output: Path,
     overwrite: bool = False,
+    resume: bool = False,
 ) -> Path:
+    if overwrite and resume:
+        raise ValueError("--overwrite and --resume are mutually exclusive")
     if output.exists():
-        if not overwrite:
-            raise FileExistsError(f"Output directory already exists: {output}")
-        shutil.rmtree(output)
+        if resume and _export_is_complete(output):
+            print(f"[INFO] Reusing completed export {output}", flush=True)
+            return output
+        if resume or overwrite:
+            shutil.rmtree(output)
+        else:
+            raise FileExistsError(
+                f"Output directory already exists: {output}; "
+                "use --resume to continue or --overwrite to replace it"
+            )
     with (source / "metadata.json").open("r", encoding="utf-8") as handle:
         metadata = json.load(handle)
     metadata["_source_data_directory"] = str(source.resolve())
@@ -407,6 +488,7 @@ def main() -> None:
         args.outer_fold,
         Path(args.output_dir),
         args.overwrite,
+        args.resume,
     )
     print(f"Exported DEM RF-selected Aquila data to {output}")
 

@@ -8,9 +8,10 @@ vcf_file="$3"
 output_dir="$4"
 model_dir="$5"
 ricenavi_switch="$6"
+evolve_command="${7:-aquila_evolve.py}"
 
 gpu_ids=(0 1 2)
-jobs_per_gpu=2
+jobs_per_gpu="${JOBS_PER_GPU:-2}"
 max_jobs=$(( ${#gpu_ids[@]} * jobs_per_gpu ))
 
 common_args=(
@@ -37,7 +38,7 @@ run_one_seed() {
 
     echo "Running seed ${seed} on GPU ${gpu_id}"
 
-    CUDA_VISIBLE_DEVICES="${gpu_id}" aquila_evolve.py \
+    CUDA_VISIBLE_DEVICES="${gpu_id}" "${evolve_command}" \
         "${common_args[@]}" \
         --seed "${seed}" \
         --output-dir "${output_dir}/seed_${seed}" \

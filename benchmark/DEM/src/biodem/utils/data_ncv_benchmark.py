@@ -504,23 +504,34 @@ def fit_rf_selector(
 def apply_selected_features(
     split: DEMSplit, indices: np.ndarray, branch_index: int = 0
 ) -> DEMSplit:
+    """Keep selected one-hot columns. Indices address the expanded matrix."""
     selected = np.asarray(indices, dtype=np.int64)
-    categories = list(split.marker_categories)
     modalities = list(split.modalities)
-    schemas = list(split.variants)
-    categories[branch_index] = np.ascontiguousarray(
-        categories[branch_index][:, selected]
+    width = modalities[branch_index].shape[1]
+    if selected.ndim != 1 or np.any(selected < 0) or np.any(selected >= width):
+        raise ValueError("Selected one-hot columns are outside the encoded matrix")
+    modalities[branch_index] = np.ascontiguousarray(
+        modalities[branch_index][:, selected]
     )
-    name = split.modality_names[branch_index]
-    modalities[branch_index] = expand_marker_categories(
-        categories[branch_index], name
-    )
-    schemas[branch_index] = tuple(schemas[branch_index][index] for index in selected)
     return DEMSplit(
-        tuple(modalities), tuple(categories), split.targets, split.raw_targets,
-        split.sample_ids, split.discarded_sample_ids, tuple(schemas),
+        tuple(modalities), split.marker_categories, split.targets, split.raw_targets,
+        split.sample_ids, split.discarded_sample_ids, split.variants,
         split.modality_names,
     )
+
+
+def selected_parent_variants(
+    split: DEMSplit, indices: np.ndarray, branch_index: int
+) -> tuple[Variant, ...]:
+    """Map each selected one-hot column back to its source marker."""
+    selected = np.asarray(indices, dtype=np.int64)
+    name = split.modality_names[branch_index]
+    channels = CHANNELS_PER_MODALITY[name]
+    variants = split.variants[branch_index]
+    width = split.modalities[branch_index].shape[1]
+    if channels < 1 or len(variants) * channels != width:
+        raise ValueError(f"One-hot width is not aligned with {name} markers")
+    return tuple(variants[int(column) // channels] for column in selected)
 
 
 def select_split_features(
@@ -537,16 +548,18 @@ def select_split_features(
     selected_held = held_out
     all_indices = []
     all_importances = []
+    parent_variants = []
     for branch_index, name in enumerate(train.modality_names):
-        marker_count = train.marker_categories[branch_index].shape[1]
+        encoded = train.modalities[branch_index]
+        feature_count = encoded.shape[1]
         requested = (
-            int(n_features.get(name, marker_count))
+            int(n_features.get(name, feature_count))
             if isinstance(n_features, Mapping)
             else int(n_features)
         )
         if enabled:
             indices, importances = fit_rf_selector(
-                train.marker_categories[branch_index],
+                encoded,
                 train.targets,
                 requested,
                 n_estimators,
@@ -560,15 +573,16 @@ def select_split_features(
                 selected_held, indices, branch_index
             )
         else:
-            indices = np.arange(marker_count, dtype=np.int64)
-            importances = np.full(marker_count, np.nan, dtype=np.float32)
+            indices = np.arange(feature_count, dtype=np.int64)
+            importances = np.full(feature_count, np.nan, dtype=np.float32)
         all_indices.append(indices)
         all_importances.append(importances)
+        parent_variants.append(selected_parent_variants(train, indices, branch_index))
     return SelectedSplits(
         selected_train,
         selected_held,
         tuple(all_indices),
-        selected_train.variants,
+        tuple(parent_variants),
         tuple(all_importances),
         train.modality_names,
     )

@@ -39,7 +39,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-from aquila.encoding import parse_genotype_file, write_evolved_vcf
+from aquila.encoding import (
+    parse_genotype_file,
+    variant_ids_for_encodings,
+    write_evolved_vcf,
+)
 from aquila.utils import load_config
 from aquila.varnn import create_model_from_config
 
@@ -111,6 +115,7 @@ class RoundResult:
     # Screening-specific: evaluated SNP for this round
     evaluated_snp_idx: int = -1
     evaluated_snp_id: str = ""
+    source_qtn_ids: str = ""
     # Cumulative SI (with maintain penalty, reflects all accumulated mutations)
     score_baseline: float = 0.0
     score_evolved: float = 0.0
@@ -610,6 +615,7 @@ def write_final_evolved_vcf(
         evolved_sample_name=sample_name,
         phased=phased,
         verbose=False,
+        variant_ids=variant_ids_for_encodings(variant_info, evolved_genotypes),
     )
 
 
@@ -1171,7 +1177,11 @@ def _si_from_preds(
 def get_encoding_dim(variant_tensors) -> int:
     """Get the encoding dimension (last axis size) for SNP tensors."""
     if isinstance(variant_tensors, dict):
-        t = variant_tensors.get('snp') or list(variant_tensors.values())[0]
+        t = (
+            variant_tensors['snp']
+            if 'snp' in variant_tensors
+            else next(iter(variant_tensors.values()))
+        )
     else:
         t = variant_tensors
     return t.shape[-1] if t.ndim == 3 else 1
@@ -1932,6 +1942,7 @@ def _screening_evaluate_one_snp(
     direction, current_preds_norm, panel_genotypes,
     original_preds_norm=None,
     homozygous_only: bool = False,
+    forced_candidate: Optional[torch.Tensor] = None,
 ) -> Optional[dict]:
     """Evaluate all mutation candidates for a single SNP. Returns best candidate info."""
     if is_multi_branch:
@@ -1943,7 +1954,15 @@ def _screening_evaluate_one_snp(
     alt = variant_info['snp']['alts'][snp_idx] if snp_idx < len(variant_info['snp']['alts']) else 'T'
     avail_gts = panel_genotypes[snp_idx] if panel_genotypes else None
 
-    candidates = build_mutation_candidates_for_snp(orig, encoding_dim, ref, alt, avail_gts, homozygous_only)
+    if forced_candidate is not None:
+        candidate = forced_candidate.detach().to(
+            device=orig.device, dtype=orig.dtype
+        ).reshape_as(orig)
+        candidates = [] if torch.equal(candidate, orig) else [candidate]
+    else:
+        candidates = build_mutation_candidates_for_snp(
+            orig, encoding_dim, ref, alt, avail_gts, homozygous_only
+        )
     if not candidates:
         return None
 
@@ -2192,6 +2211,7 @@ def strategy_screening(
     apply_all_positive_gain=True,
     homozygous_only: bool = False,
     seed: int = 42,
+    forced_genotypes: Optional[Dict[int, torch.Tensor]] = None,
 ) -> Tuple:
     """
     Strategy 1: SNP screening — evaluate candidates then apply beneficial mutations.
@@ -2226,6 +2246,10 @@ def strategy_screening(
             direction, current_preds_norm, panel_genotypes,
             original_preds_norm=original_preds_norm,
             homozygous_only=homozygous_only,
+            forced_candidate=(
+                forced_genotypes.get(snp_idx)
+                if forced_genotypes is not None else None
+            ),
         )
         if result is not None:
             eval_results[snp_idx] = result
