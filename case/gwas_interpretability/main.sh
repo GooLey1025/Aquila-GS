@@ -15,6 +15,9 @@ fi
 export MARKERS=./655rice.canonical_markers.tsv
 export PREFIX=655rice.production.gwas_interpretability
 
+# HD_BLUP, GW_BLUP and PH_BLUP are the three traits drawn against GWAS below.
+# Genome-wide IG for all 51 traits and the Spearman heatmap are produced by
+# main.all_traits_ig.sh, which attributes every trait on this same ensemble.
 TRAITS=(HD_BLUP GW_BLUP PH_BLUP) #GYP_BLUP TGW_BLUP TNP_BLUP GL_BLUP PPNP_BLUP
 
 

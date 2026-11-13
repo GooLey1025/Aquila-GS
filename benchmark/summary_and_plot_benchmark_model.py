@@ -1819,7 +1819,7 @@ def plot_performance_distribution(
     axis.axhline(0, color="#777777", linewidth=0.75, linestyle=(0, (3, 3)), zorder=1)
     axis.set_title(f"{cohort}: predictive performance across traits", pad=12)
     axis.set_xlabel("")
-    axis.set_ylabel("Outer-test Pearson's r")
+    axis.set_ylabel("Outer-test Pearson's $r$")
     axis.set_xlim(-0.5, len(order) - 0.5)
     axis.set_xticks(np.arange(len(order)))
     axis.set_xticklabels(order)
@@ -1829,7 +1829,7 @@ def plot_performance_distribution(
         label.set_fontweight("bold")
     beautify_axes(axis)
     note = (
-        "Letters: paired t-tests on per-trait Pearson's r "
+        "Letters: paired t-tests on per-trait Pearson's $r$ "
         "(Holm-adjusted α = 0.05). Models that share a letter are not significantly different."
     )
     if friedman_p is not None:
@@ -2106,7 +2106,7 @@ def plot_performance_heatmap(
         pad=12,
     )
     box_axis.set_xlabel("")
-    box_axis.set_ylabel("Outer-test Pearson's r")
+    box_axis.set_ylabel("Outer-test Pearson's $r$")
     box_axis.set_xlim(-0.5, len(model_order) - 0.5)
     box_axis.set_xticks(np.arange(len(model_order)))
     box_axis.set_xticklabels(

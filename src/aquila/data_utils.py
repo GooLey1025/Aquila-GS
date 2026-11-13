@@ -512,6 +512,30 @@ def _worker_init_fn(worker_id: int):
     # 3. Setting them in workers is unnecessary overhead
 
 
+def _unpack_encoded_genotypes(result):
+    """Return genotype matrices and sample IDs from either encoding shape.
+
+    A single branch is ``{"matrix", "sample_ids", ...}`` or a tuple.
+    Automatic detection is ``{"SNP": {"matrix", "sample_ids", ...}, ...}``.
+    Branch names are lowercased to match Aquila-Vars model configs.
+    """
+    if isinstance(result, dict) and "matrix" not in result:
+        branches = {}
+        sample_ids = None
+        for name, data in result.items():
+            if not isinstance(data, dict) or "matrix" not in data:
+                continue
+            branches[str(name).lower()] = data["matrix"]
+            sample_ids = data["sample_ids"]
+        if not branches or sample_ids is None:
+            raise KeyError("matrix")
+        return branches, sample_ids
+    if isinstance(result, dict):
+        return result["matrix"], result["sample_ids"]
+    matrix, sample_ids, _variant_ids = result
+    return matrix, sample_ids
+
+
 def create_data_loaders(
     geno_path: str,
     pheno_path: str,
@@ -737,27 +761,18 @@ def create_data_loaders(
             variant_type_from_param,
             id_prefix=id_prefix,
         )
-        # Extract sample IDs from first variant type
-        first_variant_type = list(variant_data.keys())[0]
-        sample_ids = variant_data[first_variant_type]['sample_ids']
-
-        # Create dict of matrices (n_samples, n_variants, 8) per branch
-        snp_matrix = {vtype: data['matrix'] for vtype, data in variant_data.items()}
+        snp_matrix, sample_ids = _unpack_encoded_genotypes(variant_data)
     else:
-        # Single-branch: returns dict (new format) or tuple (old format)
-        # Supports: token, diploid_onehot, snp_vcf, indel_vcf, sv_vcf
+        # Single-branch returns a flat dict or tuple. Omitting variant_type
+        # detects SNP, INDEL, and SV automatically and returns one nested
+        # branch per type; that result has no top-level "matrix" key.
         result = parse_geno_with_encoding(
             geno_path,
             encoding_type,
             variant_type_from_param,
             id_prefix=id_prefix,
         )
-        if isinstance(result, dict):
-            snp_matrix = result['matrix']
-            sample_ids = result['sample_ids']
-            snp_ids = result.get('variant_ids', [])
-        else:
-            snp_matrix, sample_ids, snp_ids = result
+        snp_matrix, sample_ids = _unpack_encoded_genotypes(result)
 
     pheno_df, regression_cols, classification_cols = parse_phenotype_file(
         pheno_path, classification_tasks

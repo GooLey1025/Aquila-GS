@@ -808,7 +808,22 @@ def main():
     # Determine sequence length(s) for multi-branch
     # Check both old format (encoding_type) and new format (variant_type)
     variant_type = config.get('data', {}).get('variant_type')
-    is_multi_branch = encoding_type in ['snp_indel_vcf', 'snp_indel_sv_vcf'] or variant_type in ['snp_indel', 'snp_indel_sv']
+    train_branches = train_config.get('branches') or model_config.get('branches')
+    is_multi_branch = (
+        encoding_type in ['snp_indel_vcf', 'snp_indel_sv_vcf']
+        or variant_type in ['snp_indel', 'snp_indel_sv']
+        or model_config.get('architecture_type') == 'multi_branch'
+        or (isinstance(train_branches, dict) and len(train_branches) > 1)
+    )
+    genotype_keys = [
+        key for key in sample_batch
+        if key not in {
+            'sample_id', 'regression_targets', 'regression_mask',
+            'classification_targets', 'classification_mask',
+        }
+    ]
+    if len(genotype_keys) > 1:
+        is_multi_branch = True
 
     if is_multi_branch:
         # Multi-branch: get seq_length for each variant type

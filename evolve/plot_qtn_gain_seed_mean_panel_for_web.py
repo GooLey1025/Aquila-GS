@@ -8,6 +8,8 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from openpyxl.styles import Alignment, Border, Font, Side
+from openpyxl.utils import get_column_letter
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import FormatStrFormatter
 from matplotlib.offsetbox import AnnotationBbox, TextArea, HPacker
@@ -156,14 +158,152 @@ def classify_hhz_selection(teqing_gt, hhz_gt, evolved_major_gt):
     return "Novel-selected"
 
 
+ANNOTATION_FIELDS = [
+    "Pos_7.0",
+    "Method_Genotyping",
+    "Alt_Allele_Func",
+    "GeneName",
+    "HuangHuaZhan",
+    "RAP_Locus",
+    "MSU_Locus",
+    "Evaluation",
+    "Trait",
+    "Ref_geno",
+    "Alt_geno",
+    "基因型（0|0）",
+    "等位基因（1|1，2|2）",
+]
+
+def write_publication_xlsx(table, path):
+    """Write a three-line scientific table in Times New Roman."""
+    sheet = table.copy()
+    integer_columns = ["global_rank", "Chr", "Pos", "gain_n_seed"]
+    decimal_columns = ["gain_mean", "gain_std", "Evolved_Major_GT_Freq"]
+    for column in integer_columns:
+        if column in sheet.columns:
+            sheet[column] = pd.to_numeric(sheet[column], errors="coerce").astype("Int64")
+    for column in decimal_columns:
+        if column in sheet.columns:
+            sheet[column] = pd.to_numeric(sheet[column], errors="coerce")
+
+    sheet = sheet.rename(columns={
+        "基因型（0|0）": "Reference Genotype Favorability (0|0)",
+        "等位基因（1|1，2|2）": "Alternate Genotype Favorability (1|1, 2|2)",
+    })
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        sheet.to_excel(writer, index=False, sheet_name="QTN")
+        worksheet = writer.sheets["QTN"]
+        body_font = Font(name="Times New Roman", size=10.5)
+        header_font = Font(name="Times New Roman", size=10.5, bold=True)
+        center = Alignment(horizontal="center", vertical="center", wrap_text=False)
+        thick = Side(style="medium", color="000000")
+        thin = Side(style="thin", color="000000")
+        header_border = Border(top=thick, bottom=thin)
+        bottom_border = Border(bottom=thick)
+        open_border = Border()
+        last_row = worksheet.max_row
+        for cell in worksheet[1]:
+            cell.font = header_font
+            cell.alignment = center
+            cell.border = header_border if last_row > 1 else Border(top=thick, bottom=thick)
+        for row_index in range(2, last_row + 1):
+            border = bottom_border if row_index == last_row else open_border
+            for cell in worksheet[row_index]:
+                cell.font = body_font
+                cell.alignment = center
+                cell.border = border
+        formats = {
+            "Pos": "#,##0",
+            "global_rank": "0",
+            "gain_n_seed": "0",
+            "gain_mean": "0.000000",
+            "gain_std": "0.000000",
+            "Evolved_Major_GT_Freq": "0.00",
+        }
+        for column_index, column_name in enumerate(sheet.columns, start=1):
+            letter = get_column_letter(column_index)
+            if column_name in formats:
+                for cell in worksheet[letter][1:]:
+                    cell.number_format = formats[column_name]
+            texts = [str(column_name)]
+            texts.extend(
+                "" if pd.isna(value) else str(value)
+                for value in sheet[column_name].head(40)
+            )
+            width = max(sum(2 if ord(char) > 127 else 1 for char in text) for text in texts)
+            worksheet.column_dimensions[letter].width = min(max(width + 2, 8), 52)
+        worksheet.row_dimensions[1].height = 22
+        for row_index in range(2, last_row + 1):
+            worksheet.row_dimensions[row_index].height = 18
+        worksheet.freeze_panes = "A2"
+        worksheet.sheet_view.showGridLines = False
+        worksheet.sheet_view.zoomScale = 100
+
+
+PUBLICATION_COLUMNS = [
+    "global_rank",
+    "evaluated_snp_id",
+    "Chr",
+    "Pos",
+    "GeneName",
+    "MSU_Locus",
+    "RAP_Locus",
+    "Ref_geno",
+    "Alt_geno",
+    "基因型（0|0）",
+    "等位基因（1|1，2|2）",
+    "Trait",
+    "Trait_category",
+    "Alt_Allele_Func",
+    "Evaluation",
+    "gain_mean",
+    "gain_std",
+    "gain_n_seed",
+    "Base_GT",
+    "Evolved_Major_GT",
+    "Evolved_Major_GT_Freq",
+]
+
+
+def _annotation_record(rows):
+    if not rows:
+        return {field: np.nan for field in ANNOTATION_FIELDS}
+    genes = []
+    traits = []
+    for row in rows:
+        gene = str(row["GeneName"])
+        trait = str(row["Trait"])
+        if gene not in genes:
+            genes.append(gene)
+        if trait not in traits:
+            traits.append(trait)
+    record = {}
+    for field in ANNOTATION_FIELDS:
+        value = rows[0][field] if field in rows[0].index else np.nan
+        if isinstance(value, str):
+            value = value.strip()
+        record[field] = value
+    record["GeneName"] = ";".join(genes)
+    record["Trait"] = traits[0]
+    return record
+
+
+def _coordinate_key(chrom, pos):
+    if pd.isna(chrom) or pd.isna(pos):
+        return None
+    chrom = str(chrom).strip()
+    if chrom.lower().startswith("chr"):
+        chrom = chrom[3:]
+    return chrom, int(pos)
+
+
 def annotate_source_qtns(gain_summary, ricenavi):
-    """Attach RiceNavi gene and trait labels through source QTN IDs."""
+    """Attach the full RiceNavi row through source QTN IDs."""
     lookup = ricenavi.drop_duplicates("SNP_ID").set_index("SNP_ID")
-    gene_labels = []
-    trait_labels = []
+    records = []
     for source_text in gain_summary["source_qtn_ids"]:
-        genes = []
-        traits = []
+        matched_rows = []
         for source_id in str(source_text).split(","):
             source_id = source_id.strip()
             if source_id not in lookup.index:
@@ -171,45 +311,29 @@ def annotate_source_qtns(gain_summary, ricenavi):
             row = lookup.loc[source_id]
             if isinstance(row, pd.DataFrame):
                 row = row.iloc[0]
-            genes.append(str(row["GeneName"]))
-            traits.append(row["Trait"])
-        gene_labels.append(";".join(dict.fromkeys(genes)) if genes else np.nan)
-        trait_labels.append(traits[0] if traits else np.nan)
-    annotated = gain_summary.copy()
-    annotated["GeneName"] = gene_labels
-    annotated["Trait"] = trait_labels
-    return annotated
+            matched_rows.append(row)
+        records.append(_annotation_record(matched_rows))
+    return pd.DataFrame(records, index=gain_summary.index)
 
 
 def annotate_by_coordinate(gain_summary, ricenavi):
-    """Match evaluated VCF IDs to RiceNavi by chromosome and position."""
+    """Match evaluated VCF IDs to RiceNavi by chromosome and position.
+
+    Evaluated IDs end with the allele (SNP-11-28399720-G). RiceNavi IDs end
+    with a placeholder (SNP-11-28399720-1), so an ID join leaves the locus,
+    genotype, and status columns empty.
+    """
     grouped = {}
     for _, row in ricenavi.iterrows():
-        key = (str(row["Chr_clean"]), int(row["Pos_clean"]))
-        bucket = grouped.setdefault(key, {"genes": [], "traits": []})
-        gene = str(row["GeneName"])
-        trait = str(row["Trait"])
-        if gene not in bucket["genes"]:
-            bucket["genes"].append(gene)
-        if trait not in bucket["traits"]:
-            bucket["traits"].append(trait)
-    genes = []
-    traits = []
+        key = _coordinate_key(row["Chr_clean"], row["Pos_clean"])
+        if key is None:
+            continue
+        grouped.setdefault(key, []).append(row)
+    records = []
     for snp_id in gain_summary["evaluated_snp_id"]:
         parsed = parse_snp_id(snp_id)
-        chrom, pos = parsed.iloc[0], parsed.iloc[1]
-        bucket = None
-        if pd.notna(chrom) and pd.notna(pos):
-            chrom = str(chrom)
-            if chrom.lower().startswith("chr"):
-                chrom = chrom[3:]
-            bucket = grouped.get((chrom, int(pos)))
-        genes.append(";".join(bucket["genes"]) if bucket else np.nan)
-        traits.append(bucket["traits"][0] if bucket else np.nan)
-    annotated = gain_summary.copy()
-    annotated["GeneName"] = genes
-    annotated["Trait"] = traits
-    return annotated
+        records.append(_annotation_record(grouped.get(_coordinate_key(parsed.iloc[0], parsed.iloc[1]), [])))
+    return pd.DataFrame(records, index=gain_summary.index)
 
 
 def trait_category_en(trait):
@@ -615,21 +739,21 @@ def main():
         "source_qtn_ids" in gain_summary.columns
         and gain_summary["source_qtn_ids"].astype(str).str.strip().replace("nan", "").ne("").any()
     )
-    if has_sources:
-        merged = annotate_source_qtns(gain_summary, ricenavi)
-    else:
-        merged = gain_summary.merge(
-            ricenavi,
-            left_on="evaluated_snp_id",
-            right_on="SNP_ID",
-            how="left",
-            suffixes=("", "_ricenavi"),
-        )
-        missing = merged["GeneName"].isna()
-        if missing.any():
-            by_coordinate = annotate_by_coordinate(gain_summary, ricenavi)
-            merged.loc[missing, "GeneName"] = by_coordinate.loc[missing, "GeneName"].to_numpy()
-            merged.loc[missing, "Trait"] = by_coordinate.loc[missing, "Trait"].to_numpy()
+    annotation = (
+        annotate_source_qtns(gain_summary, ricenavi)
+        if has_sources
+        else annotate_by_coordinate(gain_summary, ricenavi)
+    )
+    merged = gain_summary.copy()
+    for field in ANNOTATION_FIELDS:
+        merged[field] = annotation[field].to_numpy()
+    # Source-ID matches can miss sites whose VCF allele suffix differs from
+    # the RiceNavi placeholder. Fill those from chromosome and position.
+    missing = merged["GeneName"].isna()
+    if has_sources and missing.any():
+        by_coordinate = annotate_by_coordinate(gain_summary, ricenavi)
+        for field in ANNOTATION_FIELDS:
+            merged.loc[missing, field] = by_coordinate.loc[missing, field].to_numpy()
 
     matched_all = merged[merged["GeneName"].notna()].copy()
 
@@ -710,9 +834,15 @@ def main():
     else:
         matched = matched_all.copy()
 
-    matched.to_csv(f"{args.out_prefix}.publication_panel.tsv", sep="\t", index=False)
-    merged.to_csv(f"{args.out_prefix}.all_merged.tsv", sep="\t", index=False)
-    all_seed_gain.to_csv(f"{args.out_prefix}.all_seed_gain.tsv", sep="\t", index=False)
+    publication_columns = [column for column in PUBLICATION_COLUMNS if column in matched.columns]
+    publication_table = matched.loc[:, publication_columns]
+    publication_table.to_csv(
+        f"{args.out_prefix}.publication_panel.tsv",
+        sep="\t",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    write_publication_xlsx(publication_table, f"{args.out_prefix}.publication_panel.xlsx")
 
     print(f"Total evaluated SNPs: {len(merged)}")
     print(f"Matched RiceNavi QTNs: {len(matched_all)}")
@@ -1044,42 +1174,27 @@ def main():
         title_fontsize=10,
     )
 
-    legend_pdf_path = f"{args.out_prefix}.trait_category_legend.pdf"
     legend_png_path = f"{args.out_prefix}.trait_category_legend.png"
     legend_svg_path = f"{args.out_prefix}.trait_category_legend.svg"
 
-    legend_fig.savefig(legend_pdf_path, bbox_inches="tight")
     legend_fig.savefig(legend_png_path, dpi=300, bbox_inches="tight")
     legend_fig.savefig(legend_svg_path, bbox_inches="tight")
     plt.close(legend_fig)
 
-    print(f"Saved: {legend_pdf_path}")
     print(f"Saved: {legend_png_path}")
     print(f"Saved: {legend_svg_path}")
 
-    pdf_path = f"{args.out_prefix}.publication_panel.pdf"
     png_path = f"{args.out_prefix}.publication_panel.png"
     svg_path = f"{args.out_prefix}.publication_panel.svg"
-    html_path = f"{args.out_prefix}.publication_panel.html"
 
-    plt.savefig(pdf_path, bbox_inches="tight")
     plt.savefig(png_path, dpi=300, bbox_inches="tight")
     plt.savefig(svg_path, bbox_inches="tight")
     plt.close(fig)
 
-    write_html_wrapper(
-        svg_path=svg_path,
-        html_path=html_path,
-        title="QTN SI evolved contribution panel"
-    )
-
-    print(f"Saved: {pdf_path}")
     print(f"Saved: {png_path}")
     print(f"Saved: {svg_path}")
-    print(f"Saved: {html_path}")
     print(f"Saved: {args.out_prefix}.publication_panel.tsv")
-    print(f"Saved: {args.out_prefix}.all_merged.tsv")
-    print(f"Saved: {args.out_prefix}.all_seed_gain.tsv")
+    print(f"Saved: {args.out_prefix}.publication_panel.xlsx")
 
 
 if __name__ == "__main__":

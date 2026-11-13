@@ -156,7 +156,7 @@ aquila_cv.py \
 ```bash
 aquila_data_cv_production.py \
   --vcf Rice3305.vcf.gz \
-  --phenotype Rice3305.pheno.with_BLUP.tsv \
+  --phenotype Rice3305.from_3605.pheno.with_BLUP.tsv \
   --encoding-type diploid_onehot \
   --variant-type snp \
   --id-prefix SNP- \
