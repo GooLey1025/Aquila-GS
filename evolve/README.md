@@ -234,17 +234,14 @@ Run all commands below from the `evolve/` directory. The workflow has three stag
 3. Run multi-round directed evolution with the fixed mapping while recalculating each proxy's SI effect in the current genomic background.
 
 ### Data preparation
+#### Case 1: Yield changes from South China to North China.
 ```sh
 PANEL_VCF=4lines.Rice655_ref.snp.indel.sv.impute.biallelic.vcf.gz
 QTN_LIST=ricenavi_gatk3_gatk4_snp_indel_id.exclude_sterility.list
 MODEL_DIR=../production_GS_model_train/655rice.production.more_sv_markers.final.imputed.panel.aquila-snp.multi_trait.per-fold.10folds.hpo
-```
-
-#### Case 1: Yield changes from South China to North China.
-```bash
-SAMPLE=D2295 # D2785
+SAMPLE=D309 # Jigeng528
 PARENT_VCF=${SAMPLE}.parent.vcf.gz
-DIRECTION_FILE=gyp_south_to_north.directions.tsv
+DIRECTION_FILE=gyp_beijing_to_lingshui.directions.tsv
 PROXY_DIR=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.qtn_proxy
 EVOLVE_DIR=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.proxy_evolve
 TRAIT_PREFIX=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.trait_change_summary
@@ -252,19 +249,7 @@ GAIN_PREFIX=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.proxy_si_g
 NULL_PREFIX=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.recommendation_null
 ```
 
-#### Case 2: Yield changes from North China to South China.
-```bash
-SAMPLE=D341 # D309
-PARENT_VCF=${SAMPLE}.parent.vcf.gz
-DIRECTION_FILE=gyp_north_to_south.directions.tsv
-PROXY_DIR=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.qtn_proxy
-EVOLVE_DIR=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.proxy_evolve
-TRAIT_PREFIX=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.trait_change_summary
-GAIN_PREFIX=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.proxy_si_gain
-NULL_PREFIX=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.recommendation_null
-```
-
-#### Case 3: Huanghuazhan base.
+#### Case 2: Huanghuazhan base.
 
 Extract `Huanghuazhan__SAMN04505852` from the joint Huanghuazhan–Teqing VCF. The QTN list is the previous Huanghuazhan list with sterility sites removed. The direction file is the south-to-north file: maximize `GYP_YangZ15` and minimize `GYP_LingS15`. Run the shared commands below with these variables. The model remains the 10-fold ensemble set in data preparation.
 
@@ -273,7 +258,7 @@ PANEL_VCF=HuangHuaZhan_Teqing_Rice655-ref.snp.indel.sv.impute.biallelic.vcf.gz
 QTN_LIST=ricenavi_gatk3_gatk4_snp_indel_id.exclude_sterility.list
 SAMPLE=Huanghuazhan__SAMN04505852
 PARENT_VCF=${SAMPLE}.parent.vcf.gz
-DIRECTION_FILE=gyp_south_to_north.directions.tsv
+DIRECTION_FILE=teqing_to_hhz.evolve_direction_2.tsv
 PROXY_DIR=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.qtn_proxy
 EVOLVE_DIR=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.proxy_evolve
 TRAIT_PREFIX=evolve_results/${SAMPLE}/${SAMPLE}_${DIRECTION_FILE%.tsv}.trait_change_summary
