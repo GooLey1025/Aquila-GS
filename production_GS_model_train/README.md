@@ -296,3 +296,6 @@ python correlation_analysis.py \
 ```
 
 Replace `GYP_BLUP` with `HD_BLUP` or `PH_BLUP` to evaluate another trait. Add `--keep-fold-predictions predictions/aquila-snp.GYP_BLUP.folds` to the Aquila command when the individual fold tables are needed.
+
+
+# For other cohort (Rice1171 and Rice3305), see [README.OTHER_COHORT.md](README.OTHER_COHORT.md).
