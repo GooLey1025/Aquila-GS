@@ -25,9 +25,11 @@ pip3 install -e .
 
 Model comparisons against other genomic selection methods are documented in [`benchmark`](benchmark/README.md).
 
-QTN evolution analyses are documented in [`evolve`](evolve/README.md).
+Production genomic selection model training is documented in [`production_GS_model_train`](production_GS_model_train/README.md).
 
 Integrated-gradient attribution alongside GWAS markers is in [`case/gwas_interpretability/main.sh`](case/gwas_interpretability/main.sh).
+
+QTN evolution analyses are documented in [`evolve`](evolve/README.md).
 
 ## Contact
 
