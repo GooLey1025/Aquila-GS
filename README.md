@@ -1,6 +1,6 @@
 # Aquila: Deep Learning for Genomic Selection
 
-Aquila is a powerful deep learning framework for genomic prediction using SNP (Single Nucleotide Polymorphism) data. It supports multi-task learning with both regression and classification tasks, handles missing data elegantly, and uses state-of-the-art transformer architectures.
+Aquila is a powerful deep learning framework for genomic prediction using SNP (Single Nucleotide Polymorphism) data. It supports multi-task learning for both regression and classification tasks, accommodates missing phenotypic values through a masking mechanism, and effectively captures complex genotype–phenotype relationships to enable accurate prediction across diverse traits.
 
 ## Installation
 
@@ -21,7 +21,13 @@ conda activate aquila
 pip3 install -e .
 ```
 
-## Data Preprocess
+## Analyses
+
+Model comparisons against other genomic selection methods are documented in [`benchmark`](benchmark/README.md).
+
+QTN evolution analyses are documented in [`evolve`](evolve/README.md).
+
+Integrated-gradient attribution alongside GWAS markers is in [`case/gwas_interpretability/main.sh`](case/gwas_interpretability/main.sh).
 
 ## Contact
 
