@@ -225,7 +225,7 @@ python plot_qtn_direction_null.py \
   --out-prefix "$DIRECTION_NULL_PREFIX"
 ```
 
-# QTN Proxy-Guided Evolution
+# (Ignore., Experimental version) QTN Proxy-Guided Evolution 
 
 Run all commands below from the `evolve/` directory. The workflow has three stages:
 
