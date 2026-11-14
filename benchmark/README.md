@@ -7,7 +7,7 @@ All benchmarks were conducted using the versions of the compared methods that we
 All integrated benchmark adapters are run from the existing Aquila environment. Install the additional Python and R dependencies with:
 
 ```sh
-cd ~/projects/Aquila-GS/benchmark
+# Assume you are in the Aquila-GS/benchmark directory.
 conda activate aquila
 conda env update -n aquila -f environment.yml
 ```
@@ -17,7 +17,7 @@ The environment file adds the dependencies not supplied by Aquila itself, includ
 The CRAN `hibayes` package used by BayesCpi is not available from the configured Conda channels. Install it once into the R library inside the activated Aquila environment:
 
 ```sh
-# You need to download r-library in the aquila env. CONDA_PREFIX is the path to the conda root directory. E.g. /data4/gulei/anaconda3
+# You need to download r-library in the aquila env. CONDA_PREFIX is the path to the conda root directory. E.g. $HOME/anaconda3
 # A proxy may be required to download this package.
 conda activate aquila
 $CONDA_PREFIX/bin/Rscript -e 'install.packages("hibayes", repos="https://cloud.r-project.org")'
@@ -379,19 +379,6 @@ for FOLD in {0..9}; do
       --resume
   done
 done
-
-cd ../aquila-vars
-for TRAIT in GYP_BLUP HD_BLUP PH_BLUP; do
-  for FOLD in {0..9}; do
-    aquila_train_cv.py \
-      --data-dir "../Rice655.DEM-RF.Aquila-Vars.data/${TRAIT}/fold_${FOLD}" \
-      --config "configs/dem_rf_matched.${TRAIT}.yaml" \
-      -o "results/Rice655-rf-matched/${TRAIT}/fold_${FOLD}" \
-      --resume
-  done
-done
 ```
 
-DEM-Vars trains an independent single-output model for each selected trait and outer fold. Missing phenotypes are removed only within the assigned train, validation, or test split, so predefined fold membership is unchanged, and training uses ordinary MSE. DEM-Vars uses ordered SNP, INDEL, and SV branches, with ten channels for SNPs and Aquila-Vars four-class channels for INDELs and SVs. Random-forest marker selection is fitted separately per branch using retained training samples only. The original batch-dependent Transformer behavior is preserved. See the [detailed DEM benchmark adaptation](docs/DEM_benchmark_adaptation.md).
-
-
+DEM-Vars trains an independent single-output model for each selected trait and outer fold. Missing phenotypes are removed only within the assigned train, validation, or test split, so predefined fold membership is unchanged, and training uses ordinary MSE. DEM-Vars uses ordered SNP, INDEL, and SV branches, with ten channels for SNPs and Aquila-Vars four-class channels for INDELs and SVs. Random-forest marker selection is fitted separately per branch using retained training samples only. The original batch-dependent Transformer behavior is preserved.
